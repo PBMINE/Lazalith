@@ -1,0 +1,12 @@
+[package]
+name = "lazalith-devices"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lazalith-isa = { path = "../lazalith-isa" }
+lazalith-types = { path = "../lazalith-types" }
+
+[lints]
+workspace = true

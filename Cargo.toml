@@ -1,0 +1,14 @@
+[workspace]
+members = ["crates/lazalith-types", "crates/lazalith-diagnostics", "crates/lazalith-isa", "crates/lazalith-cpu", "crates/lazalith-memory", "crates/lazalith-devices", "crates/lazalith-machine"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

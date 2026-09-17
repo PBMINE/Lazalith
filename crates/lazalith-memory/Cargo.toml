@@ -1,0 +1,17 @@
+[package]
+name = "lazalith-memory"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lazalith-devices = { path = "../lazalith-devices" }
+lazalith-types = { path = "../lazalith-types" }
+lazalith-isa = { path = "../lazalith-isa" }
+lazalith-cpu = { path = "../lazalith-cpu" }
+
+[dev-dependencies]
+lazalith-diagnostics = { path = "../lazalith-diagnostics" }
+
+[lints]
+workspace = true

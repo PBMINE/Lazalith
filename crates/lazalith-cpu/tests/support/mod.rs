@@ -1,0 +1,185 @@
+use lazalith_cpu::{
+    ArchitecturalState, CpuMemory, DataAccess, DataAccessKind, Privilege, ReferenceInterpreter,
+};
+use lazalith_isa::{Instruction, Opcode, Operand, encode};
+use lazalith_types::{ArchitectureConfig, InstructionAddress, RegisterIndex, VirtualAddress};
+use std::{error::Error, fmt};
+
+pub const MODES: [ArchitectureConfig; 2] = [ArchitectureConfig::lz32(), ArchitectureConfig::lz64()];
+
+pub fn r(index: u8) -> Operand {
+    Operand::Register(RegisterIndex::try_from(index).unwrap())
+}
+pub fn instruction(
+    config: ArchitectureConfig,
+    opcode: Opcode,
+    operands: &[Operand],
+) -> Instruction {
+    Instruction::new(config, opcode, operands).unwrap()
+}
+pub fn cpu(
+    config: ArchitectureConfig,
+    pc: u64,
+    sp: u64,
+    status: u64,
+    registers: &[(u8, u64)],
+) -> ReferenceInterpreter {
+    let mut state = ArchitecturalState::new(
+        config,
+        InstructionAddress::new(pc),
+        VirtualAddress::new(sp),
+        status,
+    )
+    .unwrap();
+    for &(index, value) in registers {
+        state.write_register_raw(index, value).unwrap();
+    }
+    ReferenceInterpreter::new(state)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryError {
+    Unmapped,
+    Permission,
+    Transaction,
+    Policy,
+}
+impl fmt::Display for MemoryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl Error for MemoryError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Ram {
+    bytes: Vec<u8>,
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+    pub user: bool,
+    pub device: bool,
+    pub fail: bool,
+    pub reads: usize,
+    pub writes: usize,
+}
+impl Default for Ram {
+    fn default() -> Self {
+        Self {
+            bytes: vec![0; 512],
+            readable: true,
+            writable: true,
+            executable: true,
+            user: true,
+            device: false,
+            fail: false,
+            reads: 0,
+            writes: 0,
+        }
+    }
+}
+impl Ram {
+    pub fn put(&mut self, address: usize, bytes: &[u8]) {
+        self.bytes[address..address + bytes.len()].copy_from_slice(bytes);
+    }
+    pub fn word(&self, address: usize, size: usize) -> u64 {
+        let mut bytes = [0; 8];
+        bytes[..size].copy_from_slice(&self.bytes[address..address + size]);
+        u64::from_le_bytes(bytes)
+    }
+    pub fn code(
+        &mut self,
+        address: usize,
+        config: ArchitectureConfig,
+        opcode: Opcode,
+        operands: &[Operand],
+    ) {
+        self.put(
+            address,
+            &encode(config, &instruction(config, opcode, operands)).unwrap(),
+        );
+    }
+    fn range(&self, address: u64, size: u8) -> Result<std::ops::Range<usize>, MemoryError> {
+        let start = usize::try_from(address).map_err(|_| MemoryError::Unmapped)?;
+        let end = start
+            .checked_add(usize::from(size))
+            .ok_or(MemoryError::Unmapped)?;
+        if end > self.bytes.len() {
+            return Err(MemoryError::Unmapped);
+        }
+        Ok(start..end)
+    }
+    fn validate(
+        &self,
+        access: DataAccess,
+        write: bool,
+    ) -> Result<std::ops::Range<usize>, MemoryError> {
+        let range = self.range(access.address().as_u64(), access.size().bytes())?;
+        if (write && !self.writable)
+            || (!write && !self.readable)
+            || (access.privilege() == Privilege::User && !self.user)
+        {
+            return Err(MemoryError::Permission);
+        }
+        if self.device
+            && matches!(
+                access.kind(),
+                DataAccessKind::StackRead | DataAccessKind::StackWrite
+            )
+        {
+            return Err(MemoryError::Policy);
+        }
+        if self.fail {
+            return Err(MemoryError::Transaction);
+        }
+        Ok(range)
+    }
+}
+impl CpuMemory for Ram {
+    type Error = MemoryError;
+    fn fetch_instruction(
+        &self,
+        config: ArchitectureConfig,
+        pc: InstructionAddress,
+        privilege: Privilege,
+    ) -> Result<[u8; 8], Self::Error> {
+        assert!(pc.as_u64().is_multiple_of(4));
+        assert!(
+            config
+                .word_width()
+                .checked_access_end(pc.as_u64(), 8)
+                .is_ok()
+        );
+        let range = self.range(pc.as_u64(), 8)?;
+        if !self.executable || (privilege == Privilege::User && !self.user) {
+            return Err(MemoryError::Permission);
+        }
+        if self.device {
+            return Err(MemoryError::Policy);
+        }
+        Ok(self.bytes[range].try_into().unwrap())
+    }
+    fn read_data(&mut self, access: DataAccess) -> Result<u64, Self::Error> {
+        assert_eq!(access.kind(), DataAccessKind::Read);
+        let range = self.validate(access, false)?;
+        let value = self.word(range.start, range.len());
+        self.reads += 1;
+        Ok(value)
+    }
+    fn write_data(&mut self, access: DataAccess, value: u64) -> Result<(), Self::Error> {
+        assert!(matches!(
+            access.kind(),
+            DataAccessKind::Write | DataAccessKind::StackWrite
+        ));
+        let range = self.validate(access, true)?;
+        let len = range.len();
+        self.bytes[range].copy_from_slice(&value.to_le_bytes()[..len]);
+        self.writes += 1;
+        Ok(())
+    }
+    fn peek_stack(&self, access: DataAccess) -> Result<u64, Self::Error> {
+        assert_eq!(access.kind(), DataAccessKind::StackRead);
+        let range = self.validate(access, false)?;
+        Ok(self.word(range.start, range.len()))
+    }
+}
