@@ -1,9 +1,197 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-25 (Steps 1–50 of the roadmap in `instruction.md`, plus
-the retrospective Steps 25–50 audit and repair pass)
+Last updated: 2026-09-25 (Steps 1–60 verified; Steps 61–75 not started)
 
-## Steps 25–50 Retrospective Audit and Repair
+## Where the roadmap stands
+
+```text
+Steps 1–50    complete, audited, repaired, verified, committed (31dbf86)
+Steps 51–59   complete: the Lazen design cluster (documentation only)
+Step  60      complete: lazalith-ir, the shared low-level IR
+Steps 61–75   NOT started. No compiler, runtime, driver, GUI, or debug code exists.
+```
+
+This milestone committed the design cluster and the IR. The remaining steps are
+listed below with their exact entry point so the next session starts from a
+verified baseline rather than from a partial implementation.
+
+### What deliberately did not land
+
+An attempt was made to carry Steps 61–63 in this milestone. The frontend
+reached a working lexer, a recursive-descent parser, and a name resolver, but
+the type checker and lowering pass were drafted against a larger language than
+the milestone could finish and verify, and the drafted lowering was itself
+unsound (it treated a function-address intrinsic as a frame pointer and dropped
+slice lengths). Rather than commit code that compiles-but-is-wrong, or leave a
+non-compiling crate in the tree, the compiler crate was removed and the milestone
+was closed at Step 60, which is fully verified.
+
+The consequence for the design documents is that they now describe the language
+that will actually be built, not a larger one: `docs/lazen-syntax.md` and
+`docs/lazen-types.md` record that Lazen v1 has no `optional`, no enums, no
+records, and no `match`, with the reason for each exclusion. That decision was
+made *because* of the failed attempt, and it is the right one: every remaining
+step depends on a type system and a lowering pass that can be audited, and a
+closed v1 type set is what makes that possible.
+
+## Steps 51–60 Dependency Map and Entry Points
+
+The roadmap for the rest of this milestone, with the dependency each step has:
+
+```text
+51 purpose ─┐
+52 syntax ──┤
+53 memory ──┤ design cluster: documentation only, no code      [complete]
+54 types ───┤
+55 modules ─┤
+56 apps ────┤
+57 sdk ─────┤
+58 graphics ┤
+59 input ───┘
+            ↓
+60 Lazalith IR (crates/lazalith-ir)                            [complete]
+            ↓
+61 Lazen frontend: lexer, parser, AST, name resolution, type checking
+            ↓
+62 Lazen lowering: checked program → Lazalith IR
+            ↓
+63 Lazen code generation: IR → Lazalith instructions → .lzo
+            ↓
+64 Lazen runtime: startup, stack, syscall wrappers (linked into every program)
+            ↓
+65 first Lazen program runs under LazOS            ← milestone checkpoint
+            ↓
+66 CLI: new, check, build, run (test/fmt deferred: no test runner, no formatter)
+            ↓
+67 standard library: core, io, text, math, collections, fs, process
+            ↓
+68 Virtual Display Device        69 Virtual Input Device
+            ↓                                  ↓
+70 LazOS display driver      71 LazOS input driver + host input adapter
+            ↓                                  ↓
+72 first graphical Lazen application (window, draw, keyboard, state)
+            ↓
+73 Lazen GUI library
+            ↓
+74 Debug API: DebugController, DebugSession
+            ↓
+75 machine snapshots: CPU, device, process
+```
+
+Decisions taken before implementation, so the design documents and the code
+target the same thing:
+
+- **Lazen v1 has no ownership, GC, or reference counting** (`lazen-memory-model.md`).
+  LazOS has no served heap, so a collector would be a collector over a bump
+  allocator. Values live in static data, on the stack, or in OS memory.
+- **The v1 type set is closed**: `bool`, `i8`–`i64`, `u8`–`u64`, `usize`, `str`,
+  `ptr<T>`, `&[T]`, `&mut [T]`, `[T; N]`. No `optional`, enums, records, or
+  `match` (`lazen-types.md`).
+- **Bounds failures trap, they do not panic.** An out-of-range index executes the
+  ISA software trap with a documented code, which the scheduler already turns
+  into a faulted process.
+- **The code generator will use a stack discipline.** The ISA is a flat register
+  machine with sixteen registers, so an expression stack in real stack memory is
+  the correct v1 lowering. Locals are addressed relative to the stack pointer,
+  which the ISA can read with `GETSP`; a register allocator is future work.
+- **The OS ABI grows new calls within v1.** Steps 70 and 71 need display and
+  input calls. `ABI_VERSION` stays 1, the new IDs are appended above the existing
+  ones, and the addition is recorded in `docs/os-abi.md`.
+- **The display is not MMIO.** The display device owns a framebuffer *RAM
+  region*, and `present` is a synchronization point, so a User context and a
+  device mapping never need to coexist. This keeps the Step 25–50 rule that a
+  user context cannot be bound while a device mapping exists intact.
+
+## Step 60 — Lazalith IR
+
+`crates/lazalith-ir` is the common low-level representation that sits below
+language-specific syntax trees. It contains no language concept: no generics, no
+closures, no traits, no ownership metadata.
+
+```text
+IrModule      name, functions, data segments
+Function      name, linkage, params, result, blocks, span
+Block         label, instructions, one terminator
+Instruction   Const Binary Unary Compare LogicalAnd LogicalOr Load Store
+              Call Intrinsic Copy Extract Insert Trap
+Terminator    Jump Branch Return Unreachable
+Type          Void Bool Int Pointer Slice Record Enum Function
+```
+
+Decisions recorded in the crate:
+
+- **Values are function-local and densely numbered.** Parameters occupy the first
+  identifiers, then every instruction that produces a value takes the next one.
+  `Store` and `Trap` produce nothing and consume no identifier.
+- **The verifier is a gate, not a suggestion.** It checks uniqueness, that every
+  operand is defined, that every use is dominated by its definition using an
+  iterative dominator computation over the reverse postorder, that a call's arity
+  and argument types match the callee, that a store's width matches the value's
+  size, that a return matches the declared result, and that a data segment's
+  alignment is a power of two.
+- **The builder prevents malformed modules structurally.** A block must be
+  terminated before a new one is created, an instruction cannot follow a
+  terminator, switching back to a finished block is allowed so a front end can
+  close a loop, and finishing a function checks that every block is terminated.
+- **`CallTarget::Syscall` records a name, not a number.** The IR never contains a
+  syscall number, so the ABI mapping stays in one place: the compiler's table
+  over the shared `lazalith-os-abi` definitions.
+- **Unreachable blocks are not dominance-checked.** Nothing can reach them, so a
+  verifier cannot prove anything about them, and a code generator may drop them.
+
+18 tests cover the verifier, including tests written so that removing a specific
+check fails the suite: undefined operands, undominated uses, unknown callees,
+unresolved imports, arity and argument-type mismatches, store width mismatches,
+return/result mismatches, degenerate branches, duplicate definitions, and the
+builder's own structural rules. The earlier Steps 25–50 suite (334 tests) still
+passes unchanged, so the new crate introduced no regression.
+
+## Steps 51–59 — Lazen Design Cluster
+
+Nine documents, no code, in the order the roadmap requires:
+
+| Step | Artifact | Decision recorded |
+| --- | --- | --- |
+| 51 | `docs/lazen-purpose.md` | Lazen is the application language; C and assembly keep their documented roles |
+| 52 | `docs/lazen-syntax.md` | 12 worked example programs, the explicit v1 omissions, and the type of each builtin |
+| 53 | `docs/lazen-memory-model.md` | manual memory, no ownership, three memory places, trap-based bounds checks |
+| 54 | `docs/lazen-types.md` | the closed v1 type set, ten checker rules, and the rejected features with reasons |
+| 55 | `docs/lazen-modules.md` | modules, visibility, imports, crates, packages, dependency rules |
+| 56 | `docs/lazen-applications.md` | `lazen.toml` manifest, entry point, resources, permissions, versioning |
+| 57 | `docs/lazen-sdk.md` | the SDK is Lazen over the OS ABI only, with a per-module availability table |
+| 58 | `docs/lazen-graphics.md` | guest-owned framebuffer, ARGB8888, canvas primitives, clipping |
+| 59 | `docs/lazen-input.md` | 16-byte guest event record, stable key codes, polling, determinism |
+
+The syntax document is load-bearing: its example programs are the test fixtures
+for the frontend, so the documented grammar cannot drift from the implemented
+grammar. The graphics and input documents specify contracts for the ABI calls
+that Steps 68–71 will implement; the Step 75 audit must check that the documents
+and the implementation agree.
+
+## Next step
+
+Step 61, the Lazen compiler frontend, in this order and with these tests:
+
+1. `crates/lazalith-compiler` crate, `no_std`, depending on `lazalith-types`,
+   `lazalith-diagnostics`, `lazalith-ir`, `lazalith-isa`, `lazalith-os-abi`, and
+   `lazalith-toolchain`. Diagnostics go through the shared `Diagnostic`,
+   `SourceManager`, and `SourceSpan`; no compiler-specific string formatting.
+2. Lexer with a span on every token, the escapes in
+   `docs/lazen-syntax.md`, and rejection of block comments, unterminated strings,
+   and malformed integer literals.
+3. Parser producing the AST in `docs/lazen-syntax.md`, error-tolerant so one
+   mistake yields one diagnostic.
+4. Resolver building a flat, fully qualified symbol table, rejecting duplicates,
+   private imports, and unknown import targets, each with a "first defined here"
+   note.
+5. Type checker for the closed v1 type set, producing frame slot offsets and the
+   ten rules from `docs/lazen-types.md`, each with a test that names the rule.
+
+Step 62 then lowers that output into `lazalith-ir`, and Step 63 generates
+instructions and a `.lzo` through the existing `ObjectBuilder`, so the linker,
+the `.lzx` emitter, and the loader are reused rather than reimplemented.
+
+## Steps 1–50 Retrospective Audit and Repair
 
 A read-only audit of every step from 25 through 50 was performed against
 `instruction.md`, the implementation, the tests, the Nix configuration, and the
@@ -183,8 +371,10 @@ symbols, ordering, alignment, dword width, BSS, and unknown symbols.
 
 Full workspace Rust formatting, strict Clippy, check, and all-target tests pass
 with 334 tests and zero doctests after the retrospective repair pass. Current
-Rust source/test line count is 39,404. Path-based Nix flake checks and package
-build pass with output
+Rust source/test line count is 39,404 at that milestone; the workspace now
+holds 352 tests and 41,839 lines after Steps 51-60, whose build output is
+`/nix/store/b5wqs8lpgjh0sv24vvc23jlvzlr81l38-lazalith-foundations-0.1.0`.
+The Nix build at the end of that repair pass was
 `/nix/store/mkvdplx6wsyb28878jlpbakjk7nvdsfa-lazalith-foundations-0.1.0`.
 aarch64-linux remains untested. The Steps 26–50 audit repaired linker BSS
 alignment accounting, made syscall-admission identity structurally

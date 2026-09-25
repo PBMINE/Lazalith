@@ -41,6 +41,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazalith-ir"
+version = "0.1.0"
+dependencies = [
+ "lazalith-diagnostics",
+ "lazalith-types",
+]
+
+[[package]]
 name = "lazalith-isa"
 version = "0.1.0"
 dependencies = [
