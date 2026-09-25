@@ -33,6 +33,13 @@ pub enum MachineState {
     Faulted,
 }
 
+fn is_executable_state(state: MachineState) -> bool {
+    matches!(
+        state,
+        MachineState::Reset | MachineState::Running | MachineState::Paused
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MachineOperation {
     Reset,
@@ -128,7 +135,23 @@ impl fmt::Display for MachineError {
             Self::InvalidUserContext { reason } => {
                 write!(f, "invalid User execution context: {reason}")
             }
-            _ => write!(f, "machine rejected operation: {self:?}"),
+            Self::TrapEntryContextMissing => {
+                f.write_str("trap entry requires a valid execution context")
+            }
+            Self::InterruptAllocation(source) => {
+                write!(f, "interrupt request allocation failed: {source}")
+            }
+            Self::Clock(source) => write!(f, "virtual clock rejected the operation: {source}"),
+            Self::Device(source) => write!(f, "device rejected the operation: {source}"),
+            Self::Memory(source) => write!(f, "memory rejected the operation: {source}"),
+            Self::Cpu(source) => write!(f, "CPU rejected the operation: {source}"),
+            Self::InstructionCountOverflow => f.write_str("executed instruction count overflowed"),
+            Self::InitialClock { devices, requested } => write!(
+                f,
+                "initial clock {} precedes the device epoch {}",
+                requested.as_u64(),
+                devices.as_u64()
+            ),
         }
     }
 }
@@ -367,12 +390,23 @@ impl<D: Device> LazalithMachine<D> {
         self.bus
             .swap_user_address_space(address_space)
             .map_err(MachineError::AddressSpaceSwap)?;
-        let _ = self
+        if !self
             .cpu
             .trap_controller_mut()
-            .clear_execution_context(execution_context);
-        self.state = MachineState::Halted;
+            .clear_execution_context(execution_context)
+        {
+            return Err(MachineError::InvalidUserContext {
+                reason: "execution context changed during context release",
+            });
+        }
+        self.settle_after_context_release();
         Ok(())
+    }
+
+    fn settle_after_context_release(&mut self) {
+        if !matches!(self.state, MachineState::Faulted) {
+            self.state = MachineState::Halted;
+        }
     }
 
     pub fn invalidate_user_context(
@@ -384,11 +418,16 @@ impl<D: Device> LazalithMachine<D> {
                 reason: "execution context is not active",
             });
         }
-        let _ = self
+        if !self
             .cpu
             .trap_controller_mut()
-            .clear_execution_context(execution_context);
-        self.state = MachineState::Halted;
+            .clear_execution_context(execution_context)
+        {
+            return Err(MachineError::InvalidUserContext {
+                reason: "execution context changed during context release",
+            });
+        }
+        self.settle_after_context_release();
         Ok(())
     }
 
@@ -566,10 +605,7 @@ impl<D: Device> LazalithMachine<D> {
     }
 
     fn ensure_executable(&self, operation: MachineOperation) -> Result<(), MachineError> {
-        if matches!(
-            self.state,
-            MachineState::Reset | MachineState::Running | MachineState::Paused
-        ) {
+        if is_executable_state(self.state) {
             return Ok(());
         }
         Err(MachineError::InvalidTransition {
@@ -665,7 +701,7 @@ impl<D: Device> LazalithMachine<D> {
     }
 
     fn try_external_interrupt(&mut self) -> Result<Option<TrapEvent>, MachineError> {
-        if self.state != MachineState::Running
+        if !is_executable_state(self.state)
             || !self.architectural_state().status().interrupts_enabled()
             || self.cpu.trap_controller().has_active_frame()
         {

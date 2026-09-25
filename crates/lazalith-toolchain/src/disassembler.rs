@@ -131,15 +131,10 @@ pub fn disassemble(
 
 pub fn disassemble_object(object: &ObjectFile) -> Result<Vec<ObjectDisassembly>, DisassemblyError> {
     let mut result = Vec::new();
-    for section in object.sections() {
+    for (index, section) in object.sections().iter().enumerate() {
         if section.kind() == SectionKind::Text {
             result.push(ObjectDisassembly {
-                section: object
-                    .sections()
-                    .iter()
-                    .position(|candidate| core::ptr::eq(candidate, section))
-                    .and_then(|index| u16::try_from(index).ok())
-                    .unwrap_or(u16::MAX),
+                section: u16::try_from(index).unwrap_or(u16::MAX),
                 instructions: disassemble(object.config(), section.bytes())?,
             });
         }

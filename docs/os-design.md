@@ -122,7 +122,7 @@ transfers through the architectural trap mechanism and kernel dispatcher only.
 | User-permitted RAM/ROM | R/W/X only as mapped and `user=true` | Same permission checks; Supervisor has no R/W/X bypass |
 | Kernel-only regions | Rejected | Allowed only where their R/W/X bits permit |
 | Trap TVEC, EPC, ESP, ESTATUS, TCAUSE, TPAYLOAD | Not directly accessible | Accessed only through validated controller operations |
-| Device registers/MMIO | Only deliberately User-mapped ranges; never device internals | Routed through validated Bus/device operations |
+| Device registers/MMIO | Never mapped: a User context cannot be bound while a device mapping exists | Routed through validated Bus/device operations |
 | `Bus`, `AddressSpace`, `DeviceManager`, host loaders, mappings | Not guest-visible | Private implementation details, never exposed wholesale |
 | Debugger `peek` and raw host inspection | Not a guest operation | Trusted frontend/debugger only; never substituted for User access |
 | Physical/instruction/virtual address policy | User pointers only through ABI validation | Typed kernel-owned domains, no implicit conversions |
@@ -232,8 +232,12 @@ User RAM, architecture, and mode before creating CPU state. New threads are
 attached through `Process::attach_thread`, which records the owner and rejects
 duplicate or foreign thread IDs.
 
-`Process::memory_context` and `memory_context_for_thread` are the only safe
-service-context constructors. The resulting context binds the request to one
+`Process::memory_context` and `memory_context_for_thread` are the constructors
+used for host-side inspection of a process that is not currently running. While
+a process is running, the machine holds its User regions, so only
+`memory_context_for_thread_in_space`, built from the live machine space, is a
+valid service context; the other two would observe the process's dormant space.
+The resulting context binds the request to one
 process/thread identity, active scheduler execution token, and address-space
 identity while lending the process's allocator, mutable User address space,
 typed handles, active thread CPU state, image/stack metadata, and
@@ -243,9 +247,11 @@ syscall can be admitted. The dispatcher rejects a request whose process,
 thread, execution token, lifecycle state, or address-space identity does not
 match that context; requests cannot be rebound after admission.
 
-The first scheduler is deterministic round-robin. A scheduler decision changes
-which owned thread context is active; it does not copy global machine state or
-hide context switches inside the CPU. Blocking, exit, and fault transitions are
+The first scheduler is deterministic round-robin. A scheduler decision selects
+which process is active; the thread it binds is always that process's primary
+thread, and additional threads are owned, addressable state that no scheduler
+path dispatches yet. It does not copy global machine state or hide context
+switches inside the CPU. Blocking, exit, and fault transitions are
 validated by the process model. Exact state-transition tables and IDs are
 defined by the Step 38 implementation, not inferred from CPU execution state.
 
@@ -298,7 +304,9 @@ registers/SP/NZCV, forces Supervisor, clears IE, and writes no guest frame.
 CSRR/CSRW and RFE use those controls. A missing/invalid target, failed entry, or
 double trap is terminal and retains the triggering attempt/context. External
 requests are coalesced, sorted, masked by IE, delivered only at an eligible
-running boundary, and acknowledged only after entry succeeds. The syscall
+instruction boundary of an executable machine state (`Reset`, `Running`, or
+`Paused`, so single-stepping still services them), and acknowledged only after
+entry succeeds. The syscall
 dispatcher and trap-aware scheduler boundary are implemented; interrupt device
 assignments and the concrete kernel handler remain later work.
 
@@ -312,10 +320,15 @@ structured status/error results, pointers, handles, lengths, offsets, and mode
 differences.
 
 The initial service set is intentionally aligned with later filesystem and
-process work: exit, read, write, open, close, seek, time, sleep, and memory
-allocation, plus only the additional process/terminal services required to make
-the documented init and shell real. Graphics and input calls are deferred until
-drivers exist. No Linux numbers or Linux calling convention are copied.
+process work: exit, read, write, open, close, seek, stat, list, time, sleep,
+memory allocation, spawn, wait, and clear screen. The shipped
+`FileSystemService` implements exit, read, write, open, close, seek, stat, list,
+and clear screen for real. `time`, `sleep`, `AllocateMemory`,
+`SpawnProcess`, and `WaitProcess` are fully validated by the dispatcher and
+reach the service, which returns `NotSupported` in this milestone; the user
+allocator exists in `UserMemory` but is not yet wired to a syscall. Graphics and
+input calls are deferred until drivers exist. No Linux numbers or Linux calling
+convention are copied.
 
 ## Filesystem and program loading
 
@@ -361,7 +374,7 @@ file from the virtual filesystem, parsing it, and scheduling the process through
 deferred because `SpawnProcess`/`WaitProcess` services are future work. Its
 grammar is intentionally line-oriented: surrounding spaces/tabs are trimmed,
 `echo` accepts the remaining text, and path commands accept one whitespace-free
-byte path.
+byte path. This host grammar is the authoritative prompt specification.
 
 `build_init_shell_image` adds a real composite init/shell `.lzx` fixture. Its
 User code uses typed instruction emission, terminal descriptors 0/1, checked
@@ -373,6 +386,15 @@ EOF exit, and process release in both architectures. `run` is recognized and
 explicitly deferred because SpawnProcess/WaitProcess ownership is not
 implemented yet; a separate packaged kernel image and real device-backed
 terminal remain future work.
+
+The in-image shell is a declared conformance subset of the host specification,
+not a second specification: it implements `help`, `echo`, `clear`, and a
+fixed-path `ls`/`cat` over the fixture filesystem, reports `unknown command` for
+input outside that subset (including a blank line and a path argument), and
+defers `run`. The shared conformance test in
+`crates/lazalith-os/tests/native_shell.rs` pins the prompt, the `unknown
+command` behavior, the `ls` divergence, and clear-generation tracking for both
+implementations, so the difference stays declared and tested.
 
 ## Devices, console, display, and input
 

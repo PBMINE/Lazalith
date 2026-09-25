@@ -210,3 +210,149 @@ fn step44_bridge_rejects_relocation_bearing_objects() {
     let object = object(ArchitectureConfig::lz64());
     assert!(lazalith_toolchain::link_object(&object).is_err());
 }
+
+fn header_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn header_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn set_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn set_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[test]
+fn lzo_rejects_non_canonical_tables_reserved_words_and_counts() {
+    let canonical = object(ArchitectureConfig::lz64()).to_bytes().unwrap();
+    let string_offset = header_u64(&canonical, 88) as usize;
+    let string_size = header_u32(&canonical, 44) as usize;
+
+    let mut trailing = canonical.clone();
+    set_u32(&mut trailing, 44, (string_size + 1) as u32);
+    trailing[string_offset + string_size] = b'x';
+    assert!(
+        ObjectFile::from_bytes(&trailing).is_err(),
+        "an unreferenced trailing string byte is not canonical"
+    );
+
+    for field in [104u64, 112, 120] {
+        let mut reserved = canonical.clone();
+        set_u64(&mut reserved, field as usize, 1);
+        assert!(ObjectFile::from_bytes(&reserved).is_err(), "field {field}");
+    }
+
+    let mut wrong_table = canonical.clone();
+    set_u64(&mut wrong_table, 48, header_u64(&canonical, 48) + 8);
+    assert!(ObjectFile::from_bytes(&wrong_table).is_err());
+
+    let mut wrong_string_table = canonical.clone();
+    set_u64(&mut wrong_string_table, 88, header_u64(&canonical, 88) + 8);
+    assert!(ObjectFile::from_bytes(&wrong_string_table).is_err());
+
+    let mut wrong_payload = canonical.clone();
+    set_u64(&mut wrong_payload, 96, header_u64(&canonical, 96) + 8);
+    assert!(ObjectFile::from_bytes(&wrong_payload).is_err());
+
+    let short_payload = canonical.clone();
+    let payload = header_u64(&canonical, 96) as usize;
+    let truncated = &short_payload[..payload + 8];
+    assert!(ObjectFile::from_bytes(truncated).is_err());
+    let mut extra_payload = canonical.clone();
+    extra_payload.push(0);
+    assert!(ObjectFile::from_bytes(&extra_payload).is_err());
+}
+
+#[test]
+fn lzo_rejects_duplicate_names_and_out_of_order_relocations() {
+    let config = ArchitectureConfig::lz64();
+    let nop = encode(config, &Instruction::new(config, Opcode::Nop, &[]).unwrap()).unwrap();
+
+    let mut duplicate_section = ObjectBuilder::new(config);
+    let text = duplicate_section
+        .add_section(Section::text("text", config, &nop).unwrap())
+        .unwrap();
+    duplicate_section
+        .add_section(Section::read_only_data("text", 4, &[0]).unwrap())
+        .unwrap();
+    let entry = duplicate_section
+        .add_symbol(Symbol::section_defined(
+            "_start",
+            SymbolBinding::Local,
+            text,
+            0,
+            0,
+        ))
+        .unwrap();
+    duplicate_section.set_entry(entry).unwrap();
+    assert!(matches!(
+        duplicate_section.build(),
+        Err(lazalith_toolchain::ObjectError::DuplicateSection { .. })
+    ));
+
+    let mut duplicate_symbol = ObjectBuilder::new(config);
+    let text = duplicate_symbol
+        .add_section(Section::text("text", config, &nop).unwrap())
+        .unwrap();
+    let entry = duplicate_symbol
+        .add_symbol(Symbol::section_defined(
+            "same",
+            SymbolBinding::Global,
+            text,
+            0,
+            0,
+        ))
+        .unwrap();
+    duplicate_symbol.set_entry(entry).unwrap();
+    duplicate_symbol
+        .add_symbol(Symbol::absolute("same", SymbolBinding::Global, 1))
+        .unwrap();
+    assert!(matches!(
+        duplicate_symbol.build(),
+        Err(lazalith_toolchain::ObjectError::InvalidSymbol { .. })
+    ));
+
+    let mut unordered = ObjectBuilder::new(config);
+    let mut code = nop.to_vec();
+    code.extend_from_slice(&nop);
+    let text = unordered
+        .add_section(Section::text("text", config, &code).unwrap())
+        .unwrap();
+    let local = unordered
+        .add_symbol(Symbol::section_defined(
+            "local",
+            SymbolBinding::Local,
+            text,
+            0,
+            0,
+        ))
+        .unwrap();
+    unordered.set_entry(local).unwrap();
+    unordered
+        .add_relocation(Relocation::new(
+            local,
+            text,
+            RelocationKind::LiImmediate,
+            8,
+            0,
+        ))
+        .unwrap();
+    unordered
+        .add_relocation(Relocation::new(
+            local,
+            text,
+            RelocationKind::LiImmediate,
+            0,
+            0,
+        ))
+        .unwrap();
+    assert!(
+        unordered.build().is_err(),
+        "relocations must be strictly ordered by target offset"
+    );
+}

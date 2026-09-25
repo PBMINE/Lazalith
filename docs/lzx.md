@@ -77,4 +77,7 @@ malformed input cannot partially publish a process.
 
 The v1 format has no implicit entry decoding, relocation, dynamic linking,
 compression, symbol table, or debug metadata. Those features require an
-explicit future format revision.
+explicit future format revision. Because of that, the Step 48 linker resolves
+relocations and then drops object debug mappings: the linked `.lzx` carries no
+debug section, and `LinkedProgram` exposes no debug API. Debug mappings remain
+available on the `.lzo` object, which is the artifact a debugger should read.

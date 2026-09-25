@@ -1,6 +1,136 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-25 (Steps 1–50 of the roadmap in `instruction.md`)
+Last updated: 2026-09-25 (Steps 1–50 of the roadmap in `instruction.md`, plus
+the retrospective Steps 25–50 audit and repair pass)
+
+## Steps 25–50 Retrospective Audit and Repair
+
+A read-only audit of every step from 25 through 50 was performed against
+`instruction.md`, the implementation, the tests, the Nix configuration, and the
+documentation, followed by a repair pass. The audit found no P1 defect and no
+invariant violation: the implementation is Rust-only with `unsafe_code =
+forbid`, has no global mutable state, keeps LZ32 and LZ64 first-class, uses
+strong domain types, and keeps the Reference Interpreter, real Bus ownership,
+and machine-owned hardware state intact. Every confirmed finding below was a
+missing check, an unenforced contract, stale documentation, or an untested
+invariant. The historical entries below are preserved as written; this section
+records the corrections.
+
+Repaired defects and their regression tests:
+
+- **Scheduler activation failure never poisoned.** `activate_next` returned a
+  machine error while every other machine-error path poisoned the scheduler, so
+  the documented `reset_after_poison` recovery was unreachable and the
+  scheduler silently accepted processes it could never run. Both activation
+  failure paths now poison. Regression test:
+  `scheduler_poisons_on_activation_failure_and_recovers_after_reset`.
+- **Poisoning destroyed the terminal machine state.**
+  `recover_user_context`/`invalidate_user_context` overwrote `Faulted` with
+  `Halted` and discarded `clear_execution_context`'s result, so `is_halted()`
+  reported a faulted machine as merely halted. Both now check the result and
+  preserve `Faulted`. Regression tests:
+  `scheduler_preserves_the_faulted_machine_state_while_poisoned`,
+  `scheduler_release_returns_the_machine_to_halted`.
+- **VFS read access was unenforced in the abstraction.** `read_at` now takes the
+  handle access and rejects a read-less handle. Regression tests:
+  `file_access_is_enforced_by_the_filesystem_for_reads_and_writes` for the
+  filesystem itself and `a_write_only_handle_cannot_read_through_the_dispatcher`
+  for the syscall path; `stale_foreign_and_closed_handles_are_rejected_end_to_end`
+  covers stale and foreign handle indices.
+- **Single-stepping never delivered interrupts.** Delivery required the
+  `Running` state, which `step` never enters, so a debugger driving `step`
+  silently never serviced a pending enabled interrupt. Eligibility is now the
+  shared executable-state set (`Reset`, `Running`, `Paused`). Regression tests:
+  `interrupts_deliver_at_every_executable_boundary_lowest_first_and_defer_in_frame`,
+  `interrupt_delivery_requires_an_enabled_interrupt_at_an_executable_boundary`.
+- **The syscall completion path could panic.** `unreachable!()` guarded a
+  status-range check; an out-of-range status now produces
+  `DispatchOutcome::Fault(SyscallError::Internal)`. Regression test:
+  `every_syscall_error_status_fits_the_one_shot_completion_range`, which pins
+  every `SyscallError` inside the one-shot completion range.
+- **The host service API could wedge the scheduler.**
+  `UserMemoryContext::exit` and `transition(Ready)` on the running process
+  produced a `ProcessStateMismatch` poison or a double trap. `exit` now requires
+  a dispatched syscall context and `Running -> Ready` is rejected through the
+  context; `Blocked` remains available to services and hosts. Regression tests:
+  `scheduler_rejects_host_termination_of_the_running_process`,
+  `process_context_lends_owned_memory_and_handles_only_to_its_process`.
+- **Stale bindings were detected but unproven.** The binding checks in
+  `validate_active_binding` and the dispatcher survived guard removal in
+  mutation testing. `ContextMismatch` also reported two equal identifiers; it
+  now reports the side that actually diverged. Regression test:
+  `scheduler_detects_a_stale_execution_context_binding`.
+- **Blocked-process resume was unverified.** The saved CPU context on suspend
+  could be dropped with every test still green. Regression test:
+  `scheduler_resumes_a_blocked_process_with_its_own_cpu_context`, plus
+  `scheduler_unblock_enforces_its_preconditions_and_keeps_the_cursor` and
+  `scheduler_reaping_rejects_non_terminal_and_keeps_rotation_ordered`.
+- **`.lzo` was never serialized on the product path.** The linker consumed the
+  in-memory model, so the Step 49 chain had no `.lzo` stage. The pipeline is now
+  proven end to end through the real serialized object in both modes:
+  `the_serialized_lzo_format_is_the_real_linker_input_in_both_modes`.
+- **`.lzo` canonicality and validation were largely untested.** The string
+  table now rejects unreferenced trailing bytes, and rejection tests cover
+  reserved words, table offsets, payload EOF, duplicate section and symbol
+  names, and relocation ordering. Tests:
+  `lzo_rejects_non_canonical_tables_reserved_words_and_counts`,
+  `lzo_rejects_duplicate_names_and_out_of_order_relocations`.
+- **Relocation values were unverified.** Every relocation kind is now decoded
+  and compared against the documented formula in both widths:
+  `linker_writes_the_documented_value_for_every_relocation_kind` and
+  `linker_rejects_relocations_it_cannot_represent`.
+- **`.lzx` rejection coverage was ineffective.** The truncation loop discarded
+  its results; it now asserts every prefix and trailing extension is rejected,
+  and a new test pins thirteen previously untested `LzxError` variants:
+  `lzx_rejects_every_unreachable_header_and_table_field`.
+- **The disassembler round trip covered one form of forty** and located
+  sections by pointer identity. Lookup is now index-based, and every mnemonic
+  printed form is re-assembled and compared byte for byte in both widths:
+  `every_printed_instruction_reassembles_to_identical_bytes`.
+- **Assembler defects:** an undefined `.global` name was silently dropped and
+  now becomes an undefined global symbol that fails at link time; `map_error`
+  discarded its cause and now preserves it in the diagnostic. The first is
+  covered by `a_global_name_that_is_never_defined_becomes_an_undefined_symbol`.
+  The second is defensive: its only reachable inputs are allocation failures
+  from `try_reserve`, which no public source can provoke, so it is recorded as a
+  repaired code path without a dedicated test. The section-alignment padding
+  path now grows the buffer through `try_reserve` instead of `Vec::resize`.
+- **Pool accounting overstated capacity.** `BumpPool::Exhausted.remaining` now
+  reports the bytes usable from the aligned cursor, so alignment padding is not
+  counted as allocatable. Test:
+  `bump_pool_reports_alignment_aware_remaining_capacity`.
+- **Boot constants were dead and duplicated.** `RESET_VECTOR`,
+  `BOOT_ADDRESS`, and `BOOT_ROM_PHYSICAL_START` now bind the machine setup, and
+  the duplicate kernel-stack constants were removed from the boot crate. Test:
+  `the_documented_reset_vector_is_the_single_boot_source_of_truth`.
+- **Machine diagnostics fell back to a debug dump.** Every `MachineError`
+  variant now has an intentional message.
+- **`FileMetadata.permissions` implied a security guarantee it did not
+  provide.** It is now `capabilities`, documented as the node capability class;
+  per-handle `FileAccess` remains the enforced grant.
+- **The two `lazos$` shells were an undocumented pair of specifications.**
+  The host `HeadlessShell` grammar is now declared authoritative and the
+  in-image shell is declared a conformance subset; the divergence is pinned by
+  `the_two_shells_declare_one_conformance_contract`.
+- **The pending-run latch was opaque.** `ShellError::PendingRun` now carries the
+  queued path so a host can report which program must be cleared.
+
+Documentation corrections: `docs/os-design.md` (interrupt boundary on `step`,
+primary-thread-only dispatch, `NotSupported` services, dormant-space
+`memory_context` safety, unreachable User MMIO, shell conformance),
+`docs/os-memory.md` (four-byte instruction alignment, Step 34 ownership),
+`docs/os-abi.md` (`MAX_PATH_BYTES` terminator rule, `IoResult.status`
+semantics, `FileStat` capability semantics), `docs/boot.md` (HALT terminality
+for execution, reset-vector source of truth, validation ordering),
+`docs/lzx.md` and `docs/lzo.md` (debug-mapping drop, string-table coverage), and
+`docs/lazen-rationale.md` (explicit time service).
+
+Known limitations that remain by design: `aarch64-linux` is untested; in-image
+`SpawnProcess`/`WaitProcess` and the in-image `run` command are unimplemented;
+the guest shell's `ls`/`cat` are fixed-path; `time`, `sleep`, and
+`AllocateMemory` are validated by the dispatcher but return `NotSupported` from
+the shipped service; `.lzx` v1 carries no debug metadata; `PcRelativeWord32` has
+no ISA form that consumes it from data.
 
 ## Step 50 — Lazen Language Design
 
@@ -8,9 +138,9 @@ Added `docs/lazen-design.md` and `docs/lazen-rationale.md`. The design defines a
 small native systems language with explicit LZ32/LZ64 targets, `main` entry
 mapping, checked regions and pointers, typed OS wrappers, deterministic
 semantics, and a compiler pipeline into the shared `.lzo` toolchain. The
-rationale answers what would make native Lazalith applications easy while
-explicitly rejecting wholesale C/Rust/Pascal/Go conventions. No Lazen compiler
-is claimed or started; grammar details remain future work.
+rationale answers what would make building native Lazalith applications easy
+while explicitly rejecting wholesale C/Rust/Pascal/Go conventions. No Lazen
+compiler is claimed or started; grammar details remain future work.
 
 ## Step 49 — Real Assembly Program Under LazOS
 
@@ -52,9 +182,10 @@ and managers, with regression coverage for malformed memory operands, negative
 symbols, ordering, alignment, dword width, BSS, and unknown symbols.
 
 Full workspace Rust formatting, strict Clippy, check, and all-target tests pass
-with 307 tests and zero doctests. Current Rust source/test line count is 37,788.
-Path-based Nix flake checks and package build pass with output
-`/nix/store/arq3g0dnyjav7cjaxv5bi5m8dcyj06gr-lazalith-foundations-0.1.0`.
+with 334 tests and zero doctests after the retrospective repair pass. Current
+Rust source/test line count is 39,404. Path-based Nix flake checks and package
+build pass with output
+`/nix/store/mkvdplx6wsyb28878jlpbakjk7nvdsfa-lazalith-foundations-0.1.0`.
 aarch64-linux remains untested. The Steps 26–50 audit repaired linker BSS
 alignment accounting, made syscall-admission identity structurally
 non-cloneable, hardened assembler expression-range arithmetic with source-located

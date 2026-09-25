@@ -42,7 +42,13 @@ impl FileAccess {
 pub struct FileMetadata {
     pub node: FileNodeId,
     pub kind: FileNodeKind,
-    pub permissions: FilePermissions,
+    /// Capability class of the node: what a fully granted handle may do with it.
+    ///
+    /// This is a property of the node, not a grant. Per-handle access is
+    /// enforced separately through [`FileAccess`]; the virtual filesystem has no
+    /// accounts or node-level permissions, so this value is never a security
+    /// decision on its own.
+    pub capabilities: FilePermissions,
     pub size: u64,
 }
 
@@ -273,7 +279,7 @@ impl VirtualFileSystem {
             FileNode::File { bytes } => bytes.len() as u64,
             FileNode::Directory { entries } => entries.len() as u64,
         };
-        let permissions = match kind {
+        let capabilities = match kind {
             FileNodeKind::File => {
                 FilePermissions::new(FilePermissions::READ | FilePermissions::WRITE)
                     .map_err(FileSystemError::Abi)?
@@ -286,7 +292,7 @@ impl VirtualFileSystem {
         Ok(FileMetadata {
             node,
             kind,
-            permissions,
+            capabilities,
             size,
         })
     }
@@ -356,7 +362,11 @@ impl VirtualFileSystem {
         node: FileNodeId,
         offset: u64,
         length: u64,
+        access: FileAccess,
     ) -> Result<Vec<u8>, FileSystemError> {
+        if !access.read {
+            return Err(FileSystemError::PermissionDenied);
+        }
         let FileNode::File { bytes } = self.node(node)? else {
             return Err(FileSystemError::IsDirectory);
         };
@@ -771,7 +781,10 @@ impl FileSystemService {
                 0,
             ));
         }
-        let data = match self.filesystem.read_at(file.node(), file.offset(), length) {
+        let data = match self
+            .filesystem
+            .read_at(file.node(), file.offset(), length, file.access())
+        {
             Ok(data) => data,
             Err(error) => return ServiceOutcome::Return(filesystem_error_outcome(error)),
         };
@@ -927,7 +940,8 @@ impl FileSystemService {
             super::filesystem::FileNodeKind::File => AbiFileKind::File,
             super::filesystem::FileNodeKind::Directory => AbiFileKind::Directory,
         };
-        let stat = match FileStat::new(memory.config(), kind, metadata.permissions, metadata.size) {
+        let stat = match FileStat::new(memory.config(), kind, metadata.capabilities, metadata.size)
+        {
             Ok(stat) => stat,
             Err(error) => {
                 return ServiceOutcome::Return(TaggedOutcome::failure(

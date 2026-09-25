@@ -94,7 +94,7 @@ fn shell_rejects_invalid_commands_without_transcript_mutation() {
     ));
     assert!(matches!(
         shell.execute_line(b"run /init.lzx"),
-        Err(ShellError::PendingRun)
+        Err(ShellError::PendingRun { path }) if path == b"/init.lzx"
     ));
     assert_eq!(shell.output(), initial);
 }
@@ -128,4 +128,44 @@ fn shell_enforces_line_and_output_limits() {
         HeadlessShell::with_limits(VirtualFileSystem::with_defaults().unwrap(), 0, 1),
         Err(ShellError::InvalidLimits)
     ));
+}
+
+#[test]
+fn a_queued_launch_reports_its_path_from_the_run_command_entry_point() {
+    use lazalith_os::{LazalithKernel, ProcessId, ThreadId, VirtualTerminal};
+    let mut shell = shell();
+    let mut kernel = LazalithKernel::new(
+        1000,
+        VirtualTerminal::new(b"").unwrap(),
+        VirtualFileSystem::with_defaults().unwrap(),
+    )
+    .unwrap();
+    let process = ProcessId::new(1).unwrap();
+    let thread = ThreadId::new(1).unwrap();
+    let error = shell
+        .execute_run_command(b"run /init.lzx", &mut kernel, process, thread)
+        .unwrap_err();
+    assert!(
+        matches!(&error, ShellError::Image(_)),
+        "the first launch fails while parsing the queued image: {error}"
+    );
+    let error = shell
+        .execute_run_command(b"run /init.lzx", &mut kernel, process, thread)
+        .unwrap_err();
+    assert!(
+        matches!(&error, ShellError::PendingRun { path } if path == b"/init.lzx"),
+        "the queued path must be reported until it is cleared: {error}"
+    );
+    assert!(
+        error.to_string().contains("init.lzx"),
+        "the diagnostic must name the queued program: {error}"
+    );
+    shell.execute_line(b"clear").unwrap();
+    let error = shell
+        .execute_run_command(b"run /init.lzx", &mut kernel, process, thread)
+        .unwrap_err();
+    assert!(
+        matches!(&error, ShellError::Image(_)),
+        "clear releases the latch: {error}"
+    );
 }

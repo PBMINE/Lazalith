@@ -104,8 +104,12 @@ fn process_context_lends_owned_memory_and_handles_only_to_its_process() {
     ));
     context.transition(ProcessState::Ready).unwrap();
     assert_eq!(context.state(), ProcessState::Ready);
-    context.exit(7).unwrap();
-    assert_eq!(context.exit_code(), Some(7));
+    assert!(matches!(
+        context.exit(7),
+        Err(ProcessStateError::NotInSyscall { .. })
+    ));
+    assert_eq!(context.exit_code(), None);
+    assert_eq!(context.state(), ProcessState::Ready);
     context
         .write_bytes(
             lazalith_types::VirtualAddress::new(USER_DATA_START),
@@ -125,8 +129,8 @@ fn process_context_lends_owned_memory_and_handles_only_to_its_process() {
         .unwrap();
     assert_eq!(&bytes, b"private");
     assert_eq!(process.handles().len(), 1);
-    assert_eq!(process.state(), ProcessState::Exited);
-    assert_eq!(process.exit_code(), Some(7));
+    assert_eq!(process.state(), ProcessState::Ready);
+    assert_eq!(process.exit_code(), None);
 }
 
 #[test]

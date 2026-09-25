@@ -1,7 +1,7 @@
 use crate::{
     BOOT_FORMAT_VERSION, BOOT_HEADER_ADDRESS, BOOT_HEADER_SIZE, BOOT_MAGIC, BOOT_ROM_LENGTH,
-    BOOT_ROM_START, BootArchitecture, BootError, KERNEL_IMAGE_LENGTH, KERNEL_INITIAL_SP,
-    KERNEL_LOAD_ADDRESS, KERNEL_PAYLOAD_ADDRESS, MAX_BOOT_ROM_PAYLOAD, bootloader,
+    BOOT_ROM_PHYSICAL_START, BootArchitecture, BootError, KERNEL_IMAGE_LENGTH, KERNEL_INITIAL_SP,
+    KERNEL_LOAD_ADDRESS, KERNEL_PAYLOAD_ADDRESS, MAX_BOOT_ROM_PAYLOAD, RESET_VECTOR, bootloader,
 };
 use alloc::{boxed::Box, vec::Vec};
 use core::fmt;
@@ -275,7 +275,7 @@ impl BootImage {
         regions.push(
             MemoryRegion::rom(
                 self.config,
-                PhysicalAddress::new(BOOT_ROM_START),
+                BOOT_ROM_PHYSICAL_START,
                 &self.rom,
                 RegionPermissions::new(true, false, true, false),
             )
@@ -287,7 +287,7 @@ impl BootImage {
             config: self.config,
             devices,
             regions,
-            pc: InstructionAddress::new(BOOT_ROM_START),
+            pc: RESET_VECTOR,
             sp: VirtualAddress::new(KERNEL_INITIAL_SP),
             status: 0,
             initial_time: CycleCount::new(0),
@@ -727,7 +727,7 @@ mod tests {
         let regions = vec![
             MemoryRegion::rom(
                 config,
-                PhysicalAddress::new(BOOT_ROM_START),
+                BOOT_ROM_PHYSICAL_START,
                 image.rom(),
                 RegionPermissions::new(true, false, true, false),
             )
@@ -751,7 +751,7 @@ mod tests {
             config,
             devices: DeviceManager::<NoDevice>::new(),
             regions,
-            pc: InstructionAddress::new(BOOT_ROM_START),
+            pc: RESET_VECTOR,
             sp: VirtualAddress::new(KERNEL_INITIAL_SP),
             status: 0,
             initial_time: CycleCount::new(0),

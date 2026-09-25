@@ -82,7 +82,7 @@ impl BumpPool {
         if end > self.limit {
             return Err(MemoryError::Exhausted {
                 requested: length,
-                remaining: self.limit - self.cursor,
+                remaining: self.limit.saturating_sub(address),
             });
         }
         self.config

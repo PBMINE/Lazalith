@@ -1117,7 +1117,13 @@ fn filesystem_service_reads_writes_seeks_and_closes_handles() {
             },
         );
         assert_return(&outcome, SyscallStatus::Ok, 0);
-        assert_eq!(service.filesystem().read_at(node, 0, 99).unwrap(), b"XYc");
+        assert_eq!(
+            service
+                .filesystem()
+                .read_at(node, 0, 99, FileAccess::new(true, true))
+                .unwrap(),
+            b"XYc"
+        );
         let mut encoded = [0u8; 16];
         process
             .memory()
@@ -1150,7 +1156,10 @@ fn filesystem_service_reads_writes_seeks_and_closes_handles() {
             .unwrap();
         assert_eq!(&read, b"abcd");
         assert_eq!(
-            service.filesystem().read_at(node, 0, 99).unwrap(),
+            service
+                .filesystem()
+                .read_at(node, 0, 99, FileAccess::new(true, true))
+                .unwrap(),
             b"abcdef"
         );
 
@@ -1292,5 +1301,224 @@ fn terminal_service_handles_input_output_and_clear_descriptors() {
         assert_return(&outcome, SyscallStatus::Ok, 0);
         assert_eq!(service.terminal().screen_generation(), 1);
         assert!(service.terminal().output().is_empty());
+    }
+}
+
+#[test]
+fn every_syscall_error_status_fits_the_one_shot_completion_range() {
+    for error in [
+        SyscallError::UnknownSyscall,
+        SyscallError::InvalidArgument,
+        SyscallError::InvalidPointer,
+        SyscallError::RangeOverflow,
+        SyscallError::Misaligned,
+        SyscallError::NotFound,
+        SyscallError::AlreadyExists,
+        SyscallError::PermissionDenied,
+        SyscallError::InvalidHandle,
+        SyscallError::NotDirectory,
+        SyscallError::IsDirectory,
+        SyscallError::NotSupported,
+        SyscallError::ResourceExhausted,
+        SyscallError::InvalidState,
+        SyscallError::IoFailure,
+        SyscallError::DeviceFailure,
+        SyscallError::ProcessFailure,
+        SyscallError::Faulted,
+        SyscallError::Internal,
+    ] {
+        let status = SyscallStatus::from(error).as_u32();
+        assert!(
+            status <= 19,
+            "status {status} for {error:?} cannot be completed in one shot"
+        );
+    }
+    assert_eq!(SyscallStatus::from(SyscallError::Internal).as_u32(), 19);
+    assert_eq!(SyscallStatus::Ok.as_u32(), 0);
+}
+
+#[test]
+fn stale_foreign_and_closed_handles_are_rejected_end_to_end() {
+    for config in [C::lz32(), C::lz64()] {
+        let data = lazalith_os::USER_DATA_START;
+        let result = data + 256;
+        let buffer = data + 32;
+        let mut filesystem = VirtualFileSystem::with_defaults().unwrap();
+        let node = filesystem.insert_file(b"/file", b"abc").unwrap();
+        let (outcome, _process, _service) = dispatch_filesystem_call(
+            config,
+            Syscall::Close,
+            [2, 0, 0, 0, 0, 0],
+            filesystem,
+            |memory| {
+                memory
+                    .handles()
+                    .open_file(node, FileAccess::new(true, true))
+                    .unwrap();
+            },
+        );
+        assert_return(&outcome, SyscallStatus::Ok, 0);
+
+        let (outcome, _process, _service) = dispatch_filesystem_call(
+            config,
+            Syscall::Close,
+            [2, 0, 0, 0, 0, 0],
+            VirtualFileSystem::with_defaults().unwrap(),
+            |_| {},
+        );
+        assert_return(&outcome, SyscallStatus::InvalidHandle, 0);
+
+        let (outcome, process, _service) = dispatch_filesystem_call(
+            config,
+            Syscall::Read,
+            [7, buffer, 3, result, 0, 0],
+            VirtualFileSystem::with_defaults().unwrap(),
+            |memory| {
+                memory
+                    .handles()
+                    .open_file(node, FileAccess::new(true, true))
+                    .unwrap();
+            },
+        );
+        assert_return(&outcome, SyscallStatus::InvalidHandle, 0);
+        let mut encoded = [0u8; 16];
+        process
+            .memory()
+            .address_space()
+            .peek(PhysicalAddress::new(result), &mut encoded)
+            .unwrap();
+        assert_eq!(IoResult::decode(&encoded, config).unwrap().transferred(), 0);
+    }
+}
+
+#[test]
+fn word_width_bounds_the_records_and_arguments_in_both_modes() {
+    let data = lazalith_os::USER_DATA_START;
+    for (config, word_bytes) in [(C::lz32(), 4u64), (C::lz64(), 8u64)] {
+        let (outcome, service) = dispatch_request(
+            config,
+            Syscall::Write.as_u16() as u64,
+            [1, data, 4, data + 256, 0, 0],
+            0,
+            |_| {},
+        );
+        assert_return(&outcome, SyscallStatus::Ok, 0);
+        assert_eq!(service.calls.len(), 1);
+        let (outcome, service) = dispatch_request(
+            config,
+            Syscall::Write.as_u16() as u64,
+            [1, data, 4, data + 256 + 1, 0, 0],
+            0,
+            |_| {},
+        );
+        assert_return(&outcome, SyscallStatus::Misaligned, 3);
+        assert!(service.calls.is_empty());
+        let (outcome, service) = dispatch_request(
+            config,
+            Syscall::Read.as_u16() as u64,
+            [0, 0x0080_0000, 4, data + 256, 0, 0],
+            0,
+            |_| {},
+        );
+        assert_return(&outcome, SyscallStatus::InvalidPointer, 1);
+        assert!(service.calls.is_empty());
+        let permissions = lazalith_os::abi::FilePermissions::new(1).unwrap();
+        let stat =
+            FileStat::new(config, lazalith_os::abi::AbiFileKind::File, permissions, 7).unwrap();
+        let encoded = stat.encode();
+        assert_eq!(encoded.len(), 16);
+        let decoded = FileStat::decode(&encoded, config).unwrap();
+        assert_eq!(decoded.size(), 7);
+        assert_eq!(decoded.kind(), lazalith_os::abi::AbiFileKind::File);
+        let wide = [0x1_0000_0000u64, 0x1_0000_0000, 0, 0, 0, 0];
+        let arguments = lazalith_os::abi::SyscallArguments::new(wide);
+        if config == C::lz32() {
+            assert!(
+                arguments.word(config, 0).is_err(),
+                "LZ32 arguments must reject a value above the word mask"
+            );
+            assert!(
+                arguments.word(config, 1).is_err(),
+                "every LZ32 word argument is bounded by the word mask"
+            );
+        } else {
+            arguments.word(config, 0).unwrap();
+        }
+        assert_eq!(
+            word_bytes as u32,
+            u32::from(config.word_bytes()),
+            "the record word width follows the architecture"
+        );
+    }
+}
+
+#[test]
+fn read_write_guards_reject_out_of_range_lengths_without_partial_effects() {
+    let data = lazalith_os::USER_DATA_START;
+    let result = data + 256;
+    for config in [C::lz32(), C::lz64()] {
+        let (outcome, service) = dispatch_request(
+            config,
+            Syscall::Write.as_u16() as u64,
+            [1, data, u64::MAX, result, 0, 0],
+            0,
+            |_| {},
+        );
+        assert_return(&outcome, SyscallStatus::RangeOverflow, 1);
+        assert!(service.calls.is_empty());
+        let (outcome, service) = dispatch_request(
+            config,
+            Syscall::Read.as_u16() as u64,
+            [0, data, u64::MAX, result, 0, 0],
+            0,
+            |_| {},
+        );
+        assert_return(&outcome, SyscallStatus::RangeOverflow, 1);
+        assert!(service.calls.is_empty());
+    }
+}
+
+#[test]
+fn a_write_only_handle_cannot_read_through_the_dispatcher() {
+    for config in [C::lz32(), C::lz64()] {
+        let data = lazalith_os::USER_DATA_START;
+        let result = data + 256;
+        let buffer = data + 32;
+        let mut filesystem = VirtualFileSystem::with_defaults().unwrap();
+        let node = filesystem.insert_file(b"/secret", b"classified").unwrap();
+        let (outcome, process, service) = dispatch_filesystem_call(
+            config,
+            Syscall::Read,
+            [2, buffer, 4, result, 0, 0],
+            filesystem,
+            |memory| {
+                memory
+                    .handles()
+                    .open_file(node, FileAccess::new(false, true))
+                    .unwrap();
+            },
+        );
+        assert_return(&outcome, SyscallStatus::PermissionDenied, 0);
+        let mut encoded = [0u8; 16];
+        process
+            .memory()
+            .address_space()
+            .peek(PhysicalAddress::new(result), &mut encoded)
+            .unwrap();
+        assert_eq!(IoResult::decode(&encoded, config).unwrap().transferred(), 0);
+        let mut written = [0u8; 4];
+        process
+            .memory()
+            .address_space()
+            .peek(PhysicalAddress::new(buffer), &mut written)
+            .unwrap();
+        assert_eq!(&written, &[0, 0, 0, 0], "no bytes may be copied");
+        assert_eq!(
+            service
+                .filesystem()
+                .read_at(node, 0, 99, FileAccess::new(true, true))
+                .unwrap(),
+            b"classified"
+        );
     }
 }

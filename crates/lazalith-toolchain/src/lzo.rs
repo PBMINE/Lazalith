@@ -421,6 +421,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ObjectFile, ObjectError> {
     let config = target.architecture();
     let max_name_bytes = OBJECT_MAX_MATERIALIZED_NAME_BYTES;
     let mut name_bytes = 0usize;
+    let mut string_ranges: Vec<(usize, usize)> = Vec::new();
     let mut sections = Vec::new();
     sections
         .try_reserve_exact(section_count_usize)
@@ -476,7 +477,13 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ObjectFile, ObjectError> {
                 offset: section_offset + (index as u64) * 64 + 56,
             });
         }
-        let name = read_string_bounded(string_bytes, name_offset, &mut name_bytes, max_name_bytes)?;
+        let name = read_string_bounded(
+            string_bytes,
+            name_offset,
+            &mut name_bytes,
+            max_name_bytes,
+            &mut string_ranges,
+        )?;
         let kind = section_kind(kind_raw, index)?;
         let expected_file_offset = if file_size == 0 {
             0
@@ -566,7 +573,13 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ObjectFile, ObjectError> {
         }
         let value = symbol_reader.u64()?;
         let size = symbol_reader.u64()?;
-        let name = read_string_bounded(string_bytes, name_offset, &mut name_bytes, max_name_bytes)?;
+        let name = read_string_bounded(
+            string_bytes,
+            name_offset,
+            &mut name_bytes,
+            max_name_bytes,
+            &mut string_ranges,
+        )?;
         if section != u16::MAX {
             let section_index = usize::from(section);
             let count =
@@ -649,7 +662,13 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ObjectFile, ObjectError> {
             });
         }
         debug_sources.push(DebugSource::new(
-            read_string_bounded(string_bytes, name_offset, &mut name_bytes, max_name_bytes)?,
+            read_string_bounded(
+                string_bytes,
+                name_offset,
+                &mut name_bytes,
+                max_name_bytes,
+                &mut string_ranges,
+            )?,
             length,
         ));
     }
@@ -683,6 +702,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ObjectFile, ObjectError> {
             reason: "payload does not end at EOF",
         });
     }
+    verify_string_table_coverage(string_bytes, string_ranges)?;
     for (index, (raw, actual)) in section_symbol_counts
         .iter()
         .zip(actual_symbol_counts.iter())
@@ -823,6 +843,7 @@ fn read_string_bounded(
     offset: u32,
     used: &mut usize,
     maximum: usize,
+    referenced: &mut Vec<(usize, usize)>,
 ) -> Result<String, ObjectError> {
     if offset == 0 {
         return Err(ObjectError::InvalidString { offset });
@@ -847,7 +868,33 @@ fn read_string_bounded(
         return Err(ObjectError::InvalidString { offset });
     }
     *used = next;
+    referenced.push((start, start + length + 1));
     Ok(String::from(value))
+}
+
+fn verify_string_table_coverage(
+    table: &[u8],
+    mut referenced: Vec<(usize, usize)>,
+) -> Result<(), ObjectError> {
+    referenced.sort_unstable();
+    let mut cursor = 1usize;
+    for (start, end) in referenced {
+        if end <= cursor {
+            continue;
+        }
+        if start != cursor {
+            return Err(ObjectError::InvalidString {
+                offset: u32::try_from(start).unwrap_or(u32::MAX),
+            });
+        }
+        cursor = end;
+    }
+    if cursor != table.len() {
+        return Err(ObjectError::InvalidString {
+            offset: u32::try_from(table.len()).unwrap_or(u32::MAX),
+        });
+    }
+    Ok(())
 }
 fn put_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     output.extend_from_slice(bytes);

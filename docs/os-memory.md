@@ -90,8 +90,10 @@ calling procedures. The initial SP leaves a 4 KiB top margin inside the mapped
 stack region.
 
 Kernel allocation and User allocation metadata are not architectural memory and
-must not be placed in User-accessible ranges. The future kernel memory manager
-will validate every pool against this complete map before publishing a layout.
+must not be placed in User-accessible ranges. The Step 34 `KernelMemory` and
+`UserMemory` layouts hard-code this map and their pools are bounded by the
+regions defined here, so disjointness is structural rather than re-validated per
+pool.
 
 ## User memory
 
@@ -184,9 +186,9 @@ Supervisor stack explicitly before calling procedures.
 
 ## Paging and future extension
 
-v1 has no virtual pages and therefore defines no active page size. Four KiB is
-the architectural alignment already used for instructions and is the planned
-minimum future page size, but Step 33 does not expose `PageNumber`, page tables,
+v1 has no virtual pages and therefore defines no active page size. Instructions
+are four-byte aligned, and Four KiB is only the planned minimum future page
+size; Step 33 does not expose `PageNumber`, page tables,
 MMU state, TLB behavior, demand paging, copy-on-write, or shared mappings.
 
 A future MMU can be inserted at the Bus translation boundary. Process and kernel

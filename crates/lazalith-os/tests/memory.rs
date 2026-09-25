@@ -398,3 +398,30 @@ fn kernel_consumes_the_shared_os_abi_without_copying_definitions() {
         [2, 3]
     );
 }
+
+#[test]
+fn bump_pool_reports_alignment_aware_remaining_capacity() {
+    let mut pool = BumpPool::new(C::lz64(), PhysicalAddress::new(0x1000), 0x20, 8).unwrap();
+    pool.allocate(1, 1).unwrap();
+    assert_eq!(pool.remaining(), 0x1f);
+    pool.allocate(3, 1).unwrap();
+    assert_eq!(pool.remaining(), 0x1c);
+    let mut padded = BumpPool::new(C::lz64(), PhysicalAddress::new(0x1000), 0x10, 1).unwrap();
+    padded.allocate(4, 1).unwrap();
+    let before = padded.clone();
+    assert!(
+        matches!(
+            padded.allocate(1, 0x10),
+            Err(MemoryError::Exhausted { remaining: 0, .. })
+        ),
+        "alignment padding must not be reported as usable capacity"
+    );
+    assert_eq!(padded, before);
+    let tail = pool.allocate(0x1c, 1).unwrap();
+    assert_eq!(tail.address().as_u64(), 0x1004);
+    assert_eq!(pool.remaining(), 0);
+    assert!(matches!(
+        pool.allocate(1, 1),
+        Err(MemoryError::Exhausted { remaining: 0, .. })
+    ));
+}

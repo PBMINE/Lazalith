@@ -15,9 +15,24 @@ fn virtual_filesystem_resolves_files_and_supports_offsets() {
         )
         .unwrap();
     assert_eq!(opened.access, FileAccess::new(true, true));
-    assert_eq!(filesystem.read_at(opened.node, 0, 3).unwrap(), b"abc");
-    assert_eq!(filesystem.read_at(opened.node, 0, 0).unwrap(), b"");
-    assert_eq!(filesystem.read_at(opened.node, 1, 99).unwrap(), b"bc");
+    assert_eq!(
+        filesystem
+            .read_at(opened.node, 0, 3, opened.access)
+            .unwrap(),
+        b"abc"
+    );
+    assert_eq!(
+        filesystem
+            .read_at(opened.node, 0, 0, opened.access)
+            .unwrap(),
+        b""
+    );
+    assert_eq!(
+        filesystem
+            .read_at(opened.node, 1, 99, opened.access)
+            .unwrap(),
+        b"bc"
+    );
     assert_eq!(
         filesystem
             .write_at(opened.node, 0, b"", opened.access)
@@ -30,7 +45,12 @@ fn virtual_filesystem_resolves_files_and_supports_offsets() {
             .unwrap(),
         3
     );
-    assert_eq!(filesystem.read_at(opened.node, 0, 99).unwrap(), b"abcdef");
+    assert_eq!(
+        filesystem
+            .read_at(opened.node, 0, 99, opened.access)
+            .unwrap(),
+        b"abcdef"
+    );
     assert_eq!(
         filesystem
             .seek(opened.node, 0, 0, SeekOrigin::Start)
@@ -88,7 +108,19 @@ fn creation_truncation_listing_and_limits_are_deterministic() {
         filesystem.write_at(created.node, 0, b"123456789", FileAccess::new(false, true)),
         Err(FileSystemError::FileTooLarge { .. })
     ));
-    assert_eq!(filesystem.read_at(created.node, 0, 99).unwrap(), b"");
+    assert!(matches!(
+        filesystem.read_at(created.node, 0, 99, created.access),
+        Err(FileSystemError::PermissionDenied)
+    ));
+    let reader = filesystem
+        .open(b"/new.txt", OpenFlags::new(OPEN_READ).unwrap())
+        .unwrap();
+    assert_eq!(
+        filesystem
+            .read_at(reader.node, 0, 99, reader.access)
+            .unwrap(),
+        b""
+    );
     let mut bounded = VirtualFileSystem::new(FileSystemLimits::new(8, 4, 2)).unwrap();
     bounded.insert_file(b"/full", b"12345678").unwrap();
     let overwrite = bounded
@@ -114,6 +146,42 @@ fn creation_truncation_listing_and_limits_are_deterministic() {
         limited.insert_file(b"/second", b"x"),
         Err(FileSystemError::NodeLimit { .. })
     ));
+}
+
+#[test]
+fn file_access_is_enforced_by_the_filesystem_for_reads_and_writes() {
+    let mut filesystem = VirtualFileSystem::with_defaults().unwrap();
+    filesystem.insert_file(b"/secret", b"classified").unwrap();
+    let write_only = filesystem
+        .open(b"/secret", OpenFlags::new(OPEN_WRITE).unwrap())
+        .unwrap();
+    assert_eq!(write_only.access, FileAccess::new(false, true));
+    assert!(matches!(
+        filesystem.read_at(write_only.node, 0, 99, write_only.access),
+        Err(FileSystemError::PermissionDenied)
+    ));
+    assert_eq!(filesystem.metadata(b"/secret").unwrap().size, 10);
+
+    let read_only = filesystem
+        .open(b"/secret", OpenFlags::new(OPEN_READ).unwrap())
+        .unwrap();
+    assert_eq!(read_only.access, FileAccess::new(true, false));
+    assert_eq!(
+        filesystem
+            .read_at(read_only.node, 0, 99, read_only.access)
+            .unwrap(),
+        b"classified"
+    );
+    assert!(matches!(
+        filesystem.write_at(read_only.node, 0, b"x", read_only.access),
+        Err(FileSystemError::PermissionDenied)
+    ));
+    assert_eq!(
+        filesystem
+            .read_at(read_only.node, 0, 99, read_only.access)
+            .unwrap(),
+        b"classified"
+    );
 }
 
 #[test]

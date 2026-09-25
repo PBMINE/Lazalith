@@ -1,4 +1,4 @@
-use lazalith_isa::{Condition, DataSize, Instruction, Opcode, Operand, encode};
+use lazalith_isa::{Condition, ControlRegister, DataSize, Instruction, Opcode, Operand, encode};
 use lazalith_toolchain::{assemble_named, disassemble, disassemble_object};
 use lazalith_types::{ArchitectureConfig, RegisterIndex};
 
@@ -78,4 +78,59 @@ fn disassembler_reads_text_from_an_object() {
     assert_eq!(sections.len(), 1);
     assert_eq!(sections[0].instructions().len(), 2);
     assert_eq!(sections[0].instructions()[0].text(), "NOP");
+}
+
+#[test]
+fn every_printed_instruction_reassembles_to_identical_bytes() {
+    for config in [ArchitectureConfig::lz32(), ArchitectureConfig::lz64()] {
+        let arch = if config == ArchitectureConfig::lz32() {
+            "lz32"
+        } else {
+            "lz64"
+        };
+        let mut source = format!(".arch {arch}\n.entry _start\n_start:\n");
+        let mut expected = Vec::new();
+        for opcode in Opcode::ALL {
+            let operands = sample_operands(*opcode, config);
+            let Ok(instruction) = Instruction::new(config, *opcode, &operands) else {
+                continue;
+            };
+            let Ok(bytes) = encode(config, &instruction) else {
+                continue;
+            };
+            let printed = disassemble(config, &bytes).unwrap()[0].text().to_owned();
+            source.push_str(&format!("{printed}\n"));
+            expected.extend_from_slice(&bytes);
+        }
+        let object = assemble_named("every-form.lzs", &source).unwrap();
+        assert_eq!(
+            object.code(),
+            &expected,
+            "{arch}: every printed form must re-assemble"
+        );
+        let sections = disassemble_object(&object).unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].section(), 0);
+        assert_eq!(sections[0].instructions().len(), expected.len() / 8);
+    }
+}
+
+fn sample_operands(opcode: Opcode, _config: ArchitectureConfig) -> Vec<Operand> {
+    let register = RegisterIndex::try_from(1).unwrap();
+    let mut operands = Vec::new();
+    for definition in opcode.definition().operands() {
+        let operand = match definition.kind {
+            lazalith_isa::OperandKind::Register => Operand::Register(register),
+            lazalith_isa::OperandKind::Immediate => Operand::Immediate(-4),
+            lazalith_isa::OperandKind::Memory => Operand::Memory {
+                base: register,
+                displacement: -8,
+            },
+            lazalith_isa::OperandKind::DataSize => Operand::DataSize(DataSize::Word),
+            lazalith_isa::OperandKind::Condition => Operand::Condition(Condition::Ne),
+            lazalith_isa::OperandKind::Control => Operand::Control(ControlRegister::Estatus),
+        };
+        operands.push(operand);
+    }
+    operands
 }

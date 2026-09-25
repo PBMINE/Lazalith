@@ -339,6 +339,9 @@ pub enum ProcessStateError {
         process_id: ProcessId,
         state: ProcessState,
     },
+    NotInSyscall {
+        process_id: ProcessId,
+    },
 }
 
 impl fmt::Display for ProcessStateError {
@@ -356,6 +359,11 @@ impl fmt::Display for ProcessStateError {
             Self::Terminal { process_id, state } => write!(
                 f,
                 "process {} is terminal in state {state:?}",
+                process_id.get()
+            ),
+            Self::NotInSyscall { process_id } => write!(
+                f,
+                "process {} can only be terminated from a dispatched syscall",
                 process_id.get()
             ),
         }

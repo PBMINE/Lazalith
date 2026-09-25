@@ -120,7 +120,18 @@ fn lzx_allows_an_empty_data_section() {
 fn lzx_parser_rejects_malformed_headers_without_panicking() {
     let encoded = minimal_image().to_bytes().unwrap();
     for end in 0..encoded.len() {
-        let _ = LzxImage::from_bytes(&encoded[..end]);
+        assert!(
+            LzxImage::from_bytes(&encoded[..end]).is_err(),
+            "a {end}-byte prefix must not be accepted"
+        );
+    }
+    for extra in 1..8usize {
+        let mut extended = encoded.clone();
+        extended.extend(core::iter::repeat_n(0u8, extra));
+        assert!(
+            LzxImage::from_bytes(&extended).is_err(),
+            "trailing bytes must be rejected"
+        );
     }
     let mut bad_magic = encoded.clone();
     bad_magic[0] ^= 1;
@@ -278,4 +289,153 @@ fn lzx_file_header_and_section_layout_are_stable() {
     assert_eq!(u64::from_le_bytes(encoded[56..64].try_into().unwrap()), 112);
     assert_eq!(encoded[LZX_HEADER_SIZE], LzxSectionKind::Code as u8);
     assert_eq!(encoded[LZX_HEADER_SIZE + 1], LZX_CODE_PERMISSIONS);
+}
+
+fn set_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn set_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn set_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+#[test]
+fn lzx_rejects_every_unreachable_header_and_table_field() {
+    let image = image_with_sections(
+        LzxArchitecture::Lz64,
+        &[0; 16],
+        Some((&[1, 2, 3, 4], 0)),
+        Some((16, 8)),
+        32,
+    );
+    let canonical = image.to_bytes().unwrap();
+    let record = LZX_HEADER_SIZE;
+
+    let mut header_size = canonical.clone();
+    set_u16(&mut header_size, 10, 63);
+    assert!(matches!(
+        LzxImage::from_bytes(&header_size),
+        Err(LzxError::InvalidHeaderSize { .. })
+    ));
+
+    let mut header_reserved = canonical.clone();
+    header_reserved[26] = 1;
+    assert!(matches!(
+        LzxImage::from_bytes(&header_reserved),
+        Err(LzxError::InvalidReserved { .. })
+    ));
+
+    let mut section_count = canonical.clone();
+    set_u16(&mut section_count, 18, 4);
+    assert!(matches!(
+        LzxImage::from_bytes(&section_count),
+        Err(LzxError::InvalidSectionCount { .. })
+    ));
+
+    let mut table_offset = canonical.clone();
+    set_u64(&mut table_offset, 44, 8);
+    assert!(matches!(
+        LzxImage::from_bytes(&table_offset),
+        Err(LzxError::InvalidSectionTableOffset { .. })
+    ));
+
+    let mut table_size = canonical.clone();
+    set_u32(&mut table_size, 52, 47);
+    assert!(matches!(
+        LzxImage::from_bytes(&table_size),
+        Err(LzxError::InvalidSectionTableSize { .. })
+    ));
+
+    let mut required_data = canonical.clone();
+    set_u64(&mut required_data, 28, 8);
+    assert!(matches!(
+        LzxImage::from_bytes(&required_data),
+        Err(LzxError::InvalidMemoryRequirement { .. })
+    ));
+
+    let mut required_stack = canonical.clone();
+    set_u64(&mut required_stack, 36, USER_STACK_LENGTH + 8);
+    assert!(matches!(
+        LzxImage::from_bytes(&required_stack),
+        Err(LzxError::InvalidStackRequirement { .. })
+    ));
+
+    let mut entry_section = canonical.clone();
+    set_u16(&mut entry_section, 20, 1);
+    assert!(matches!(
+        LzxImage::from_bytes(&entry_section),
+        Err(LzxError::InvalidEntrySection { .. })
+    ));
+
+    let mut entry_offset = canonical.clone();
+    set_u32(&mut entry_offset, 22, 2);
+    assert!(LzxImage::from_bytes(&entry_offset).is_err());
+
+    let mut section_reserved = canonical.clone();
+    section_reserved[record + 2] = 1;
+    assert!(matches!(
+        LzxImage::from_bytes(&section_reserved),
+        Err(LzxError::InvalidReserved { .. })
+    ));
+
+    let mut section_kind = canonical.clone();
+    section_kind[record] = 9;
+    assert!(matches!(
+        LzxImage::from_bytes(&section_kind),
+        Err(LzxError::InvalidSectionKind { .. })
+    ));
+
+    let mut section_alignment = canonical.clone();
+    set_u64(&mut section_alignment, record + 36, 3);
+    assert!(matches!(
+        LzxImage::from_bytes(&section_alignment),
+        Err(LzxError::InvalidSectionAlignment { .. })
+    ));
+
+    let mut code_offset = canonical.clone();
+    set_u64(&mut code_offset, record + 4, 8);
+    assert!(matches!(
+        LzxImage::from_bytes(&code_offset),
+        Err(LzxError::InvalidCodeSection { .. })
+    ));
+
+    let mut code_size = canonical.clone();
+    set_u64(
+        &mut code_size,
+        record + 12,
+        lazalith_os::USER_CODE_LENGTH + 8,
+    );
+    assert!(LzxImage::from_bytes(&code_size).is_err());
+
+    let mut bss_file_bytes = canonical.clone();
+    set_u64(&mut bss_file_bytes, record + 2 * 48 + 28, 4);
+    assert!(matches!(
+        LzxImage::from_bytes(&bss_file_bytes),
+        Err(LzxError::SectionRange { .. })
+    ));
+    let mut bss_virtual = canonical.clone();
+    set_u64(&mut bss_virtual, record + 2 * 48 + 12, 0);
+    assert!(matches!(
+        LzxImage::from_bytes(&bss_virtual),
+        Err(LzxError::InvalidSectionSize { .. })
+    ));
+    let mut data_short = canonical.clone();
+    set_u64(&mut data_short, record + 48 + 12, 2);
+    assert!(matches!(
+        LzxImage::from_bytes(&data_short),
+        Err(LzxError::InvalidSectionSize { .. })
+    ));
+
+    let mut too_large = vec![0u8; 4 * 1024 * 1024 + 1];
+    too_large[..canonical.len()].copy_from_slice(&canonical);
+    assert!(matches!(
+        LzxImage::from_bytes(&too_large),
+        Err(LzxError::FileTooLarge { .. })
+    ));
+
+    assert_eq!(LzxImage::from_bytes(&canonical).unwrap(), image);
 }

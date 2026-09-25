@@ -72,8 +72,9 @@ the object format.
 ## Determinism is a feature
 
 Lazen does not expose wall-clock time, random host state, filesystem shortcuts,
-or network calls in its core language. Time and entropy, when added, are
-explicit OS services and remain deterministic in headless execution. This
+or network calls implicitly in its core language. Time and entropy, when
+reached, are explicit OS services obtained through a declared wrapper such as
+`time()`, and remain deterministic in headless execution. This
 makes the same source produce the same observable behavior in a unit test, a
 boot session, and a future SDL frontend.
 

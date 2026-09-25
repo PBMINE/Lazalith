@@ -927,7 +927,7 @@ fn rfe_releases_retained_fault_diagnostic() {
 }
 
 #[test]
-fn interrupts_wait_for_running_boundaries_deliver_lowest_first_and_defer_in_frame() {
+fn interrupts_deliver_at_every_executable_boundary_lowest_first_and_defer_in_frame() {
     for config in [C::lz32(), C::lz64()] {
         let mut machine = trap_machine(
             config,
@@ -936,38 +936,96 @@ fn interrupts_wait_for_running_boundaries_deliver_lowest_first_and_defer_in_fram
             16,
         );
         machine.set_trap_vector(I::new(0x100)).unwrap();
+        assert_eq!(machine.state(), MachineState::Reset);
         assert!(machine.request_interrupt(InterruptId::new(7)).unwrap());
         assert!(!machine.request_interrupt(InterruptId::new(7)).unwrap());
         assert!(machine.request_interrupt(InterruptId::new(1)).unwrap());
 
-        assert!(matches!(
-            machine.step().unwrap(),
-            lazalith_machine::MachineEvent::Stepped { .. }
-        ));
-        assert_eq!(machine.architectural_state().pc(), I::new(8));
-        assert_eq!(machine.interrupts().len(), 2);
-        assert_eq!(machine.run(0).unwrap().executed, 0);
-        let delivered = machine.run(1).unwrap();
-        assert_eq!(delivered.executed, 0);
+        let delivered = machine.step().unwrap();
         assert_eq!(
-            delivered.trap,
-            Some(lazalith_machine::TrapEvent {
-                cause: TrapCause::ExternalInterrupt,
-                payload: 1,
-                resume_pc: I::new(8),
-                interrupt: Some(InterruptId::new(1)),
-            })
+            delivered,
+            lazalith_machine::MachineEvent::Trapped {
+                event: lazalith_machine::TrapEvent {
+                    cause: TrapCause::ExternalInterrupt,
+                    payload: 1,
+                    resume_pc: I::new(0),
+                    interrupt: Some(InterruptId::new(1)),
+                },
+            }
         );
+        assert_eq!(machine.architectural_state().pc(), I::new(0x100));
         assert_eq!(machine.interrupts().peek(), Some(InterruptId::new(7)));
         assert!(machine.trap_controller().has_active_frame());
 
-        let halted = machine.run(1).unwrap();
-        assert_eq!(halted.halted_at, Some(2));
+        let deferred = machine.step().unwrap();
+        assert_eq!(deferred, lazalith_machine::MachineEvent::Halted);
+        assert_eq!(machine.architectural_state().pc(), I::new(0x108));
+        assert_eq!(machine.interrupts().peek(), Some(InterruptId::new(7)));
         assert_eq!(machine.state(), MachineState::Halted);
+        assert!(matches!(
+            machine.run(1),
+            Err(MachineError::InvalidTransition {
+                operation: MachineOperation::Run,
+                state: MachineState::Halted
+            })
+        ));
         assert_eq!(machine.interrupts().peek(), Some(InterruptId::new(7)));
         machine.reset();
         assert!(machine.interrupts().is_empty());
         assert!(!machine.trap_controller().has_active_frame());
+        assert_eq!(machine.state(), MachineState::Reset);
+    }
+}
+
+#[test]
+fn interrupt_delivery_requires_an_enabled_interrupt_at_an_executable_boundary() {
+    for config in [C::lz32(), C::lz64()] {
+        let mut masked = trap_machine(
+            config,
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            0,
+        );
+        masked.set_trap_vector(I::new(0x100)).unwrap();
+        masked.request_interrupt(InterruptId::new(3)).unwrap();
+        assert!(matches!(
+            masked.step().unwrap(),
+            lazalith_machine::MachineEvent::Stepped { .. }
+        ));
+        assert_eq!(masked.interrupts().peek(), Some(InterruptId::new(3)));
+        assert!(!masked.trap_controller().has_active_frame());
+
+        let mut running = trap_machine(
+            config,
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            16,
+        );
+        running.set_trap_vector(I::new(0x100)).unwrap();
+        running.request_interrupt(InterruptId::new(3)).unwrap();
+        let run = running.run(1).unwrap();
+        assert_eq!(run.executed, 0);
+        assert_eq!(
+            run.trap.map(|event| event.cause),
+            Some(TrapCause::ExternalInterrupt)
+        );
+
+        let mut paused = trap_machine(
+            config,
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            16,
+        );
+        paused.set_trap_vector(I::new(0x100)).unwrap();
+        assert_eq!(paused.run(1).unwrap().executed, 1);
+        paused.pause().unwrap();
+        assert_eq!(paused.state(), MachineState::Paused);
+        paused.request_interrupt(InterruptId::new(3)).unwrap();
+        assert!(matches!(
+            paused.step().unwrap(),
+            lazalith_machine::MachineEvent::Trapped { .. }
+        ));
+        assert_eq!(paused.interrupts().len(), 0);
     }
 }
 

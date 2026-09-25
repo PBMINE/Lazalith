@@ -189,6 +189,7 @@ pub struct UserMemoryContext<'a> {
     program: &'a ProgramImage,
     stack: &'a StackRegion,
     execution_context: Option<ExecutionContextId>,
+    in_syscall: bool,
 }
 
 impl<'a> UserMemoryContext<'a> {
@@ -228,6 +229,7 @@ impl<'a> UserMemoryContext<'a> {
             program,
             stack,
             execution_context,
+            in_syscall: false,
         })
     }
 
@@ -263,6 +265,13 @@ impl<'a> UserMemoryContext<'a> {
             });
         }
         if matches!(next, ProcessState::Exited | ProcessState::Faulted) {
+            return Err(crate::ProcessStateError::InvalidTransition {
+                process_id: self.process_id,
+                from: *self.state,
+                to: next,
+            });
+        }
+        if *self.state == ProcessState::Running && next == ProcessState::Ready {
             return Err(crate::ProcessStateError::InvalidTransition {
                 process_id: self.process_id,
                 from: *self.state,
@@ -308,6 +317,11 @@ impl<'a> UserMemoryContext<'a> {
             return Err(crate::ProcessStateError::Terminal {
                 process_id: self.process_id,
                 state: *self.state,
+            });
+        }
+        if !self.in_syscall {
+            return Err(crate::ProcessStateError::NotInSyscall {
+                process_id: self.process_id,
             });
         }
         *self.state = ProcessState::Exited;
@@ -965,10 +979,14 @@ fn abi_detail(error: AbiError) -> u32 {
     }
 }
 
-fn complete_admission(admission: SyscallAdmission, outcome: TaggedOutcome) -> SyscallCompletion {
-    admission
-        .complete_checked(outcome.status().as_u32(), outcome.payload())
-        .unwrap_or_else(|| unreachable!())
+fn returning_outcome(admission: SyscallAdmission, outcome: TaggedOutcome) -> DispatchOutcome {
+    match admission.complete_checked(outcome.status().as_u32(), outcome.payload()) {
+        Some(completion) => DispatchOutcome::Return {
+            outcome,
+            completion,
+        },
+        None => DispatchOutcome::Fault(SyscallError::Internal),
+    }
 }
 
 #[derive(Default)]
@@ -997,6 +1015,7 @@ impl SyscallDispatcher {
         {
             return DispatchOutcome::Fault(SyscallError::InvalidState);
         }
+        memory.in_syscall = true;
         let SyscallRequest {
             config,
             admission,
@@ -1012,34 +1031,22 @@ impl SyscallDispatcher {
                     SyscallError::from(error),
                     u32::try_from(number).unwrap_or(u32::MAX),
                 );
-                return DispatchOutcome::Return {
-                    completion: complete_admission(admission, outcome),
-                    outcome,
-                };
+                return returning_outcome(admission, outcome);
             }
         };
         if let Err(error) = validate_reserved_register(reserved) {
             let outcome = ValidationError::Abi(error).into_outcome();
-            return DispatchOutcome::Return {
-                completion: complete_admission(admission, outcome),
-                outcome,
-            };
+            return returning_outcome(admission, outcome);
         }
         if let Err(error) = arguments.validate_required_zero(call) {
             let outcome = ValidationError::Abi(error).into_outcome();
-            return DispatchOutcome::Return {
-                completion: complete_admission(admission, outcome),
-                outcome,
-            };
+            return returning_outcome(admission, outcome);
         }
         let call = match Self::validate(config, arguments, memory, call) {
             Ok(call) => call,
             Err(error) => {
                 let outcome = error.into_outcome();
-                return DispatchOutcome::Return {
-                    completion: complete_admission(admission, outcome),
-                    outcome,
-                };
+                return returning_outcome(admission, outcome);
             }
         };
         match (call.kind(), service.invoke(&call, memory)) {
@@ -1059,10 +1066,7 @@ impl SyscallDispatcher {
                     memory.state(),
                     ProcessState::Running | ProcessState::Blocked
                 ) {
-                    DispatchOutcome::Return {
-                        completion: complete_admission(admission, outcome),
-                        outcome,
-                    }
+                    returning_outcome(admission, outcome)
                 } else {
                     DispatchOutcome::Fault(SyscallError::Internal)
                 }

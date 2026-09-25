@@ -491,16 +491,20 @@ impl RoundRobinScheduler {
                 actual: process.state(),
             });
         }
-        if process.execution_context() != Some(active.execution_context)
-            || machine.active_execution_context() != Some(active.execution_context)
+        let process_context = process.execution_context();
+        let machine_context = machine.active_execution_context();
+        if process_context != Some(active.execution_context)
+            || machine_context != Some(active.execution_context)
         {
+            let stale = if process_context != Some(active.execution_context) {
+                process_context
+            } else {
+                machine_context
+            };
             return Err(SchedulerError::ProcessExecution(
                 ProcessExecutionError::ContextMismatch {
                     expected: active.execution_context,
-                    actual: process
-                        .execution_context()
-                        .or(machine.active_execution_context())
-                        .unwrap_or(active.execution_context),
+                    actual: stale.unwrap_or(active.execution_context),
                 },
             ));
         }
@@ -591,12 +595,14 @@ impl RoundRobinScheduler {
         {
             let _ = process.deactivate(context);
             let _ = process.preempt();
+            self.poison_after_machine_error(machine);
             return Err(SchedulerError::Machine(error));
         }
         if machine.memory().identity() != &process.memory().identity() {
             let _ = machine.recover_user_context(process.memory_mut().address_space_mut(), context);
             let _ = process.deactivate(context);
             let _ = process.preempt();
+            self.poison_after_machine_error(machine);
             return Err(SchedulerError::Machine(MachineError::InvalidUserContext {
                 reason: "activated address-space identity does not match process",
             }));

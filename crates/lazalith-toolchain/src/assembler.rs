@@ -2,7 +2,7 @@ use crate::{
     CodeMapping, DebugSource, ObjectBuilder, ObjectFile, Relocation, RelocationKind, Section,
     Symbol, SymbolBinding, ToolchainError,
 };
-use alloc::{borrow::ToOwned, boxed::Box, collections::BTreeMap, string::String, vec::Vec};
+use alloc::{borrow::ToOwned, boxed::Box, collections::BTreeMap, format, string::String, vec::Vec};
 use core::{error::Error, fmt};
 use lazalith_diagnostics::{Diagnostic, DiagnosticCode, Label, Severity};
 use lazalith_isa::{
@@ -185,7 +185,21 @@ impl SectionAccumulator {
         if self.key == SectionKey::Bss {
             self.bss_size = next;
         } else {
-            self.bytes.resize(self.bytes.len() + padding as usize, 0);
+            let padding = usize::try_from(padding).map_err(|_| {
+                ToolchainError::Assembly(Box::new(AssemblyError::Diagnostic {
+                    diagnostic: Diagnostic::new(
+                        Severity::Error,
+                        DiagnosticCode::new("E202").expect("assembler diagnostic code is valid"),
+                        "alignment padding is out of range",
+                    ),
+                    sources: SourceManager::new(),
+                }))
+            })?;
+            let target = self.bytes.len().saturating_add(padding);
+            self.bytes
+                .try_reserve(padding)
+                .map_err(ToolchainError::Allocation)?;
+            self.bytes.resize(target, 0);
         }
         self.used = true;
         Ok(next)
@@ -1536,6 +1550,19 @@ impl<'a> Assembler<'a> {
             section_indices.insert(key, index);
         }
         let mut symbol_indices = BTreeMap::new();
+        for (name, global) in &self.globals {
+            if *global
+                && !self
+                    .symbols
+                    .iter()
+                    .any(|definition| definition.name == *name)
+            {
+                let index = builder
+                    .add_symbol(Symbol::undefined(name.clone(), SymbolBinding::Global))
+                    .map_err(ToolchainError::Object)?;
+                symbol_indices.insert(name.clone(), index);
+            }
+        }
         for definition in &self.symbols {
             let binding = if definition.global {
                 SymbolBinding::Global
@@ -1742,8 +1769,14 @@ impl<'a> Assembler<'a> {
             sources: self.manager.clone(),
         }))
     }
-    fn map_error(&self, _error: ToolchainError, start: usize, end: usize) -> ToolchainError {
-        self.fail(start, end, "E303", "assembler operation failed")
+    fn map_error(&self, error: ToolchainError, start: usize, end: usize) -> ToolchainError {
+        match error {
+            ToolchainError::Assembly(source) => ToolchainError::Assembly(source),
+            other => {
+                let message = format!("assembler operation failed: {other}");
+                self.fail(start, end, "E303", &message)
+            }
+        }
     }
 }
 

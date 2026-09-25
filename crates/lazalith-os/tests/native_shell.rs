@@ -4,15 +4,15 @@ use lazalith_isa::{Instruction, Opcode, decode, encode};
 use lazalith_machine::{LazalithMachine, MachineEvent, MachineSetup};
 use lazalith_memory::{MemoryRegion, RegionPermissions};
 use lazalith_os::{
-    DispatchOutcome, FileSystemService, LzxArchitecture, LzxImage, LzxSectionKind,
+    DispatchOutcome, FileSystemService, HeadlessShell, LzxArchitecture, LzxImage, LzxSectionKind,
     NATIVE_SHELL_BSS_LENGTH, NATIVE_SHELL_BSS_OFFSET, NATIVE_SHELL_CAT_PATH,
     NATIVE_SHELL_DATA_LENGTH, NATIVE_SHELL_DATA_OFFSET, NATIVE_SHELL_DIRECTORY_OFFSET,
     NATIVE_SHELL_FILE_BUFFER_OFFSET, NATIVE_SHELL_HELP, NATIVE_SHELL_IO_RESULT_OFFSET,
     NATIVE_SHELL_LINE_BUFFER_OFFSET, NATIVE_SHELL_LS_HEADER, NATIVE_SHELL_LS_PATH,
     NATIVE_SHELL_PROCESS_LAUNCH_SUPPORTED, NATIVE_SHELL_PROMPT, NATIVE_SHELL_REQUIRED_DATA,
-    NATIVE_SHELL_RUN_DEFERRED, ProcessId, RoundRobinScheduler, TerminalService, ThreadId,
-    USER_CODE_START, USER_DATA_START, USER_INITIAL_SP, USER_STACK_LENGTH, UserMemory,
-    VirtualFileSystem, VirtualTerminal, build_init_shell_image,
+    NATIVE_SHELL_RUN_DEFERRED, ProcessId, RoundRobinScheduler, ShellCommand, ShellError,
+    ShellOutcome, TerminalService, ThreadId, USER_CODE_START, USER_DATA_START, USER_INITIAL_SP,
+    USER_STACK_LENGTH, UserMemory, VirtualFileSystem, VirtualTerminal, build_init_shell_image,
 };
 use lazalith_types::{
     ArchitectureConfig as C, CycleCount, InstructionAddress, PhysicalAddress, VirtualAddress,
@@ -283,5 +283,69 @@ fn native_shell_fixture_executes_bounded_commands() {
 
         let (_, generation) = run_native_shell(architecture, b"clear\n");
         assert_eq!(generation, 1);
+    }
+}
+
+#[test]
+fn the_two_shells_declare_one_conformance_contract() {
+    let architecture = LzxArchitecture::Lz64;
+    for input in [&b"help\n"[..], b"echo hello\n", b"echo\n"] {
+        let (guest, _) = run_native_shell(architecture, input);
+        let mut host = HeadlessShell::new(VirtualFileSystem::with_defaults().unwrap());
+        host.print_prompt().unwrap();
+        host.execute_line(trim_newline(input)).unwrap();
+        assert_eq!(
+            guest.starts_with(NATIVE_SHELL_PROMPT),
+            host.output().starts_with(NATIVE_SHELL_PROMPT),
+            "both shells must emit the same prompt for {input:?}"
+        );
+    }
+
+    let (guest, _) = run_native_shell(architecture, b"unknown\n");
+    assert!(guest.starts_with(&[NATIVE_SHELL_PROMPT, b"unknown command\n"].concat()));
+    let mut host = HeadlessShell::new(VirtualFileSystem::with_defaults().unwrap());
+    assert!(matches!(
+        host.execute_line(b"unknown"),
+        Err(ShellError::UnknownCommand { command }) if command == b"unknown"
+    ));
+
+    let (guest, _) = run_native_shell(architecture, b"\n");
+    assert!(
+        guest.starts_with(&[NATIVE_SHELL_PROMPT, b"unknown command\n"].concat()),
+        "a blank line is outside the in-image subset and is reported"
+    );
+    assert!(matches!(host.execute_line(b""), Err(ShellError::EmptyLine)));
+
+    let (guest, _) = run_native_shell(architecture, b"ls /dir\n");
+    assert!(
+        guest
+            .windows(b"unknown command".len())
+            .any(|window| window == b"unknown command"),
+        "the in-image shell is a documented subset: it takes no ls argument"
+    );
+    let mut host = HeadlessShell::new(VirtualFileSystem::with_defaults().unwrap());
+    host.filesystem_mut().insert_directory(b"/dir").unwrap();
+    assert!(matches!(
+        host.execute_line(b"ls /dir"),
+        Ok(ShellOutcome {
+            command: ShellCommand::Ls,
+            ..
+        })
+    ));
+
+    let (guest, generation) = run_native_shell(architecture, b"clear\n");
+    assert_eq!(generation, 1);
+    let mut host = HeadlessShell::new(VirtualFileSystem::with_defaults().unwrap());
+    host.print_prompt().unwrap();
+    host.execute_line(b"clear").unwrap();
+    assert_eq!(host.screen_generation(), 1);
+    assert!(host.output().is_empty(), "clear resets the host transcript");
+    let _ = guest;
+}
+
+fn trim_newline(input: &[u8]) -> &[u8] {
+    match input.strip_suffix(b"\n") {
+        Some(trimmed) => trimmed,
+        None => input,
     }
 }

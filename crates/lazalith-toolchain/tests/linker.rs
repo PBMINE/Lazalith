@@ -142,3 +142,100 @@ fn linker_honors_data_and_bss_alignment() {
     ));
     assert_eq!(program.image().sections()[2].virtual_offset() % 16, 0);
 }
+
+#[test]
+
+fn linker_writes_the_documented_value_for_every_relocation_kind() {
+    for config in [ArchitectureConfig::lz64(), ArchitectureConfig::lz32()] {
+        let dword = if config == ArchitectureConfig::lz64() {
+            ".dword target\n"
+        } else {
+            ""
+        };
+        let source = format!(
+            ".arch {arch}\n.entry _start\n.section .rodata\nro:\n.word target\n.pcrelword target\n{dword}.section .text\n_start:\nBR AL, target\nCALL target\nLI r0, target\nLDZ r1, [r2 + target], BYTE\nSYSCALL\ntarget:\nNOP\n",
+            arch = if config == ArchitectureConfig::lz32() {
+                "lz32"
+            } else {
+                "lz64"
+            }
+        );
+        let name = if config == ArchitectureConfig::lz32() {
+            "all-relocations-lz32.lzs"
+        } else {
+            "all-relocations-lz64.lzs"
+        };
+        let object = assemble_named(name, &source).unwrap();
+        let program = link_objects(&[object], &LinkOptions::default()).unwrap();
+        let code = program.image().sections()[0].bytes();
+        let data = program.image().sections()[1].bytes();
+        let code_base = 0x0020_0000u64;
+        let data_base = 0x0030_0000u64;
+        let instruction = 8u64;
+        let word_field = 4u64;
+        let text_size = code.len() as u64;
+        let target = code_base + text_size - instruction;
+
+        let branch = decode(config, &code[..8]).unwrap();
+        assert_eq!(branch.opcode(), Opcode::Br);
+        assert_eq!(
+            branch.operands()[1],
+            Operand::Immediate(((target - (code_base + instruction)) / 4) as i32)
+        );
+        let call = decode(config, &code[8..16]).unwrap();
+        assert_eq!(call.opcode(), Opcode::Call);
+        assert_eq!(
+            call.operands()[0],
+            Operand::Immediate(((target - (code_base + instruction * 2)) / 4) as i32)
+        );
+        let load = decode(config, &code[16..24]).unwrap();
+        assert_eq!(load.opcode(), Opcode::Li);
+        assert_eq!(load.operands()[1], Operand::Immediate(target as i32));
+        let memory = decode(config, &code[24..32]).unwrap();
+        assert_eq!(memory.opcode(), Opcode::Ldz);
+        assert_eq!(
+            memory.operands()[1],
+            Operand::Memory {
+                base: RegisterIndex::try_from(2).unwrap(),
+                displacement: target as i32,
+            }
+        );
+
+        assert_eq!(
+            u64::from(u32::from_le_bytes(data[0..4].try_into().unwrap())),
+            target,
+            "AbsoluteWord32 stores the symbol runtime address"
+        );
+        assert_eq!(
+            i64::from(i32::from_le_bytes(data[4..8].try_into().unwrap())),
+            i64::try_from(target).unwrap() - i64::try_from(data_base + word_field).unwrap(),
+            "PcRelativeWord32 is relative to the relocated field"
+        );
+        if config == ArchitectureConfig::lz64() {
+            assert_eq!(
+                u64::from_le_bytes(data[8..16].try_into().unwrap()),
+                target,
+                "AbsoluteWord64 stores the symbol runtime address"
+            );
+        }
+    }
+}
+
+#[test]
+fn linker_rejects_relocations_it_cannot_represent() {
+    let narrow = assemble_named(
+        "narrow.lzs",
+        ".arch lz32\n.entry _start\n_start:\nLI r0, 0x1_0000_0000\n",
+    );
+    assert!(narrow.is_err());
+    let misaligned = assemble_named(
+        "misaligned.lzs",
+        ".arch lz64\n.entry _start\n.section .text\n_start:\nBR AL, target\n.section .rodata\n.byte 0\ntarget:\nNOP\n",
+    );
+    assert!(misaligned.is_err());
+    let overflow = assemble_named(
+        "overflow.lzs",
+        ".arch lz64\n.entry _start\n_start:\nBR AL, target\n.section .rodata\n.zero 0x40000000\ntarget:\nNOP\n",
+    );
+    assert!(overflow.is_err());
+}

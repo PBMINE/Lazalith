@@ -7,7 +7,7 @@ use lazalith_os::{
     KernelServiceOutcome, LazalithKernel, LzxArchitecture, LzxImage, ProcessId, ProcessState,
     ThreadId, VirtualFileSystem, VirtualTerminal, build_init_image,
 };
-use lazalith_toolchain::{assemble_named, link_object};
+use lazalith_toolchain::{LinkOptions, ObjectFile, assemble_named, link_object, link_objects};
 use lazalith_types::{ArchitectureConfig as C, InstructionAddress};
 
 fn kernel(config: C) -> Vec<u8> {
@@ -127,4 +127,52 @@ fn object_bridge_rejects_noncanonical_code() {
     code[7] |= 1;
     let object = lazalith_toolchain::ObjectFile::new(LzxArchitecture::Lz64, code, 0);
     assert!(object.is_err());
+}
+
+#[test]
+fn the_serialized_lzo_format_is_the_real_linker_input_in_both_modes() {
+    for (config, name) in [(C::lz32(), "lz32"), (C::lz64(), "lz64")] {
+        let object = assemble_named("pipeline.lzs", &source(name)).unwrap();
+        let serialized = object.to_bytes().unwrap();
+        let reparsed = ObjectFile::from_bytes(&serialized).unwrap();
+        assert_eq!(reparsed, object, "the .lzo round trip must be lossless");
+        assert_eq!(reparsed.to_bytes().unwrap(), serialized);
+        let program = link_objects(&[reparsed], &LinkOptions::default()).unwrap();
+        let bytes = program.image().to_bytes().unwrap();
+        let image = LzxImage::from_bytes(&bytes).unwrap();
+        let process = image
+            .load_process(ProcessId::new(9).unwrap(), ThreadId::new(9).unwrap())
+            .unwrap();
+
+        let boot = BootImage::new(config, kernel(config), 0).unwrap();
+        let mut machine = boot.start(DeviceManager::<NoDevice>::new()).unwrap();
+        machine
+            .set_trap_vector(InstructionAddress::new(KERNEL_LOAD_ADDRESS + 8))
+            .unwrap();
+        machine.step().unwrap();
+        let mut kernel = LazalithKernel::new(
+            1000,
+            VirtualTerminal::new(b"").unwrap(),
+            VirtualFileSystem::with_defaults().unwrap(),
+        )
+        .unwrap();
+        kernel.scheduler_mut().add_process(process).unwrap();
+        let mut exited = false;
+        for _ in 0..10000 {
+            let step = kernel.step(&mut machine).unwrap();
+            if let Some(KernelServiceOutcome::Exit(0)) = step.outcome {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited, "{name}: the .lzo pipeline must reach Exit(0)");
+        assert_eq!(
+            kernel
+                .scheduler()
+                .process(ProcessId::new(9).unwrap())
+                .unwrap()
+                .exit_code(),
+            Some(0)
+        );
+    }
 }

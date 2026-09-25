@@ -53,7 +53,10 @@ All offsets are absolute byte offsets from the beginning of the file. Table
 offsets are canonical and are derived from the preceding count and record
 size. File-backed payloads are emitted in section order, each beginning at an
 8-byte boundary. BSS and empty file-backed sections have no payload. Alignment
-padding is zero. There are no undeclared gaps or trailing bytes.
+padding is zero. There are no undeclared gaps or trailing bytes. The string
+table is canonical in the same sense: it begins with one NUL byte, and the
+names referenced by section, symbol, and debug-source records cover the rest of
+the table exactly once in order, with no unreferenced bytes left at its end.
 
 ## Header
 

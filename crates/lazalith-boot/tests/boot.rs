@@ -1,7 +1,8 @@
 use lazalith_boot::{
-    BOOT_FORMAT_VERSION, BOOT_HEADER_ADDRESS, BOOT_HEADER_SIZE, BOOT_ROM_LENGTH, BootArchitecture,
-    BootError, BootImage, KERNEL_INITIAL_SP, KERNEL_LOAD_ADDRESS, KERNEL_PAYLOAD_ADDRESS,
-    MAX_BOOT_ROM_PAYLOAD,
+    BOOT_ADDRESS, BOOT_FORMAT_VERSION, BOOT_HEADER_ADDRESS, BOOT_HEADER_SIZE, BOOT_ROM_LENGTH,
+    BOOT_ROM_PHYSICAL_START, BOOT_ROM_START, BootArchitecture, BootError, BootImage,
+    KERNEL_IMAGE_LENGTH, KERNEL_INITIAL_SP, KERNEL_LOAD_ADDRESS, KERNEL_PAYLOAD_ADDRESS,
+    MAX_BOOT_ROM_PAYLOAD, RESET_VECTOR,
 };
 use lazalith_cpu::Privilege;
 use lazalith_devices::{ConsoleDevice, DeviceId, DeviceManager, NoDevice};
@@ -443,4 +444,49 @@ fn machine_setup_rejects_an_initial_device_clock_ahead_of_boot_epoch() {
             )
     ));
     assert!(Error::source(&error).is_some());
+}
+
+#[test]
+fn the_documented_reset_vector_is_the_single_boot_source_of_truth() {
+    assert_eq!(BOOT_ADDRESS, RESET_VECTOR);
+    assert_eq!(RESET_VECTOR.as_u64(), BOOT_ROM_START);
+    assert_eq!(BOOT_ROM_PHYSICAL_START.as_u64(), BOOT_ROM_START);
+    assert_eq!(
+        KERNEL_INITIAL_SP,
+        KERNEL_LOAD_ADDRESS + KERNEL_IMAGE_LENGTH + 0xF000
+    );
+    for config in [C::lz32(), C::lz64()] {
+        let setup = image(config)
+            .machine_setup(DeviceManager::<NoDevice>::new())
+            .unwrap();
+        assert_eq!(setup.pc, RESET_VECTOR);
+        assert_eq!(setup.sp.as_u64(), KERNEL_INITIAL_SP);
+        let machine = image(config)
+            .start(DeviceManager::<NoDevice>::new())
+            .unwrap();
+        assert_eq!(
+            machine.architectural_state().pc().as_u64(),
+            KERNEL_LOAD_ADDRESS
+        );
+        assert_eq!(
+            machine.architectural_state().sp().as_u64(),
+            KERNEL_INITIAL_SP
+        );
+        assert_eq!(
+            machine.architectural_state().sp().as_u64(),
+            KERNEL_INITIAL_SP
+        );
+        let starts: Vec<u64> = machine
+            .memory()
+            .regions()
+            .iter()
+            .map(|region| region.start().as_u64())
+            .collect();
+        let mut sorted = starts.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), starts.len(), "boot regions must be disjoint");
+        assert!(starts.contains(&BOOT_ROM_PHYSICAL_START.as_u64()));
+        assert!(starts.contains(&KERNEL_LOAD_ADDRESS));
+    }
 }

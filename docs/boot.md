@@ -56,8 +56,12 @@ payload. Kernel software must not depend on unrelated RAM bytes being zero after
 a warm reset. Device output is reset by the device contract; MMIO mappings are
 preserved by the machine.
 
-`HALT` remains terminal until reset. Interrupts are disabled at architectural
-reset and no device interrupt assignment exists in this boot mechanism.
+`HALT` is terminal for instruction execution: `step`, `run`, and `pause` are
+rejected afterwards and only `reset` or binding a User execution context can
+leave that state, because a context switch is a host-driven scheduling event
+rather than continued execution of the halted program. Interrupts are disabled
+at architectural reset and no device interrupt assignment exists in this boot
+mechanism.
 
 ## Reset vector and boot address
 
@@ -67,8 +71,10 @@ The v1 reset vector and boot address are the same value:
 RESET_VECTOR = BOOT_ADDRESS = 0x0000_0000
 ```
 
-`BOOT_ADDRESS` is an `InstructionAddress`; `0` is representable and four-byte
-aligned in both LZ32 and LZ64. The first fetch must obtain eight canonical
+`BOOT_ADDRESS` is an `InstructionAddress` alias of `RESET_VECTOR`, and
+`BOOT_ROM_PHYSICAL_START` is the `PhysicalAddress` form of the same value; the
+machine setup binds its reset program counter and ROM base directly to these
+constants. `0` is representable and four-byte aligned in both LZ32 and LZ64. The first fetch must obtain eight canonical
 instruction bytes from the boot ROM with Supervisor read and execute permission.
 Anything else is a structured boot failure before normal boot execution.
 
@@ -188,15 +194,19 @@ machine. The trusted host validates, in this order:
 9. The bootloader prefix is the canonical generated code, and all bytes not
    assigned to code, header, or payload are zero.
 10. The mandatory boot ROM, kernel image, and kernel stack mappings are mutually
-    disjoint and satisfy their permissions.
+    disjoint and satisfy their permissions; this is enforced when the host
+    constructs the machine, because region overlap is rejected by the address
+    space itself.
 
 After all static checks, the host creates the machine with the boot ROM,
 mandatory RAM mappings, and explicit reset state. The parser itself writes no
 kernel RAM. On a cold machine the new RAM backing begins zero. The bootloader
 copies the complete validated ROM payload into the kernel image RAM region and
-jumps to the kernel. Before `start` exposes the machine, it performs a pure
-Supervisor execute fetch at the entry and verifies the complete documented CPU
-handoff. Loading and execution are never interleaved with unchecked input.
+jumps to the kernel. Before `start` exposes the machine, it verifies the complete
+documented CPU handoff registers and then performs a pure Supervisor execute
+fetch at the entry, so a corrupted handoff is reported before any guest
+instruction is retired. Loading and execution are never interleaved with
+unchecked input.
 
 The Step 28 API constructs a fresh machine for each boot. The machine layer's
 warm-reset/RAM-preservation semantics remain available to a future typed reboot

@@ -2,7 +2,7 @@ use crate::{
     FileNodeKind, FileSystemError, KernelError, LZX_MAX_FILE_SIZE, LazalithKernel, LzxError,
     LzxImage, ProcessId, ThreadId, VirtualFileSystem,
 };
-use alloc::{boxed::Box, collections::TryReserveError, vec::Vec};
+use alloc::{boxed::Box, collections::TryReserveError, string::String, vec::Vec};
 use core::{error::Error, fmt};
 use lazalith_os_abi::{OPEN_READ, OpenFlags};
 
@@ -64,18 +64,33 @@ pub struct ShellOutcome {
 #[derive(Debug)]
 pub enum ShellError {
     InvalidLimits,
-    LineTooLong { length: usize, maximum: usize },
+    LineTooLong {
+        length: usize,
+        maximum: usize,
+    },
     EmptyLine,
     InvalidCommand,
-    UnknownCommand { command: Vec<u8> },
-    MissingArgument { command: ShellCommand },
-    ExtraArguments { command: ShellCommand },
+    UnknownCommand {
+        command: Vec<u8>,
+    },
+    MissingArgument {
+        command: ShellCommand,
+    },
+    ExtraArguments {
+        command: ShellCommand,
+    },
     FileSystem(FileSystemError),
     Kernel(Box<KernelError>),
     Image(Box<LzxError>),
     NoPendingRun,
-    PendingRun,
-    OutputLimit { maximum: usize },
+    /// A launch is already queued and has not been consumed yet. The queued path is
+    /// reported so a host can explain which program must be cleared.
+    PendingRun {
+        path: Vec<u8>,
+    },
+    OutputLimit {
+        maximum: usize,
+    },
     GenerationOverflow,
     Allocation(TryReserveError),
 }
@@ -102,7 +117,13 @@ impl fmt::Display for ShellError {
             Self::Kernel(source) => write!(f, "shell program launch failed: {source}"),
             Self::Image(source) => write!(f, "shell program image is invalid: {source}"),
             Self::NoPendingRun => f.write_str("no program launch is pending"),
-            Self::PendingRun => f.write_str("a program launch is already pending"),
+            Self::PendingRun { path } => {
+                write!(
+                    f,
+                    "a program launch is already pending for {}",
+                    String::from_utf8_lossy(path)
+                )
+            }
             Self::OutputLimit { maximum } => write!(f, "shell output exceeds {maximum} bytes"),
             Self::GenerationOverflow => f.write_str("shell screen generation overflowed"),
             Self::Allocation(source) => write!(f, "shell allocation failed: {source}"),
@@ -205,20 +226,25 @@ impl HeadlessShell {
             .filesystem
             .open(&path, flags)
             .map_err(ShellError::FileSystem)?;
+        let maximum = self
+            .filesystem
+            .limits()
+            .max_file_bytes
+            .min(LZX_MAX_FILE_SIZE);
         let mut bytes = Vec::new();
         let mut offset = 0u64;
         loop {
             let chunk = self
                 .filesystem
-                .read_at(opened.node, offset, 4096)
+                .read_at(opened.node, offset, 4096, opened.access)
                 .map_err(ShellError::FileSystem)?;
             if chunk.is_empty() {
                 break;
             }
-            if (bytes.len() as u64).saturating_add(chunk.len() as u64) > LZX_MAX_FILE_SIZE {
+            if (bytes.len() as u64).saturating_add(chunk.len() as u64) > maximum {
                 return Err(ShellError::FileSystem(FileSystemError::FileTooLarge {
                     length: bytes.len() as u64 + chunk.len() as u64,
-                    maximum: LZX_MAX_FILE_SIZE,
+                    maximum,
                 }));
             }
             bytes
@@ -252,8 +278,8 @@ impl HeadlessShell {
         if command != ShellCommand::Run {
             return Err(ShellError::InvalidCommand);
         }
-        if self.pending_run.is_some() {
-            return Err(ShellError::PendingRun);
+        if let Some(path) = self.pending_run.clone() {
+            return Err(ShellError::PendingRun { path });
         }
         let outcome = self.execute_line(line)?;
         let image = self.take_pending_image()?;
@@ -338,7 +364,7 @@ impl HeadlessShell {
                 loop {
                     let chunk = self
                         .filesystem
-                        .read_at(opened.node, offset, 4096)
+                        .read_at(opened.node, offset, 4096, opened.access)
                         .map_err(ShellError::FileSystem)?;
                     if chunk.is_empty() {
                         break;
@@ -376,8 +402,8 @@ impl HeadlessShell {
                 if metadata.kind == FileNodeKind::Directory {
                     return Err(ShellError::FileSystem(FileSystemError::IsDirectory));
                 }
-                if self.pending_run.is_some() {
-                    return Err(ShellError::PendingRun);
+                if let Some(pending) = self.pending_run.clone() {
+                    return Err(ShellError::PendingRun { path: pending });
                 }
                 self.pending_run = Some(copy_bytes(path)?);
                 return Ok(ShellOutcome {

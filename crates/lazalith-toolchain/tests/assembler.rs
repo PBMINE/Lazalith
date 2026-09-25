@@ -1,4 +1,6 @@
-use lazalith_toolchain::{ObjectFile, RelocationKind, SectionKind, assemble_named};
+use lazalith_toolchain::{
+    ObjectFile, RelocationKind, SectionKind, SymbolBinding, SymbolKind, assemble_named,
+};
 
 const SOURCE: &str = r#".arch lz64
 .entry _start
@@ -135,4 +137,38 @@ fn assembler_reports_out_of_range_expression_arithmetic() {
         };
         assert_eq!(error.diagnostic().unwrap().code().as_str(), code);
     }
+}
+
+#[test]
+fn a_global_name_that_is_never_defined_becomes_an_undefined_symbol() {
+    let object = assemble_named(
+        "undefined-global.lzs",
+        ".arch lz64\n.entry _start\n.global never_defined\n_start:\n LI r0, 1\n SYSCALL\n",
+    )
+    .unwrap();
+    let undefined = object
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name() == "never_defined")
+        .expect("a declared global must appear in the symbol table");
+    assert_eq!(undefined.kind(), SymbolKind::Undefined);
+    assert_eq!(undefined.binding(), SymbolBinding::Global);
+    assert!(
+        lazalith_toolchain::link_objects(&[object], &lazalith_toolchain::LinkOptions::default())
+            .is_err(),
+        "an undeclared global must fail at link time instead of vanishing"
+    );
+    let defined = assemble_named(
+        "defined-global.lzs",
+        ".arch lz64\n.entry _start\n.global later\n_start:\n LI r0, 1\n SYSCALL\nlater:\n NOP\n",
+    )
+    .unwrap();
+    assert_eq!(
+        defined
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name() == "later")
+            .map(|symbol| symbol.kind()),
+        Some(SymbolKind::Section)
+    );
 }

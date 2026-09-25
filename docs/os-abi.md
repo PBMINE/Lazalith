@@ -147,12 +147,15 @@ Open flags occupy a `u32`:
 Unknown flags are rejected. There is no mode copied from Linux.
 
 The frozen v1 input limits are `MAX_PATH_BYTES = 4096` for a path byte string
-(no embedded NUL), `MAX_ARGUMENT_COUNT = 1024` argv entries, and
+(no embedded NUL; the supplied length is the exact path extent and the path is
+not NUL-terminated on the wire), `MAX_ARGUMENT_COUNT = 1024` argv entries, and
 `MAX_ARGUMENT_BYTES = 65536` bytes per NUL-terminated argv string including its
 terminator. `MAX_ARGUMENT_TOTAL_BYTES = 1048576` bounds the aggregate string
 bytes, including terminators, in one `SpawnProcess` request. A zero-length path
 is invalid; a zero-length data transfer does not dereference its pointer but the
-pointer value must still be a valid architectural word.
+pointer value must still be a valid architectural word. A NUL byte inside the
+declared path range is rejected, so the maximum usable path is a full
+`MAX_PATH_BYTES` bytes.
 
 ### `IoResult`
 
@@ -165,7 +168,10 @@ size 16
 
 `Write`/`Read` return this structure through a validated output pointer and the
 normal `r0`/`r1` status/payload pair. `transferred` may be short for files,
-input, or output capacity; it never exceeds the requested length.
+input, or output capacity; it never exceeds the requested length. The record's
+`status` field is reserved and always `Ok` on a returned record: transfer
+failures are reported through `r0`/`r1` instead, so a consumer must not read
+this field as a per-transfer result.
 
 ### `FileStat`
 
@@ -177,7 +183,11 @@ size 16
 ```
 
 `Stat` rejects a path to a missing object and does not follow a symbolic-link
-model that v1 does not implement.
+model that v1 does not implement. `permissions` reports the node's capability
+class, that is, what a fully granted handle may do with it. It is not a
+per-handle grant: v1 has no accounts or node-level permissions, and read/write
+access is enforced per open handle, so a consumer must not treat this field as
+an authorization decision.
 
 ### `DirectoryRecord`
 
