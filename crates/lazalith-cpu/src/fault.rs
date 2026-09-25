@@ -1,6 +1,9 @@
-use crate::{ControlStateError, DataAccess, DataAccessError, OutcomeError, OutcomeErrorKind};
+use crate::{
+    ControlStateError, DataAccess, DataAccessError, OutcomeError, OutcomeErrorKind,
+    PrepareEntryError,
+};
 use core::{error::Error, fmt};
-use lazalith_isa::{DecodeError, InstructionError, Opcode};
+use lazalith_isa::{DecodeError, InstructionError};
 use lazalith_types::{InstructionAddress, WidthError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,7 +17,10 @@ pub struct CpuFault<E> {
 pub enum CpuFaultCause<E> {
     Halted,
     PrivilegeViolation,
-    UnsupportedUntilTrapController(Opcode),
+    DoubleTrap,
+    DeferredInterrupt,
+    TerminalTrap,
+    TrapEntry(PrepareEntryError<E>),
     Decode(DecodeError),
     Instruction(InstructionError),
     OperandLayout,
@@ -44,9 +50,14 @@ impl<E: Error + 'static> fmt::Display for CpuFaultCause<E> {
         match self {
             Self::Halted => f.write_str("execution is halted"),
             Self::PrivilegeViolation => f.write_str("instruction requires Supervisor privilege"),
-            Self::UnsupportedUntilTrapController(opcode) => {
-                write!(f, "{opcode:?} requires the Step 31 trap controller")
+            Self::DoubleTrap => {
+                f.write_str("synchronous trap occurred while a trap frame was active")
             }
+            Self::DeferredInterrupt => {
+                f.write_str("external interrupt is deferred by an active frame")
+            }
+            Self::TerminalTrap => f.write_str("trap controller is in a terminal failure state"),
+            Self::TrapEntry(source) => write!(f, "trap entry failed: {source}"),
             Self::OperandLayout => {
                 f.write_str("instruction operand layout has no execution implementation")
             }
@@ -73,6 +84,7 @@ impl<E: Error + 'static> Error for CpuFaultCause<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Decode(source) => Some(source),
+            Self::TrapEntry(source) => Some(source),
             Self::Instruction(source) => Some(source),
             Self::Control(source) => Some(source),
             Self::Width(source) => Some(source),

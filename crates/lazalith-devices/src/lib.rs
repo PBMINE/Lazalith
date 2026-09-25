@@ -219,10 +219,19 @@ impl<D: Device> DeviceManager<D> {
     }
 
     pub fn reset(&mut self) {
+        self.reset_at(CycleCount::new(0));
+    }
+
+    pub fn reset_at(&mut self, elapsed: CycleCount) {
         for entry in &mut self.entries {
             entry.device.reset();
         }
-        self.clock = VirtualClock::new();
+        if elapsed != CycleCount::new(0) {
+            for entry in &mut self.entries {
+                entry.device.tick(elapsed);
+            }
+        }
+        self.clock = VirtualClock::at(elapsed);
     }
 
     pub fn tick(&mut self, delta: CycleCount) -> Result<(), DeviceError> {

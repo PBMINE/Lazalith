@@ -1,22 +1,27 @@
 use crate::{
-    ArchitecturalState, ControlTarget, CpuFault, CpuFaultCause as Cause, CpuMemory, DataAccess,
-    DataAccessKind, ExecutionOutcome as Outcome, ExecutionState, OutcomeApplication, Privilege,
-    StackEffect, TrapRequest, checked_next_pc, checked_return_sp, prepare_outcome, validate_pc,
+    ArchitecturalState, ControlStateError, ControlTarget, CpuFault, CpuFaultCause as Cause,
+    CpuMemory, DataAccess, DataAccessKind, ExecutionOutcome as Outcome, ExecutionState,
+    OutcomeApplication, Privilege, StackEffect, TrapCause, TrapController, TrapRequest,
+    checked_next_pc, checked_return_sp, prepare_outcome, trap::prepare_entry_control, validate_pc,
+    validate_sp,
 };
-use lazalith_isa::{DataSize, Instruction, Opcode, Operand, decode};
+use lazalith_isa::{ControlRegister, DataSize, Instruction, Opcode, Operand, decode};
 use lazalith_types::{InstructionAddress, VirtualAddress, WordWidth};
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ReferenceInterpreter {
     architectural: ArchitecturalState,
     execution: ExecutionState,
+    traps: TrapController,
 }
 
 impl ReferenceInterpreter {
-    pub const fn new(architectural: ArchitecturalState) -> Self {
+    pub fn new(architectural: ArchitecturalState) -> Self {
+        let traps = TrapController::new(architectural.config());
         Self {
             architectural,
             execution: ExecutionState::Running,
+            traps,
         }
     }
 
@@ -26,6 +31,218 @@ impl ReferenceInterpreter {
     pub const fn execution_state(&self) -> ExecutionState {
         self.execution
     }
+    pub const fn trap_controller(&self) -> &TrapController {
+        &self.traps
+    }
+    pub fn trap_controller_mut(&mut self) -> &mut TrapController {
+        &mut self.traps
+    }
+    pub fn replace_architectural_state(
+        &mut self,
+        state: ArchitecturalState,
+    ) -> Result<(), ControlStateError> {
+        if self.architectural.config() != state.config()
+            || self.traps.has_active_frame()
+            || self.traps.is_terminal()
+        {
+            return Err(ControlStateError::InvalidControlState {
+                operation: "replace execution context",
+                selector: 0,
+            });
+        }
+        validate_pc(state.config(), state.pc())?;
+        validate_sp(state.config(), state.sp())?;
+        self.architectural = state;
+        self.execution = ExecutionState::Running;
+        Ok(())
+    }
+    pub fn restore_architectural_state(
+        &mut self,
+        state: ArchitecturalState,
+    ) -> Result<(), ControlStateError> {
+        if self.architectural.config() != state.config()
+            || self.traps.has_active_frame()
+            || self.traps.is_terminal()
+        {
+            return Err(ControlStateError::InvalidControlState {
+                operation: "restore execution context",
+                selector: 0,
+            });
+        }
+        validate_pc(state.config(), state.pc())?;
+        validate_sp(state.config(), state.sp())?;
+        self.architectural = state;
+        Ok(())
+    }
+    pub fn restore_architectural_state_with_execution(
+        &mut self,
+        state: ArchitecturalState,
+        execution: ExecutionState,
+    ) -> Result<(), ControlStateError> {
+        self.restore_architectural_state(state)?;
+        self.execution = execution;
+        Ok(())
+    }
+    pub fn write_register(&mut self, index: lazalith_types::RegisterIndex, value: u64) {
+        self.architectural.write_register(index, value);
+    }
+    pub fn set_trap_vector(&mut self, target: InstructionAddress) -> Result<(), ControlStateError> {
+        self.write_trap_control(ControlRegister::Tvec, target.as_u64())
+    }
+    pub fn read_trap_control(&self, control: ControlRegister) -> Result<u64, ControlStateError> {
+        self.traps.read_control(control)
+    }
+    pub fn write_trap_control(
+        &mut self,
+        control: ControlRegister,
+        value: u64,
+    ) -> Result<(), ControlStateError> {
+        self.traps.write_control(control, value)
+    }
+    pub fn enter_fault<M: CpuMemory>(
+        &mut self,
+        memory: &mut M,
+        cause: TrapCause,
+        resume_pc: InstructionAddress,
+    ) -> Result<(), CpuFault<M::Error>> {
+        if matches!(
+            cause,
+            TrapCause::Syscall | TrapCause::SoftwareTrap | TrapCause::ExternalInterrupt
+        ) {
+            return Err(CpuFault {
+                pc: self.architectural.pc(),
+                opcode: None,
+                cause: Cause::Control(ControlStateError::InvalidControlState {
+                    operation: "invalid fault cause",
+                    selector: 0,
+                }),
+            });
+        }
+        self.enter_event(memory, cause, 0, resume_pc)
+    }
+
+    pub fn enter_syscall<M: CpuMemory>(
+        &mut self,
+        memory: &mut M,
+        resume_pc: InstructionAddress,
+    ) -> Result<(), CpuFault<M::Error>> {
+        self.enter_event(memory, TrapCause::Syscall, 0, resume_pc)
+    }
+
+    pub fn enter_software<M: CpuMemory>(
+        &mut self,
+        memory: &mut M,
+        payload: i32,
+        resume_pc: InstructionAddress,
+    ) -> Result<(), CpuFault<M::Error>> {
+        let payload = match self.architectural.config().word_width() {
+            lazalith_types::WordWidth::W32 => u64::from(payload as u32),
+            lazalith_types::WordWidth::W64 => payload as i64 as u64,
+        };
+        self.enter_event(memory, TrapCause::SoftwareTrap, payload, resume_pc)
+    }
+
+    pub fn enter_external<M: CpuMemory>(
+        &mut self,
+        memory: &mut M,
+        id: u16,
+        resume_pc: InstructionAddress,
+    ) -> Result<(), CpuFault<M::Error>> {
+        if self.traps.is_terminal() {
+            return Err(CpuFault {
+                pc: self.architectural.pc(),
+                opcode: None,
+                cause: Cause::TerminalTrap,
+            });
+        }
+        if self.execution == ExecutionState::Halted {
+            return Err(CpuFault {
+                pc: self.architectural.pc(),
+                opcode: None,
+                cause: Cause::Halted,
+            });
+        }
+        if self.traps.has_active_frame() {
+            return Err(CpuFault {
+                pc: self.architectural.pc(),
+                opcode: None,
+                cause: Cause::DeferredInterrupt,
+            });
+        }
+        self.enter_event(
+            memory,
+            TrapCause::ExternalInterrupt,
+            u64::from(id),
+            resume_pc,
+        )
+    }
+
+    fn enter_event<M: CpuMemory>(
+        &mut self,
+        memory: &mut M,
+        cause: TrapCause,
+        payload: u64,
+        resume_pc: InstructionAddress,
+    ) -> Result<(), CpuFault<M::Error>> {
+        let fault = |cause| CpuFault {
+            pc: self.architectural.pc(),
+            opcode: None,
+            cause,
+        };
+        if self.execution == ExecutionState::Halted {
+            if !self.traps.is_terminal() {
+                self.traps
+                    .record_failed_entry(&self.architectural, cause, payload, resume_pc);
+            }
+            return Err(fault(Cause::Halted));
+        }
+        if self.traps.is_terminal() {
+            return Err(fault(Cause::TerminalTrap));
+        }
+        if self.traps.has_active_frame() {
+            let snapshot = self.architectural.clone();
+            self.traps
+                .record_double_trap(&snapshot, cause, payload, resume_pc);
+            return Err(fault(Cause::DoubleTrap));
+        }
+        let Some(target) = self.traps.tvec() else {
+            self.traps
+                .record_failed_entry(&self.architectural, cause, payload, resume_pc);
+            return Err(fault(Cause::Control(
+                ControlStateError::InvalidControlState {
+                    operation: "enter trap without TVEC",
+                    selector: ControlRegister::Tvec.as_u8(),
+                },
+            )));
+        };
+        let candidate = prepare_entry_control(
+            self.architectural.config(),
+            &self.architectural,
+            memory,
+            target,
+        );
+        let candidate = match candidate {
+            Ok(candidate) => candidate,
+            Err(source) => {
+                self.traps
+                    .record_failed_entry(&self.architectural, cause, payload, resume_pc);
+                return Err(fault(Cause::TrapEntry(source)));
+            }
+        };
+        let snapshot = TrapController::snapshot(&self.architectural);
+        let resume_sp = self.architectural.sp();
+        let resume_status = self.architectural.status().bits();
+        self.traps.install_frame(
+            snapshot,
+            cause,
+            payload,
+            resume_pc,
+            resume_sp,
+            resume_status,
+        );
+        self.architectural = candidate;
+        Ok(())
+    }
 
     fn validate_fetch<E>(&self) -> Result<(), CpuFault<E>> {
         let fault = |cause| CpuFault {
@@ -33,6 +250,9 @@ impl ReferenceInterpreter {
             opcode: None,
             cause,
         };
+        if self.traps.is_terminal() {
+            return Err(fault(Cause::TerminalTrap));
+        }
         if self.execution == ExecutionState::Halted {
             return Err(fault(Cause::Halted));
         }
@@ -105,13 +325,57 @@ impl ReferenceInterpreter {
         {
             return Err(fault(Cause::PrivilegeViolation));
         }
-        checked_next_pc(config, pc).map_err(|e| fault(Cause::NextPc(e)))?;
-        if matches!(opcode, Opcode::Rfe | Opcode::Csrr | Opcode::Csrw) {
-            return Err(fault(Cause::UnsupportedUntilTrapController(opcode)));
+        let next_pc = checked_next_pc(config, pc).map_err(|e| fault(Cause::NextPc(e)))?;
+        let read = |index| self.architectural.registers().read(index);
+        match (opcode, instruction.operands()) {
+            (Opcode::Rfe, []) => {
+                let (resume_pc, resume_sp, resume_status) = self
+                    .traps
+                    .return_control()
+                    .map_err(|source| fault(Cause::Control(source)))?;
+                if !self.traps.consume_syscall_return_authorization() {
+                    return Err(fault(Cause::Control(
+                        ControlStateError::InvalidControlState {
+                            operation: "return",
+                            selector: ControlRegister::Epc.as_u8(),
+                        },
+                    )));
+                }
+                let mut candidate = self.architectural.clone();
+                candidate
+                    .restore_control(resume_pc, resume_sp, resume_status)
+                    .map_err(|source| fault(Cause::Control(source)))?;
+                self.architectural = candidate;
+                self.traps.commit_return();
+                return Ok(OutcomeApplication::Continue);
+            }
+            (Opcode::Csrr, [Operand::Register(d), Operand::Control(control)]) => {
+                let value = self
+                    .traps
+                    .read_control(*control)
+                    .map_err(|source| fault(Cause::Control(source)))?;
+                let mut candidate = self.architectural.clone();
+                candidate.write_register(*d, value);
+                candidate
+                    .set_pc(next_pc)
+                    .map_err(|source| fault(Cause::Control(source)))?;
+                self.architectural = candidate;
+                return Ok(OutcomeApplication::Continue);
+            }
+            (Opcode::Csrw, [Operand::Control(control), Operand::Register(source)]) => {
+                let value = read(*source);
+                self.traps
+                    .write_control(*control, value)
+                    .map_err(|error| fault(Cause::Control(error)))?;
+                self.architectural
+                    .set_pc(next_pc)
+                    .map_err(|source| fault(Cause::Control(source)))?;
+                return Ok(OutcomeApplication::Continue);
+            }
+            _ => {}
         }
         let mut candidate = self.architectural.clone();
         let mut execution = self.execution;
-        let read = |index| self.architectural.registers().read(index);
         let mut outcome = Outcome::Continue;
         let mut data = None;
         let mut arithmetic = None;

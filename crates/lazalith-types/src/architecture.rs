@@ -77,6 +77,19 @@ impl DeviceId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct InterruptId(u16);
+
+impl InterruptId {
+    pub const fn new(value: u16) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DeviceOffset(u64);
 
 impl DeviceOffset {
@@ -193,7 +206,7 @@ impl Error for InvalidRegisterIndex {}
 #[cfg(test)]
 mod tests {
     use crate::{
-        CycleCount, DeviceId, DeviceOffset, InstructionAddress, InstructionCount,
+        CycleCount, DeviceId, DeviceOffset, InstructionAddress, InstructionCount, InterruptId,
         InvalidRegisterIndex, PhysicalAddress, RegisterIndex, VirtualAddress,
     };
     use alloc::{format, string::ToString};
@@ -267,6 +280,14 @@ mod tests {
             assert_eq!(DeviceId::new(value).as_u32(), value);
         }
         assert!(DeviceId::new(0) < DeviceId::new(u32::MAX));
+    }
+
+    #[test]
+    fn interrupt_id_preserves_full_u16_range() {
+        for value in [0, 1, u16::MAX] {
+            assert_eq!(InterruptId::new(value).as_u16(), value);
+        }
+        assert!(InterruptId::new(0) < InterruptId::new(u16::MAX));
     }
 
     #[test]

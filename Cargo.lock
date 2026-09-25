@@ -3,6 +3,21 @@
 version = 4
 
 [[package]]
+name = "lazalith-boot"
+version = "0.1.0"
+dependencies = [
+ "lazalith-cpu",
+ "lazalith-devices",
+ "lazalith-diagnostics",
+ "lazalith-isa",
+ "lazalith-machine",
+ "lazalith-memory",
+ "lazalith-os",
+ "lazalith-toolchain",
+ "lazalith-types",
+]
+
+[[package]]
 name = "lazalith-cpu"
 version = "0.1.0"
 dependencies = [
@@ -52,6 +67,37 @@ dependencies = [
  "lazalith-devices",
  "lazalith-diagnostics",
  "lazalith-isa",
+ "lazalith-types",
+]
+
+[[package]]
+name = "lazalith-os"
+version = "0.1.0"
+dependencies = [
+ "lazalith-cpu",
+ "lazalith-devices",
+ "lazalith-isa",
+ "lazalith-machine",
+ "lazalith-memory",
+ "lazalith-os-abi",
+ "lazalith-types",
+]
+
+[[package]]
+name = "lazalith-os-abi"
+version = "0.1.0"
+dependencies = [
+ "lazalith-types",
+]
+
+[[package]]
+name = "lazalith-toolchain"
+version = "0.1.0"
+dependencies = [
+ "lazalith-diagnostics",
+ "lazalith-isa",
+ "lazalith-os",
+ "lazalith-os-abi",
  "lazalith-types",
 ]
 

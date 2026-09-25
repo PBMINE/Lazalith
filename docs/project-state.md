@@ -1,6 +1,822 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-17 (Steps 1–25 of the roadmap in `instruction.md`)
+Last updated: 2026-09-25 (Steps 1–50 of the roadmap in `instruction.md`)
+
+## Step 50 — Lazen Language Design
+
+Added `docs/lazen-design.md` and `docs/lazen-rationale.md`. The design defines a
+small native systems language with explicit LZ32/LZ64 targets, `main` entry
+mapping, checked regions and pointers, typed OS wrappers, deterministic
+semantics, and a compiler pipeline into the shared `.lzo` toolchain. The
+rationale answers what would make native Lazalith applications easy while
+explicitly rejecting wholesale C/Rust/Pascal/Go conventions. No Lazen compiler
+is claimed or started; grammar details remain future work.
+
+## Step 49 — Real Assembly Program Under LazOS
+
+Completed the bounded headless milestone. The headless shell's `run` command now
+validates a VFS path, reads the actual `.lzx` bytes, parses them, and schedules
+the resulting process through `LazalithKernel::start_image`. The integration
+fixture assembles and links a real LZ64 program, round-trips the executable,
+boots through ROM and Supervisor RFE, executes `Write(1)` into the virtual
+terminal, and observes `Exit(0)`. The in-image native shell still reports
+in-image `run` as deferred because `SpawnProcess`/`WaitProcess` services are
+future work; the host shell path is the documented bounded claim.
+
+## Step 48 — Relocatable Linker
+
+Implemented multi-object compatibility checks, global/local symbol resolution,
+aligned parallel section layout, runtime code/data address bases, all six
+relocation evaluations, canonical instruction patching, BSS placement, and
+`.lzx` v1 emission including BSS-only images. Linker tests cover cross-object
+symbols, `BR`/`CALL`, memory and data relocations, alignment, BSS-only output,
+incompatible targets, and executable round trips. The existing single-text
+bridge remains the bounded Step 44 compatibility path.
+
+## Step 47 — Shared-ISA Disassembler
+
+Implemented canonical decode/encode verification and text formatting for the
+shared ISA, object text-section disassembly, comma-separated re-assemblable
+output, and structured rejection of incomplete or noncanonical bytes.
+
+## Step 46 — Source-Spanned Assembler
+
+Replaced the Step 44 line shim with a bounded source lexer, parser, semantic
+checks, metadata-driven operand handling, section accumulators, symbol
+resolution, data directives, debug mappings, and all six relocation emitters.
+Supported directives include `.arch`, `.entry`, `.section`, `.global`,
+`.extern`, `.equ`, `.align`, `.zero`, `.ascii`, `.asciz`, `.byte`, `.half`,
+`.word`, `.dword`, and `.pcrelword`; every ISA mnemonic and operand form is
+parsed through `lazalith-isa`. Source errors retain typed diagnostics, spans,
+and managers, with regression coverage for malformed memory operands, negative
+symbols, ordering, alignment, dword width, BSS, and unknown symbols.
+
+Full workspace Rust formatting, strict Clippy, check, and all-target tests pass
+with 307 tests and zero doctests. Current Rust source/test line count is 37,788.
+Path-based Nix flake checks and package build pass with output
+`/nix/store/arq3g0dnyjav7cjaxv5bi5m8dcyj06gr-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. The Steps 26–50 audit repaired linker BSS
+alignment accounting, made syscall-admission identity structurally
+non-cloneable, hardened assembler expression-range arithmetic with source-located
+diagnostics, and corrected stale LazOS `run`/toolchain/ABI wording in
+`docs/os-design.md`. Independent review found no remaining P0/P1 defects for the
+bounded scopes; no staging or commit was created.
+
+## Step 45 — Native `.lzo` Object Format
+
+Added the typed relocatable `.lzo` v1 model and canonical little-endian codec to
+`lazalith-toolchain`. `ObjectTarget`, `Section`, `Symbol`, `Relocation`,
+`DebugSource`, `CodeMapping`, `ObjectBuilder`, and `ObjectFile` cover
+architecture/ISA/ABI metadata, four section kinds, symbol bindings and entries,
+six relocation kinds, and source mappings. The format has checked canonical table
+boundaries, zero reserved fields, bounded payloads/name materialization,
+canonical instruction validation, strict BSS and payload rules, and no runtime
+kernel dependency. `docs/lzo.md` records the wire contract; `.lzx` v1 remains
+fixed and independent.
+
+Round-trip, header-offset, padding, repeated-name, exhaustive-truncation,
+malformed-header, BSS-byte, and relocation-rejection tests pass alongside the
+Step 44 LZ32/LZ64 boot path. Full workspace Rust formatting, strict Clippy,
+check, and all-target tests pass with 291 tests and zero doctests. Current Rust
+source/test line count is 34,856. Path-based Nix flake checks and package build
+pass with output
+`/nix/store/in4h1rspwf223arwqg04vizkfissicai-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. Independent review found no remaining P0/P1/P2
+defects; no staging or commit was created. Step 46 is next.
+
+## Step 44 — First End-to-End Assembly Program
+
+Added the `lazalith-toolchain` crate with a deliberately bounded Step 44
+assembly surface: `.arch`, `.entry`, standalone labels, `LI`, and `SYSCALL`.
+Successful source is encoded through the shared canonical ISA codec into a
+versioned in-memory `ObjectFile`, then linked as one code-only section into the
+existing validated `.lzx` v1 container. Source failures retain a typed
+`Diagnostic`, `SourceSpan`, and `SourceManager`; object validation rejects empty,
+misaligned, unsupported, undecodable, and noncanonical code before publication.
+
+The boot integration test covers both LZ32 and LZ64 through
+`assembly -> object -> executable bytes -> reparsed LZX -> Process -> LazOS
+scheduler -> Exit(0)`, and matches the existing init image byte-for-byte. This
+is intentionally not the complete Step 45 `.lzo` format, full Step 46 assembler,
+multi-object linker, shell `run`, or packaged guest kernel. Workspace Rust
+formatting, strict Clippy, check, and all-target tests pass with 286 tests and
+zero doctests. Current Rust source/test line count is 32,578. Path-based Nix
+flake checks and package build pass with output
+`/nix/store/wpk7vj2b82fzrvfvqiqpjhwzqs7885ia-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. Independent review found no remaining P0/P1/P2
+defects for the bounded Step 44 scope; no staging or commit was created. Step
+45 is next.
+
+## Step 43 — Native Composite Shell Fixture
+
+Implemented both the bounded `HeadlessShell` model and a real composite
+init/shell `.lzx` fixture. `build_init_shell_image` emits typed User code/data/
+BSS, descriptor-aware `Read(0)`/`Write(1)`, bounded line framing, `help`, `echo`,
+`ls`, `cat`, `clear`, and an explicitly deferred `run`. `TerminalService` owns
+bounded scripted input/output, rejects overlong lines before fragmentation, and
+tracks clear state; `IoHandle` reserves 0/1 while file handles start at 2, and
+`LazalithKernel` owns the scheduler/service/image-start loop with post-return
+scheduler metadata. The boot test runs the ROM handoff, Supervisor RFE
+trampoline, native User shell, returning syscalls, EOF exit, fatal-error status,
+and process release in both LZ32 and LZ64.
+
+This is a native composite fixture, not a packaged guest-kernel image or
+SpawnProcess/WaitProcess implementation. `run`, arbitrary shell paths, a real
+device-backed terminal, and a separate init-to-child launch remain future
+scope; the full Step 43 acceptance criterion is therefore not claimed. Full
+workspace Rust formatting, strict Clippy, check, and all-target tests pass with
+282 tests and zero doctests. Current Rust source/test line count is 31,765.
+Path-based Nix flake checks and package build pass with output
+`/nix/store/dzhhirwpfy3x01mgkqkpjrmxvn1vmndj-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. Independent review found no remaining P0/P1/P2
+defects for the documented bounded scope; no staging or commit was created. Step
+44 is next.
+
+## Step 42 — Userspace Init
+
+Added the typed `build_init_image` constructor and exported its fixed metadata.
+It emits a native `.lzx` v1 image for LZ32/LZ64 containing `LI r0, 1` followed
+by `SYSCALL`, with a 16-byte code section, fixed User stack requirement, and
+entry offset zero. Added canonical ISA decode/round-trip/process ownership tests
+and a bootloader-to-scheduler integration test that executes the real User
+image, observes the syscall trap, dispatches a typed Exit service, and verifies
+non-returning process release. This is a minimal init milestone, not a packaged
+guest kernel; production kernel orchestration remains later work. Workspace Rust
+formatting, strict Clippy, check, and all-target tests pass with 270 tests and
+zero doctests. Current Rust source/test line count is 28,626. Path-based Nix
+flake checks and package build pass with output
+`/nix/store/k511ivnrhm5radb4rpm7cg5kwgkhp49c-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. Independent Step 42 review found no remaining
+P0/P1/P2 defects. No staging or commit was created. Step 43 (userspace shell)
+is next.
+
+## Step 41 — Virtual Filesystem
+
+Implemented `VirtualFileSystem`, an owned in-memory backend with explicit node,
+file-size, directory-entry, and path limits. It supports absolute byte paths,
+regular files/directories, deterministic sorted directory records, checked
+create/truncate/open modes, short EOF reads, checked writes, signed seek origins,
+metadata, and fallible allocation. `ProcessHandles` now owns monotonic file
+handles with node/access/offset state, rejects stale or foreign handles, and
+uses reservation-before-commit so failed opens do not consume handle IDs.
+`FileSystemService` adapts the existing validated ABI to checked User-memory
+buffers and structured statuses without unsafe code or global mutable state.
+The backend, process-handle, and syscall adapter tests pass. Workspace Rust
+formatting, strict Clippy, check, and all-target tests pass with 268 tests and
+zero doctests. Current Rust source/test line count is 28,395. Path-based Nix
+flake checks and package build pass with output
+`/nix/store/bx7mff7k9fwsbqbg8b5fs65d405rwhk2-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. Independent Step 41 review found no remaining
+P0/P1/P2 defects. No staging or commit was created. Step 42 (userspace init)
+is next.
+
+## Step 40 — Native `.lzx` Program Loader
+
+Designed and documented the native `.lzx` v1 container in `docs/lzx.md` and
+implemented its bounded little-endian parser, typed section model, builder, and
+atomic process loader in `lazalith-os`. The format validates magic, format/ISA/
+ABI versions, LZ32/LZ64 architecture, header flags, section count/order,
+permissions, file and virtual ranges, entry alignment and instruction bounds,
+memory requirements, and section overlap before constructing an unpublished
+`Process`. Code, initialized data, and zero-filled BSS load into process-owned
+User memory; malformed input cannot publish a partial process. v1 intentionally
+has no compression, relocation, symbol, or debug extensions.
+
+Five `.lzx` integration tests cover valid LZ32/LZ64 round trips, data/BSS
+loading, empty data sections, stable header/section layout, exhaustive
+truncation handling, malformed headers, and semantic section/requirement
+rejection. Workspace Rust gates pass with 259 tests, zero doctests. Current
+Rust source/test line count is 26,724. Full workspace formatting, strict
+Clippy, check, all-target tests, Nix flake checks, and package build pass. The
+verified package output is
+`/nix/store/b9v3463gx1ya17q7q7c88rd0diff1lvh-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. No staging or commit was created.
+
+## Step 39 — Deterministic Round-Robin Scheduler
+
+Implemented `RoundRobinScheduler` in `lazalith-os`. It owns the process table,
+cursor, nonzero quantum, unique `ExecutionContextId` tokens, stable logical
+process identities, and an optional aggregate User-space admission budget; the
+normal constructor budgets two logical process layouts, while explicit
+unbounded/test construction remains available. Duplicate or pre-bound process
+IDs, incompatible architectures, invalid lifecycle states, poisoned schedulers,
+and exhausted budgets reject before insertion. Terminal processes can be reaped
+to reclaim their resident-memory accounting.
+
+The scheduler activates only validated User contexts. Machine-side activation
+checks architecture, User privilege, switchable lifecycle state, no active
+frame, and no already-active token. Context switches use a typed, fallible
+User-region transfer that pre-reserves all storage and rejects cross-space
+overlap, retaining machine-owned Supervisor regions. At a safe boundary the
+scheduler saves the complete User CPU state, returns the live User space to its
+process, validates lifecycle/token/identity state, and selects the next ready
+process. `with_active_memory_context` and `dispatch_syscall` derive service
+bindings from the scheduler's active process, token, thread, and restricted
+User-space capability; raw live address-space and admission access are not
+exposed.
+
+A User `SYSCALL` or software trap consumes one quantum at trap entry. Framed
+handler instructions, external-interrupt delivery, and `RFE` itself do not
+consume User quantum; a pending yield is applied after a frame-free return.
+Synchronous faults abort their frame and transition only the affected process to
+`Faulted`. Blocked processes are suspended before another process runs and can
+be explicitly unblocked. Non-returning `Exit` and dispatcher faults are cleaned
+up without a returning completion, including services that mutate exit state
+before returning. A terminal machine error poisons the scheduler and requires
+coordinated machine reset; recovery refuses to clear poisoning if User-space
+ownership cannot be restored. Round-robin has no priorities or SMP.
+
+Twenty-two scheduler integration tests cover validation/budgets/reaping,
+multiple-user execution, quantum and trap accounting, handler-frame boundaries,
+restricted active service memory, syscall capture/completion, blocked
+reconciliation, non-returning cleanup, terminal-error poisoning/reset,
+privilege-return rejection, run continuation/counting, and out-of-image
+architectural control state. Workspace Rust gates pass with 254 tests, zero doctests. Current Rust
+source/test line count is 24,983. Full workspace
+formatting, strict Clippy, check, all-target tests, Nix flake checks, and package
+build passed on x86_64-linux. Package output:
+`/nix/store/3fddkl6ywvmnqnbsn1pddkrc3c2srf0v-lazalith-foundations-0.1.0`. aarch64-linux remains
+untested. No staging or commit was created. Step 40 (`.lzx` program loader) is
+next.
+
+## Step 38 — Processes and Threads
+
+Implemented explicit `ProcessId`, `ThreadId`, `Process`, and `Thread` aggregates
+in `lazalith-os`. A process owns an independent `UserMemory` address space and
+allocator, a copied and bounded `ProgramImage`, its `StackRegion`, typed
+`ProcessHandles`, lifecycle state/exit code, and one or more thread CPU states.
+`ProgramImage` validates non-empty input, architecture, entry alignment and
+bounds, instruction-sized entry, address overflow, and code-region capacity
+before loading. Threads start in User mode with interrupts disabled; additional
+threads use `Thread::for_process`, which validates the image entry, stack
+membership, mapped User RAM, and architecture before construction, and
+`Process::attach_thread` records ownership while rejecting duplicate or foreign
+threads.
+
+Process states are `Created`, `Ready`, `Running`, `Blocked`, `Exited`, and
+`Faulted`. Transition validation is atomic and terminal states cannot be
+resurrected. `Process::memory_context` and `memory_context_for_thread` are the
+only constructors for the service context. The context binds process ID, thread
+ID, active scheduler execution token, and address-space identity and lends the
+process-owned address space, allocator, handles, active thread CPU state,
+image/stack metadata, and lifecycle/exit fields. A process must be `Running` and
+explicitly activated with the token held by the machine trap controller before
+syscall admission. Syscall requests cannot be rebound after admission, and the
+dispatcher rejects any mismatched process, thread, execution token, lifecycle
+state, or address-space identity. Successful `Exit` dispatch atomically records
+`Exited` and its code.
+
+Eleven Step 38 integration tests cover IDs, image ownership/validation, stack
+and entry rejection, handle tables, lifecycle transitions, CPU/privilege setup,
+address-space isolation, complete process service context, explicit execution
+activation, thread attachment, and ownership transfer. Ten Step 37 syscall tests
+remain meaningful and now use the mandatory process context and execution token.
+Workspace Rust gates pass with 232 tests, zero doctests. Current Rust
+source/test line count is 21,885. Full workspace
+formatting, strict Clippy, check, all-target tests, Nix flake checks, and
+package build passed on x86_64-linux. Generic CPU `RFE` remains available for
+ordinary software/interrupt traps, while syscall-frame `RFE` requires the exact
+completion authorization. Package output:
+`/nix/store/nggysgwk3x7h93z2sr6pipq9543anlbn-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. No staging or commit was created. The verified
+Step 39 handoff is recorded above; Step 40 is next.
+
+## Step 37 — Syscall Dispatcher
+
+Implemented the trap-admitted `SyscallDispatcher` in `lazalith-os` and
+integrated it with the existing CPU/machine trap path. `SyscallRequest` is
+created from an active `TrapCause::Syscall` frame, captures the pre-entry
+register snapshot, validates Supervisor/TVEC/resume-control state, and consumes
+a controller-generation admission exactly once. Trap controllers are no longer
+cloneable, and requests carry a stable controller identity so a request or
+completion cannot cross machine generations.
+
+The dispatcher consumes the one-shot request, binds it to one exclusive
+`UserMemoryContext`, and validates the full v1 contract before invoking an
+injected `KernelService`. It covers all fourteen calls, required-zero versus
+ignored arguments, full-word LZ32/LZ64 values, handles/flags/origins, scalar and
+signed words, output alignment/size, complete non-crossing User ranges,
+permissions, path/argv termination, byte-capacity records, and the frozen input
+budgets (`MAX_PATH_BYTES`, `MAX_ARGUMENT_COUNT`, `MAX_ARGUMENT_BYTES`, and
+`MAX_ARGUMENT_TOTAL_BYTES`). Zero-length transfers are explicit no-dereference
+operations. `AddressSpaceIdentity` is a stable per-space identity rather than a
+host address assertion.
+
+Returning calls receive an opaque `ValidatedSyscallKind` view and produce a
+one-shot typed completion containing only valid ABI `u32` status/payload values.
+`LazalithMachine::return_from_syscall` requires that completion, an active
+admitted frame, a live matching controller, Supervisor state, and an actual
+`RFE` instruction before writing `r0`/`r1` and returning. Generic CPU `RFE`
+remains unchanged for software/interrupt traps. `Exit` and dispatcher faults
+have no returning completion. No default service or concrete filesystem/process
+service was faked; those remain later work.
+
+Eight new OS syscall integration tests cover real User `SYSCALL` trap entry,
+trap admission/replay rejection, controller and address-space binding,
+required-zero/identity checks, all fourteen typed calls, pointer/path/capacity
+and aggregate-string rejection, service return-kind enforcement, and checked
+RFE completion. Workspace Rust gates pass with 219 tests, zero doctests. Full workspace
+formatting, strict Clippy, check, all-target tests, Nix flake checks, and package
+build passed on x86_64-linux. Package output:
+`/nix/store/8j839labqpghpvm3j17hw821xk91986f-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. No staging or commit was created. The verified
+Step 38 and Step 39 handoffs are recorded above; Step 40 is next.
+
+## Step 36 — Shared OS ABI Crate
+
+Created and Nix-installed the no_std `lazalith-os-abi` workspace crate and made
+`lazalith-os` consume it through the canonical `lazalith_os::abi` re-export. The
+kernel does not copy IDs, statuses, flags, records, or conversion rules. The
+crate centralizes the fourteen frozen v1 syscall IDs, full-word LZ32/LZ64 ID
+validation, used/required-zero/ignored argument metadata, six typed argument
+slots, reserved `r7` validation, returning/non-returning metadata, and the
+mode-independent `r0` status plus `r1` payload result.
+
+All fixed little-endian v1 structures are materialized and checked:
+`IoResult`, `FileStat`, 256-byte `DirectoryRecord`, `MemoryAllocation`, and
+`ExitStatusRecord`. Handles, open flags, permissions, seek origins, and frozen
+process-exit reasons are typed. Constructors and decoders reject wrong sizes,
+reserved data, unknown values, out-of-width fields, and invalid address/length
+ranges before exposing a value. Range checks use the inclusive final byte, accept
+valid ranges through each architecture's maximum address, and independently
+bound LZ32 lengths; they do not manufacture an unrepresentable exclusive end.
+
+`AbiError` retains typed width/value causes internally and maps centrally to
+the nineteen stable `SyscallError` values only at the ABI boundary. LZ32/LZ64
+pointer, unsigned-word, signed-word, host-size, and record conversions have
+coverage. The former packed-u64-in-`r0` proposal was removed after review proved
+it impossible for LZ32. Required-zero fields are distinct from ignored trailing
+arguments, so `Seek` retains its output pointer and `Exit` may ignore later
+arguments as documented. A final independent review found no remaining Step 36
+code or specification defect.
+
+Ten ABI integration tests plus one kernel shared-definition test bring the
+workspace to 211 tests, zero doctests. They cover every ID/status/error, complete
+request metadata, return transport, required-zero and ignored arguments, r7,
+both pointer/word modes, signed boundaries, terminal ranges, exact wire bytes,
+reserved fields, record decoding, host-layout independence, and error causes.
+Rust source/test line count is 20,062. Strict workspace all-target Clippy,
+formatting, check, all-target tests, Nix flake
+checks, and package build passed on x86_64-linux. Package output:
+`/nix/store/d0l82y2yxc673ms17gw8sk8x3qjn2zlx-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. No dispatcher or service behavior was faked,
+and no staging or commit was created. At the end of Step 36, the dispatcher was
+next; the verified Step 37 handoff is recorded above.
+
+## Step 35 — System Call ABI Design
+
+Created and Nix-packaged `docs/os-abi.md`, freezing ABI version 1 before shared
+code creation. It defines custom stable syscall IDs, not Linux numbers:
+Exit=0x0001, Write=0x0002, Read=0x0003, Open=0x0004, Close=0x0005,
+Seek=0x0006, Stat=0x0007, ListDirectory=0x0008, Time=0x0009, Sleep=0x000a,
+AllocateMemory=0x000b, SpawnProcess=0x000c, WaitProcess=0x000d, and
+ClearScreen=0x000e. `0x0100..0xffff` is reserved; unknown/reserved IDs reject.
+
+The register convention uses word-sized `r0` for the number and `r1..r6` for at
+most six arguments, with `r7` zero on entry and `r7`/`r8..r15` preserved.
+Returning services write a mode-independent `u32` status to `r0` and `u32`
+payload to `r1`, zero-extended in both LZ32 and LZ64; Step 36 review rejected
+the earlier impossible packed-u64-in-`r0` result. SP/NZCV are preserved. Wide
+values use checked fixed-size output structures. The design fixes little-endian
+layouts/sizes for `IoResult`, `FileStat`, 256-byte `DirectoryRecord`,
+`MemoryAllocation`, and `ExitStatusRecord`, plus custom open flags,
+handle/offset types, and a structured non-Linux error set.
+
+Pointer validation is defined before side effects: address-space identity,
+mode-width complete range, read/write permission, alignment, exact structure
+size/reserved fields, scalar/path constraints, and variable-output capacity.
+Debugger peek cannot authorize User memory. Short I/O alone may commit a
+validated prefix; other failures are atomic. `Sleep` uses virtual cycles,
+process launch consumes the future shared `.lzx` model, directory records are
+deterministic, and ClearScreen is a virtual-terminal operation. Display/graphics,
+signals, networking, environment mutation, and wall-clock syscalls are
+explicitly deferred.
+
+No Rust API or runtime dispatcher was added because Step 35 is design-only; all
+200 tests remain meaningful. Manual review checked every roadmap-named service,
+future Step 41–43 requirements, register preservation, LZ32/LZ64 layout,
+reserved numbering, structured errors, and Linux-divergence constraints. Full
+Rust gates, host Nix flake checks, and package build passed on x86_64-linux.
+Package output:
+`/nix/store/azanmslryvz2q41dslwq63lpmrkp89q5-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. No staging or commit was created. At the end of
+Step 35, materializing the single shared `lazalith-os-abi` crate was next; the
+verified Step 36 handoff is recorded above.
+
+## Step 34 — Basic Kernel and User Memory
+
+Added `lazalith-os` (`no_std + alloc`; local memory/types dependencies only),
+registered/installed it in Cargo/Nix, and implemented the minimum allocation and
+layout substrate from `docs/os-memory.md`. `BumpPool` validates nonzero
+power-of-two alignment, mode-width complete ranges, checked aligned extent, and
+capacity before moving its cursor. Failure preserves the exact pool state.
+Exact exhaustion returns `cursor() == None` rather than manufacturing an invalid
+one-past address; no individual free or global allocator exists.
+
+`StackRegion` validates complete mode range and alignment and requires the
+initial SP to be mapped (`start <= SP < end`), fixing the prior one-past/out-of-
+range ambiguity. `KernelMemory` owns the checked kernel heap and stack plus the
+canonical kernel image/stack/heap `MemoryRegion` builders. `UserMemoryLayout`
+owns the User heap/stack allocator, while each `UserMemory` owns exactly one
+configuration-bound `AddressSpace`; `into_parts` transfers layout and space
+together for future process ownership. Cross-config/repeated-space misuse and
+mutable raw region/byte access are not exposed.
+
+The mandatory physical RAM length is corrected to `0x310000` bytes
+(`0x0010_0000..0x0040_ffff`, 3.0625 MiB), including the User stack. Boot setup
+now extends the Step 28 ROM with the same centralized kernel and User region
+builders, so every successful boot machine has the complete backed v1 map
+before execution. This integration replaces the historical three-RAM-region
+Step 28 setup; no allocator can return an unmapped kernel heap address.
+
+Six OS integration tests cover low and exact LZ32 upper-bound pool exhaustion,
+invalid alignment/zero/overflow atomicity, stack SP boundaries, complete physical
+range and all six permissions, fresh zeroed backing, failed overlapping code-load
+atomicity, real Bus/CPU User code/data/heap/CALL/RET, User stack NX in both modes,
+and real Bus/CPU Supervisor kernel code/heap/CALL/RET. Workspace total: 200
+tests, zero doctests.
+
+Independent review found and corrected the physical endpoint, incomplete boot
+backing, address-space/config ownership, one-past stack SP, exhausted cursor,
+and direct-AddressSpace test gaps. Full required Rust gates, strict workspace
+all-target Clippy, host Nix flake checks, and package build passed on
+x86_64-linux. Package output:
+`/nix/store/y12zlba5k2fyqx3h88l2zbcssa2ad210-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. No SDL, external dependency, staging, or commit
+was added. Rust source/test line count is 15,954. Step 35 (system-call ABI
+design) is next.
+
+## Step 33 — Flat OS Memory Model
+
+Created and Nix-packaged `docs/os-memory.md`. It defines a v1 flat,
+identity-mapped, region-permission memory model using the existing strong
+address domains and explicit Bus translation boundary. The mandatory physical
+RAM window is `0x0010_0000..0x0040_ffff` (`0x310000` bytes,
+3.0625 MiB), partitioned into the Step 28
+kernel image, a distinct Supervisor kernel stack/heap, and User code,
+data/heap, and stack regions. Boot ROM remains outside RAM. Every range,
+length, permission, and initial SP is explicit for both LZ32/LZ64.
+
+The design assigns Supervisor R/W/X to the bootloader-writable kernel image,
+Supervisor R/W to kernel stack/heap, User R/X to code, and User R/W to
+data/heap/stack. Supervisor still receives no R/W/X bypass. User stack SP
+`0x0040_f000` and kernel SP `0x0018_f000` are mode-valid and aligned; stacks grow
+downward and have no guard pages. MMIO is excluded from allocation and requires
+a later disjoint driver mapping.
+
+Each process will own an independent `AddressSpace` with the same static layout;
+whole active-space/CPU context replacement will occur only at scheduler-owned
+boundaries. v1 has no shared writable pages, `Arc<Mutex<...>>`, or concurrent
+address-space mutation. The current machine still owns one static space:
+Steps 34, 38, and 39 will add pool metadata, process ownership, and explicit
+context activation in that order.
+
+Kernel and User heaps are checked contiguous bump allocators with fresh zeroed
+RAM, aligned allocation, no individual free, and no cursor mutation on failure.
+There is no active page size or paging. Four KiB is only the planned future
+minimum page size; no `PageNumber`, page table, MMU, demand paging, shared
+mapping, guard page, or global allocator is claimed. The document defines the
+smallest complete Step 34 scope without implementing it early.
+
+No Rust API or test was added because Step 33 is design-only; all 194 existing
+tests remain meaningful. Manual cross-checking covered every Step 33 field,
+boot-map compatibility, strong address separation, current `MemoryRegion`
+capabilities, CALL/RET stack rules, and the later process boundary. Full Rust
+gates, host Nix flake checks, and package build passed on x86_64-linux. Package
+output:
+`/nix/store/81dnc6sdvknljqz026sf56lzc3z75npl-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. No staging or commit was created. Step 34
+(checked bump pools and kernel/User layouts) is next.
+
+## Step 32 — Supervisor/User Privilege Contract
+
+Completed and verified the minimum useful privilege model using the existing
+centralized architecture rather than adding a duplicate OS-only enum. The ISA
+has exactly `Supervisor` and `User`, represented by status bit `U`; `EI`, `DI`,
+`HALT`, `RFE`, `CSRR`, and `CSRW` are Supervisor-only. User execution is rejected
+before any instruction, memory, status, or controller effect. `SYSCALL` and
+software `TRAP` remain legal in both modes and do not change privilege until
+trap entry. Arithmetic changes only NZCV, never U or IE.
+
+Trap entry from User forces Supervisor and clears IE while preserving NZCV, SP,
+and all general registers. RFE restores only the frame's validated editable
+PC/SP/status, including User and IE, and deliberately does not restore the
+immutable general-register snapshot. Region-level `user` permission and
+Supervisor R/W/X enforcement are unchanged and continue to use the existing Bus
+and memory tests; no third ring, kernel backdoor, or host-only guest privilege
+path was introduced.
+
+Three dedicated CPU privilege tests cover all privileged operations and atomic
+User rejection, both-mode SYSCALL/TRAP behavior, and exact User/IE entry-return
+semantics in LZ32/LZ64. Existing comprehensive, status, memory-permission, and
+trap suites continue to cover instruction metadata, reserved status bits,
+Supervisor non-bypass, and controller ordering. Workspace total: 194 tests,
+zero doctests.
+
+No new production abstraction was required for this step. Full required Rust
+gates, strict workspace/all-target Clippy, host Nix flake checks, and package
+build passed on x86_64-linux. Package output:
+`/nix/store/46y5whswx7pv8azs30ra1bxpysqbmnd9-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. No SDL, external dependency, staging, or commit
+was added. Rust source/test line count is 15,067. Step 33 (flat OS memory model)
+is next.
+
+## Step 31 — Trap and Interrupt Controllers
+
+Implemented the CPU-owned `TrapController` and machine-owned
+`InterruptController` required by Step 31. `ReferenceInterpreter` now has one
+TVEC, one active frame, immutable exact pre-entry snapshots, typed causes, and
+editable EPC/ESP/ESTATUS. `CSRR`/`CSRW`/`RFE` execute real controller behavior
+instead of the old placeholder fault. Entry validates the complete Supervisor
+execute fetch before mutation, forces Supervisor/IE-off while preserving
+NZCV, SP, and all registers, and writes no guest frame. Typed entry methods keep
+software payloads sign-extended by mode, external IDs in payload, and fault
+payloads zero.
+
+Failed entry and double-trap records retain the first triggering attempt and
+second context; controller terminal state blocks direct CPU execution, RFE,
+control access, and repeated delivery. `MachineError::TrapEntry` retains the
+boxed failure, optional original CPU fault, and boxed `TrapAttempt`. Successful
+fault delivery keeps the original fault available through the active frame;
+handler instructions do not erase it, and RFE/reset releases it. Machine step
+events now distinguish `Stepped`, `Trapped { TrapEvent }`, and `Halted`; bounded
+runs stop at a delivered trap and preserve counts. Fault classification now
+distinguishes illegal/privilege/width/address/alignment/division/control/
+unmapped/permission/device causes instead of flattening them.
+
+Interrupt requests use strong `InterruptId` values, coalesce duplicates, remain
+sorted for lowest-ID delivery, respect IE, defer while a frame is active, and
+acknowledge only after successful entry. Delivery occurs only at an eligible
+running boundary; failed target fetches leave the request pending. Reset clears
+frames, pending requests, and retained faults. HALT cannot be woken by an
+interrupt. There is no syscall service implementation or device interrupt
+assignment yet; `SYSCALL` still produces a delivered trap boundary for Step 35–37.
+
+Seven CPU trap tests cover entry snapshots, typed payload rules, CSRR/CSRW/RFE,
+invalid entry atomicity, repeated terminal double traps, external deferral, HALT
+behavior, and frame-control ordering. Nineteen machine tests cover trap
+handoffs, successful/failed/fault delivery, precise cause vectors, interrupt
+masking/order/ack/reset, retained diagnostics, EI/RFE boundaries, and both
+architecture modes; one interrupt-controller unit test covers coalescing and
+post-ack re-request. Workspace total: 191 tests, zero doctests. Independent
+review corrections included precise nested cause mapping, boxed error size,
+first-attempt retention, terminal controller enforcement, and direct external
+entry semantics.
+
+Full required Rust gates, strict workspace/all-target Clippy, host Nix flake
+checks, and package build passed on x86_64-linux. Package output:
+`/nix/store/42vgz6zw6zdwhiz26cqq5ipm1h2m263k-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. No SDL, external dependency, staging, or commit
+was added. Rust source/test line count is 14,955. Step 32 (complete and verify
+the Supervisor/User privilege contract) is next.
+
+## Step 30 — User/Kernel/Hardware Boundary
+
+Extended `docs/os-design.md` with the normative separation required by Step 30.
+It defines User as unprivileged application execution, Supervisor as the
+bootloader/kernel execution mode, and hardware as the privately owned machine,
+Bus, address space, devices, and virtual clock. The required path is fixed as
+`User -> SYSCALL/trap -> TrapController -> kernel dispatcher/service -> virtual
+hardware -> structured result`; host or SDL paths cannot substitute for it.
+
+A direct-access matrix and prohibition list make the boundary explicit. User
+cannot execute `HALT`, `RFE`, `EI`, `DI`, `CSRR`, or `CSRW`; access trap/control
+state; touch kernel-only or User-denied memory/device mappings; change privilege
+through a side channel; forge/push a trap frame; retain kernel-owned handles; or
+invoke Bus, mapping, device, allocator, scheduler, raw peek/load, host reset, or
+machine internals. `SYSCALL`/`TRAP` remain legal in both modes but change
+privilege only on trap entry. Trap entry/RFE preserve the already-defined
+register/status/frame rules.
+
+Supervisor is explicitly not an architecture superuser: it still obeys every
+R/W/X, width, address, mapping, fetch, stack, and device policy. Kernel services
+must validate syscall identity, pointers, lengths, handles, versions,
+permissions, ownership, and limits before mutation. Exact syscall IDs and result
+encoding remain deferred to Step 35; the document creates no ABI constants.
+Headless and SDL frontends use the same kernel path and cannot grant access.
+
+No Rust API or test was added because this is a design step; the existing 174
+tests remain meaningful. Manual review against ISA privilege/trap/memory clauses
+and current APIs found no duplicate privilege model, hidden User bypass, Linux
+assumption, or unimplemented-service claim. Full Rust gates, host Nix flake
+checks, and package build passed on x86_64-linux. Package output:
+`/nix/store/1l1h9l6zkddcwn6xn943n2f6648lggjj-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. No staging or commit was created. Step 31
+(traps and interrupts) is next.
+
+## Step 29 — LazOS Architecture Design
+
+Created `docs/os-design.md` and added it to the Nix source set. The document
+defines LazOS as a small native OS rather than a Linux imitation and fixes its
+architectural principles: explicit machine/kernel/process ownership, reference
+interpreter authority, validate-before-mutation, structured failure, enforced
+privilege, deterministic virtual time, simple complete mechanisms, and headless
+operation independent of SDL3.
+
+The design records the current machine/boot/device foundation separately from
+future kernel subsystems. It assigns trap control to Step 31, privilege to Steps
+30–32, flat protected memory to Steps 33–34, the shared ABI/dispatcher to Steps
+35–37, process/thread state to Step 38, deterministic round-robin scheduling to
+Step 39, validated `.lzx` loading to Step 40, a virtual in-memory filesystem to
+Step 41, and real `init`/shell delivery to Steps 42–43. It requires the kernel
+to own process address spaces, CPU contexts, stacks, images, and handles while
+reusing existing `MachineState`, `ExecutionState`, Bus, device, clock, and memory
+contracts rather than duplicating them.
+
+The document also fixes the intended service boundaries: one boot handoff into
+Supervisor, one machine-owned trap controller, a later flat User/Kernel memory
+map, a shared custom OS ABI, validated process services, bounded deterministic
+round-robin scheduling, one native executable semantic model shared by loader
+and linker, and a virtual filesystem with per-process handles. Console is the
+only implemented device; display/input drivers, persistence, paging, and SDL
+presentation remain future work. Graphics/input ABI calls are not advertised
+before drivers exist, and syscall numbers remain deferred to Step 35.
+
+No Rust API or test was added because Step 29 is documentation-only; all 174
+existing tests remain meaningful. A manual cross-check against `docs/isa.md`,
+`docs/boot.md`, current machine/device APIs, and the exact Step 29 roadmap scope
+found no Linux-model substitution or premature implementation claim. Full
+format, strict all-target Clippy, all-target Cargo check/test, host Nix flake
+checks, and package build passed on x86_64-linux. Package output:
+`/nix/store/mc5cw970gfvhvqy1s3fcg41a6jjqp8ny-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. No external dependency, Rust code, staging, or
+commit was added. Step 30 (User/Kernel/Hardware separation) is next.
+
+## Step 28 — Typed ROM Bootloader
+
+Added `lazalith-boot` (`no_std + alloc`; local devices/ISA/machine/memory/types
+dependencies only), registered it in the workspace/lockfile/Nix installation,
+and included `docs/boot.md` in the Nix source set. `BootImage` owns one exact
+materialized 512 KiB ROM, exposes read-only config/header/ROM/kernel views, and
+constructs an empty-device `MachineSetup`; a non-empty device manager is rejected
+rather than silently left unmapped. `BootImage::start` builds a fresh machine,
+executes only the fixed ROM bootloader, and returns stopped precisely at the
+validated kernel entry. No arbitrary caller-supplied-machine reboot API is
+claimed.
+
+The real bootloader is emitted as canonical `lazalith-isa::Instruction` values
+and encoded with the shared ISA codec. It checks header high halves, fixed load
+address, nonzero ROM-payload-bounded length, entry alignment, and entry range
+without wrapping, copies the payload byte-by-byte to kernel RAM, forms the
+absolute entry, clears scratch registers, and executes `JMP`. Host parsing first
+validates exact ROM length, magic/header size/version/architecture/flags/load/
+reserved fields, LZ32 high-half rejection, payload capacity and bounds, entry
+and canonical first instruction, checksum, canonical bootloader prefix, and all
+reserved gaps/tail bytes. CRC-32/ISO-HDLC is independently checked against its
+standard vector. `BootError` retains structured field values and typed cause
+chains, including decode, width, memory, allocation, conversion, and machine
+failures.
+
+The mandatory map is boot ROM Supervisor R+X, kernel-image RAM Supervisor RWX
+(the bootloader must write it in the same flat mapping), and kernel stack
+Supervisor RW. After transfer, `start` performs a pure executable fetch through
+the new `LazalithMachine::inspect_instruction` API and verifies PC, SP,
+Supervisor/IE status, every handoff register, and zeroed scratch registers before
+returning the `Reset`-lifecycle machine at the kernel entry. The first kernel
+instruction remains unexecuted. There is no filesystem, relocation, `.lzo`/`.lzx`,
+syscall, process, trap, interrupt, User transition, or OS policy in the
+bootloader.
+
+Ten boot tests cover both modes, zero/nonzero entries, exact copied bytes and
+permissions, full handoff, next kernel execution, exact ROM round trip, all
+header/checksum/reserved/code rejection and combined-error ordering, maximum
+payload plus overflow, LZ32 high-half values, empty-device enforcement, device
+clock mismatch, runtime guard HALT before any partial copy (including LZ32
+subtraction underflow), and entry-fetch permission failure after an exact copy.
+Workspace total: 174 tests (10 boot, 11 machine, 28 memory, 35 CPU, 56 types,
+14 ISA, 3 devices, 17 diagnostics), zero doctests.
+
+Development found and corrected real defects before completion: ST operand
+order, four-byte branch scaling, the fixed-load shift, absolute entry addition,
+the static instruction-count limit for variable payloads, the R+X-versus-copy
+permission contradiction, RAM-sized versus ROM-sized payload limits, validation
+order/reserved bytes/typed range causes, and the initially over-broad arbitrary
+machine reboot API. The final independent re-review found no remaining
+confirmed Step 28 implementation defect.
+
+All required gates passed on x86_64-linux: format check, strict workspace
+all-target Clippy, all-target workspace check/test, all host `nix flake check
+path:.` outputs, and `nix build path:.`. Package output:
+`/nix/store/60amgz104ahga6lbc9mx6z6qzv5gvddc-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. No external dependency, SDL, unsafe, code
+comment, staging, or commit was added. Rust source/test line count is 13,083.
+Step 29 (LazOS design) is next.
+
+## Step 27 — Flat Boot Specification
+
+Created `docs/boot.md` as the normative v1 boot contract for both LZ32 and LZ64.
+It defines exact reset CPU/device/epoch state; one reset vector and boot address
+at `0x0000_0000`; a flat identity-mapped boot ROM, kernel-image RAM, and separate
+kernel stack; fixed kernel load/entry validation; a deterministic boot image; and
+the Supervisor handoff registers. Step 28 now implements the specified loader and
+fixed ROM bootloader; no LazOS kernel exists yet.
+
+The mandatory map is boot ROM `0x0000_0000..0x0007_ffff` (Supervisor R+X),
+kernel image RAM `0x0010_0000..0x0017_ffff` (Supervisor RWX so the bootloader can
+populate it), and kernel stack RAM `0x0018_0000..0x0018_ffff` (Supervisor R+W),
+with initial SP `0x0018_f000`. Cold RAM begins zero; warm machine reset preserves
+RAM by the Step 26 contract, and kernel software may not depend on unrelated
+bytes being cleared. The common SP is valid and aligned for four-byte LZ32 and
+eight-byte LZ64 stack words.
+
+The exact materialized boot ROM stores the fixed bootloader at address zero, a
+48-byte `LZBOOT01` little-endian header at `0x0000_0400`, and up to
+`0x0007_f000` payload bytes at `0x0000_1000`. The header fixes format version 1,
+architecture, zero flags, load address `0x0010_0000`, nonzero image length,
+relative entry offset, CRC-32/ISO-HDLC payload checksum, and zero reserved data.
+Unassigned code/header gaps and the tail must be zero. Step 28 intentionally uses
+an empty device manager and installs no MMIO mapping.
+
+The successful handoff fixes PC to the validated entry, SP to `0x0018_f000`,
+Supervisor mode with IE disabled, `r0=0`, `r1=load address`, `r2=image length`,
+`r3=r15=entry`, and `r4`–`r14=0`; NZCV is explicitly boot-owned rather than a
+stable handoff value. Trap state is initially empty/unset. The specification
+rejects filesystem boot, `.lzo`/`.lzx`, relocations, compression, probing,
+paging, User entry, driver policy, and OS behavior as premature v1 scope.
+
+This documentation-only step added no placeholder Rust API or meaningless test;
+its pre-Step-28 workspace total was 164 tests. Its full Rust/Nix gates passed
+before Step 28, and `docs/boot.md` is now part of the Nix source set. No staging
+or commit was created. The Step 28 handoff above supersedes the earlier
+implementation-status wording.
+
+## Step 26 — Validated Machine Lifecycle
+
+`LazalithMachine` now owns an explicit six-state lifecycle: `Created`, `Reset`,
+`Running`, `Paused`, `Halted`, and `Faulted`. Construction succeeds in `Created`
+and does not implicitly begin execution. The transition contract is:
+
+| Current state | `reset` | `step` | `run` | `pause` |
+| --- | --- | --- | --- | --- |
+| `Created` | `Reset` | reject | reject | reject |
+| `Reset` | `Reset` | execute, remain `Reset` | enter `Running` | reject |
+| `Running` | `Reset` | execute, remain `Running` | continue | `Paused` |
+| `Paused` | `Reset` | execute, remain `Paused` | enter `Running` | reject |
+| `Halted` | `Reset` | reject | reject | reject |
+| `Faulted` | `Reset` | reject | reject | reject |
+
+`run(0)` is a real lifecycle transition but executes no instruction. A successful
+`HALT` overrides the source state with `Halted`; any CPU fault overrides it with
+`Faulted` while returning the original boxed, structured fault. Rejected execution
+returns `MachineError::InvalidTransition { operation, state }`; the old generic
+`MachineError::Halted` variant is gone. The error has precise display text and no
+synthetic cause. Invalid transitions, including terminal-state `run(0)`, perform
+no CPU, clock, count, device, or lifecycle mutation.
+
+A CPU fault still leaves the faulting instruction architecturally atomic, but the
+machine lifecycle intentionally changes to `Faulted`. A bounded `run` remains
+non-atomic across instructions: successful earlier instructions and their memory
+or device effects remain when a later instruction faults. Traps are outcomes,
+not machine faults; `run` stops at a trap without re-executing its unchanged PC
+within that call. Trap delivery across calls remains Step 31 work, so a later
+explicit step may observe the same trap and no fake `TrapController` was added.
+
+`reset` is valid from every state and infallible under the existing trusted CPU
+and `Device::reset` contracts. The machine privately retains its validated setup
+CPU snapshot and initial virtual epoch. Reset reconstructs a fresh
+`ReferenceInterpreter` (restoring setup PC/SP/status, zeroed ordinary registers,
+and CPU Running execution state), resets every device, synchronizes the device
+manager and all devices to `MachineSetup::initial_time`, restores the machine
+clock to that same epoch, and enters `Reset`. `DeviceManager::reset_at` and the
+narrow `Bus::reset_devices` bridge implement this without exposing device
+internals. Existing RAM/ROM regions, RAM contents, and device mappings are
+preserved: Step 27 owns boot/reset images and initial-memory policy, so Step 26
+does not invent a cold-memory snapshot.
+
+The successful-instruction counter remains a lifetime diagnostic count since
+construction across resets; `MachineRun::executed` is per call and
+`halted_at` remains cumulative. A first-count overflow is preflighted before
+`run` changes `Reset` or `Paused` to `Running`. Host setup, clock, and read-only
+inspection APIs retain their Step 25 behavior and do not themselves resume a
+terminal CPU; lifecycle enforcement applies to `step`, `run`, and `pause`.
+
+The machine suite now has 11 tests covering the complete transition table,
+repeated reset, zero-work runs, paused single-step, both LZ32/LZ64 paths, exact
+HALT and capacity-fault terminal behavior, full invalid-operation matrices,
+recovery from both terminal states, trap distinction, cumulative counts, full
+CPU/device/clock reset, preserved memory/mappings, and deterministic execution.
+One new MMIO test verifies reset-at-epoch across multiple preticked devices and
+preserved routing. Workspace total: 164 tests (11 machine, 28 memory, 35 CPU,
+56 types, 14 ISA, 3 devices, 17 diagnostics), zero doctests. An independent
+review found and corrected first-step count-overflow ordering and two weakened
+fault assertions before the final run.
+
+At takeover, `lazalith-types` and `lazalith-diagnostics` already had uncommitted
+source-provenance work. Its baseline tests did not compile because `SourceSpan`
+was no longer `Copy`, and one diagnostic still expected cross-manager range
+revalidation rather than the new `WrongSource` result. Only the necessary test
+ownership clones and provenance expectation were repaired; the pre-existing
+production provenance changes were preserved rather than reverted or claimed as
+Step 26 work.
+
+All required gates passed on x86_64-linux: `cargo fmt --all --check`, strict
+workspace/all-target Clippy with `-D warnings`, `cargo check --workspace`,
+`cargo test --workspace`, all host `nix flake check path:.` checks, and
+`nix build path:. --no-link --print-out-paths`. Package output:
+`/nix/store/n06vi4x0lrn6agwnqz1k5bgmi92chxpl-lazalith-foundations-0.1.0`.
+aarch64-linux remains untested. No dependency, SDL, Nix, or code-comment changes;
+no staging or commit. Rust source/test line count is 11,296. Step 27 (the boot
+specification) is next.
 
 ## Step 25 — Privately Owned Machine
 
@@ -14,15 +830,17 @@ memory/CPU boundary; the machine never invents state. The clock is prevalidated
 (`VirtualClock::advanced`) before device ticks, preserving both on failure, and
 no wall-clock enters the system.
 
-Step 25 is deliberately not Step 26: the machine exposes `step` and bounded
-`run(limit)` only — no reset/pause/resume/lifecycle or state machine. `step`
-runs one CPU instruction through the bus and returns `MachineEvent::Stepped`
+At the Step 25 boundary, the machine deliberately stopped short of Step 26: it
+exposed `step` and bounded `run(limit)` only — no reset/pause/resume/lifecycle or
+state machine. At that boundary, `step` ran one CPU instruction through the bus
+and returned `MachineEvent::Stepped`
 or `MachineEvent::Halted`; `run` reports per-call `executed` (including the
 halting step) and cumulative `halted_at` (instructions executed since
 construction at first halt; `None` when the limit bound the loop). Faults,
 clock overflow, and post-halt steps return typed `MachineError`s
-(`Fault(Box<CpuFault<MemoryFault>>)` keeps the error small) and leave halted,
-state, clock, and device state untouched; no fake trap delivery or controller.
+(`Fault(Box<CpuFault<MemoryFault>>)` keeps the error small) and left the then-current
+non-halted execution flag, clock, and device state untouched; no fake trap
+delivery or controller existed.
 Inspection APIs are read-only: config, clock, is_halted, architectural_state,
 devices, memory, and a pure peek_memory. Loading (`load_region`, `load_bytes`,
 `map_device`) is allowed before execution and fails without mutation.

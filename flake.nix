@@ -16,7 +16,7 @@
           version = "0.1.0";
           src = pkgs.lib.fileset.toSource {
             root = ./.;
-            fileset = pkgs.lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./crates ./docs/isa.md ];
+            fileset = pkgs.lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./crates ./docs/isa.md ./docs/boot.md ./docs/lzx.md ./docs/lzo.md ./docs/os-design.md ./docs/os-memory.md ./docs/os-abi.md ./docs/lazen-design.md ./docs/lazen-rationale.md ];
           };
           cargoLock.lockFile = ./Cargo.lock;
           cargoBuildFlags = [ "--workspace" ];
@@ -25,7 +25,7 @@
           installPhase = ''
             runHook preInstall
             mkdir -p "$out/lib"
-            for crate in lazalith_types lazalith_diagnostics lazalith_isa lazalith_cpu lazalith_memory lazalith_devices lazalith_machine; do
+            for crate in lazalith_types lazalith_diagnostics lazalith_isa lazalith_cpu lazalith_memory lazalith_devices lazalith_machine lazalith_boot lazalith_os lazalith_os_abi lazalith_toolchain; do
               install -m644 "target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/lib$crate.rlib" "$out/lib/"
             done
             runHook postInstall

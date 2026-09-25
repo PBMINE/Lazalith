@@ -1,9 +1,12 @@
 #![no_std]
 
+extern crate alloc;
+
 mod fault;
 mod interpreter;
 mod memory;
 mod outcome;
+mod trap;
 
 pub use fault::{CpuFault, CpuFaultCause};
 pub use interpreter::ReferenceInterpreter;
@@ -24,3 +27,7 @@ pub use state::{
     validate_pc, validate_sp,
 };
 pub use status::{InvalidStatus, Privilege, StatusRegister};
+pub use trap::{
+    DoubleTrap, ExecutionContextId, PrepareEntryError, SyscallAdmission, SyscallCompletion,
+    TrapAttempt, TrapCause, TrapController, TrapFrame, TrapSnapshot,
+};

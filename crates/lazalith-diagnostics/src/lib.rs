@@ -108,7 +108,7 @@ impl Label {
     }
 
     pub fn span(&self) -> SourceSpan {
-        self.span
+        self.span.clone()
     }
 
     pub fn message(&self) -> &str {
@@ -227,8 +227,12 @@ impl Error for Diagnostic {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RenderError {
+    WrongSource {
+        label_index: usize,
+        span: SourceSpan,
+    },
     MissingSource {
         label_index: usize,
         span: SourceSpan,
@@ -252,6 +256,13 @@ pub enum RenderError {
 impl fmt::Display for RenderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::WrongSource { label_index, span } => {
+                write!(
+                    f,
+                    "label {label_index}: source {} has different provenance",
+                    span.id()
+                )
+            }
             Self::MissingSource { label_index, span } => {
                 write!(f, "label {label_index}: source {} is missing", span.id())
             }
@@ -303,15 +314,8 @@ pub fn render_plain(
                 return Err(RenderError::MissingSource { label_index, span });
             }
             sources
-                .source_span(span.id(), span.start(), span.end())
-                .map_err(|source| RenderError::InvalidSpan {
-                    label_index,
-                    span,
-                    source,
-                })?;
-            sources
                 .resolve(&span)
-                .ok_or(RenderError::UnresolvedSpan { label_index, span })
+                .ok_or(RenderError::WrongSource { label_index, span })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -412,8 +416,8 @@ mod tests {
         let id = sources.add_file("example.lz", "hello").unwrap();
         let range = span(&sources, id, 0, 5);
         let diagnostic = diagnostic()
-            .with_label(Label::secondary(range, String::from("context")))
-            .with_label(Label::primary(range, "failure"))
+            .with_label(Label::secondary(range.clone(), String::from("context")))
+            .with_label(Label::primary(range.clone(), "failure"))
             .with_note(Note::new(String::from("first note")))
             .with_note(Note::new("second note"))
             .with_help(Help::new(String::from("first help")))
@@ -623,7 +627,7 @@ mod tests {
         let first = sources.add_file("first.lz", "a").unwrap();
         let diagnostic = diagnostic()
             .with_label(Label::primary(span(&sources, first, 0, 1), "valid"))
-            .with_label(Label::secondary(missing, "missing"));
+            .with_label(Label::secondary(missing.clone(), "missing"));
         let error = render_plain(&diagnostic, &sources).unwrap_err();
         assert_eq!(
             error,
@@ -637,39 +641,28 @@ mod tests {
     }
 
     #[test]
-    fn revalidates_every_span_against_the_rendering_manager() {
+    fn rejects_spans_from_another_source_manager() {
         let mut original = SourceManager::new();
-        let id = original.add_file("original.lz", "abcd").unwrap();
-        for (start, end, text, message) in [
-            (0, 4, "a", "source span extends past end of file"),
-            (2, 2, "a", "source span extends past end of file"),
-            (1, 2, "éab", "source span interior splits a UTF-8 character"),
-            (0, 1, "éab", "source span interior splits a UTF-8 character"),
-        ] {
-            let invalid = span(&original, id, start, end);
-            let mut sources = SourceManager::new();
-            let id = sources.add_file("replacement.lz", text).unwrap();
-            let diagnostic = diagnostic()
-                .with_label(Label::primary(span(&sources, id, 0, 0), "valid"))
-                .with_label(Label::secondary(invalid, "invalid"));
-            let error = render_plain(&diagnostic, &sources).unwrap_err();
-            let source = sources
-                .source_span(id, invalid.start(), invalid.end())
-                .unwrap_err();
-            assert_eq!(
-                error,
-                RenderError::InvalidSpan {
-                    label_index: 1,
-                    span: invalid,
-                    source
-                }
-            );
-            assert_eq!(error.to_string(), format!("label 1: {message}"));
-            assert_eq!(
-                error.source().unwrap().downcast_ref::<InvalidSpan>(),
-                Some(&source)
-            );
-        }
+        let original_id = original.add_file("original.lz", "abcd").unwrap();
+        let invalid = span(&original, original_id, 1, 3);
+        let mut sources = SourceManager::new();
+        let id = sources.add_file("replacement.lz", "abcd").unwrap();
+        let diagnostic = diagnostic()
+            .with_label(Label::primary(span(&sources, id, 0, 0), "valid"))
+            .with_label(Label::secondary(invalid.clone(), "invalid"));
+        let error = render_plain(&diagnostic, &sources).unwrap_err();
+        assert_eq!(
+            error,
+            RenderError::WrongSource {
+                label_index: 1,
+                span: invalid,
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "label 1: source #0 has different provenance"
+        );
+        assert!(error.source().is_none());
     }
 
     #[test]

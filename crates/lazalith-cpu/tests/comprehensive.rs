@@ -693,15 +693,12 @@ fn privilege_halt_and_all_control_selectors_are_explicit() {
                 };
                 for status in [31, 63] {
                     let mut machine = cpu(config, 0, 256, status, &[(0, u64::MAX)]);
-                    let expected = if status == 63 {
-                        Cause::PrivilegeViolation
+                    let actual = unchanged(&mut machine, &mut Ram::default(), opcode, &operands);
+                    if status == 63 {
+                        assert_eq!(actual, Cause::PrivilegeViolation);
                     } else {
-                        Cause::UnsupportedUntilTrapController(opcode)
-                    };
-                    assert_eq!(
-                        unchanged(&mut machine, &mut Ram::default(), opcode, &operands),
-                        expected
-                    );
+                        assert!(matches!(actual, Cause::Control(_)));
+                    }
                 }
             }
         }

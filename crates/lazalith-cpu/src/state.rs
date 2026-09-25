@@ -143,6 +143,10 @@ pub enum ControlStateError {
         width: WordWidth,
     },
     Status(InvalidStatus),
+    InvalidControlState {
+        operation: &'static str,
+        selector: u8,
+    },
 }
 
 impl fmt::Display for ControlStateError {
@@ -164,6 +168,10 @@ impl fmt::Display for ControlStateError {
                 width.bits()
             ),
             Self::Status(source) => source.fmt(f),
+            Self::InvalidControlState {
+                operation,
+                selector,
+            } => write!(f, "invalid {operation} for control selector {selector}"),
         }
     }
 }
@@ -173,7 +181,7 @@ impl Error for ControlStateError {
         match self {
             Self::Range { source, .. } => Some(source),
             Self::Status(source) => Some(source),
-            Self::Alignment { .. } => None,
+            Self::Alignment { .. } | Self::InvalidControlState { .. } => None,
         }
     }
 }

@@ -202,10 +202,6 @@ fn traps_are_events_and_controller_instructions_are_not_emulated() {
                     Opcode::Csrr,
                     vec![r(0), Operand::Control(lazalith_isa::ControlRegister::Tvec)],
                 ),
-                (
-                    Opcode::Csrw,
-                    vec![Operand::Control(lazalith_isa::ControlRegister::Tvec), r(0)],
-                ),
             ] {
                 let mut cpu = cpu(config, 0, 256, status, &[]);
                 let before = cpu.architectural_state().clone();
@@ -215,9 +211,31 @@ fn traps_are_events_and_controller_instructions_are_not_emulated() {
                 if status == 32 {
                     assert!(matches!(error.cause, Cause::PrivilegeViolation));
                 } else {
-                    assert_eq!(error.cause, Cause::UnsupportedUntilTrapController(opcode));
+                    assert!(matches!(error.cause, Cause::Control(_)));
                 }
                 assert_eq!(cpu.architectural_state(), &before);
+            }
+            let operands = vec![Operand::Control(lazalith_isa::ControlRegister::Tvec), r(0)];
+            let mut cpu = cpu(config, 0, 256, status, &[(0, 0)]);
+            if status == 32 {
+                assert!(matches!(
+                    cpu.execute(
+                        &instruction(config, Opcode::Csrw, &operands),
+                        &mut Ram::default()
+                    )
+                    .unwrap_err()
+                    .cause,
+                    Cause::PrivilegeViolation
+                ));
+            } else {
+                assert_eq!(
+                    cpu.execute(
+                        &instruction(config, Opcode::Csrw, &operands),
+                        &mut Ram::default()
+                    ),
+                    Ok(OutcomeApplication::Continue)
+                );
+                assert_eq!(cpu.trap_controller().tvec().unwrap().as_u64(), 0);
             }
         }
     }

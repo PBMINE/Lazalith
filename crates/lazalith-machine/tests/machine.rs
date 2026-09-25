@@ -1,10 +1,13 @@
-use lazalith_cpu::CpuFaultCause;
+use lazalith_cpu::{CpuFault, CpuFaultCause, TrapCause};
 use lazalith_devices::{DeviceId, DeviceManager};
-use lazalith_machine::{LazalithMachine, MachineError, MachineSetup};
-use lazalith_memory::{MemoryFaultKind, MemoryRegion, RegionPermissions as RP};
+use lazalith_isa::{Opcode, decode};
+use lazalith_machine::{
+    LazalithMachine, MachineError, MachineOperation, MachineSetup, MachineState,
+};
+use lazalith_memory::{MemoryFault, MemoryFaultKind, MemoryRegion, RegionPermissions as RP};
 use lazalith_types::{
-    ArchitectureConfig as C, CycleCount, InstructionAddress as I, PhysicalAddress as P,
-    VirtualAddress as V,
+    ArchitectureConfig as C, CycleCount, InstructionAddress as I, InterruptId,
+    PhysicalAddress as P, VirtualAddress as V,
 };
 
 fn li(register: u8, value: i32) -> [u8; 8] {
@@ -70,20 +73,59 @@ fn make_machine(
     machine
 }
 
+fn ready_machine(
+    config: C,
+    capacity: usize,
+    text: &[u8],
+) -> LazalithMachine<lazalith_devices::ConsoleDevice> {
+    let mut machine = make_machine(config, capacity, text);
+    machine.reset();
+    machine
+}
+
+fn assert_invalid_transition<T: core::fmt::Debug>(
+    result: Result<T, MachineError>,
+    operation: MachineOperation,
+    state: MachineState,
+) {
+    let error = result.unwrap_err();
+    assert!(matches!(
+        error,
+        MachineError::InvalidTransition {
+            operation: actual,
+            state: actual_state,
+        } if actual == operation && actual_state == state
+    ));
+    assert_eq!(
+        error.to_string(),
+        format!("{operation:?} is invalid while machine is {state:?}")
+    );
+    assert!(std::error::Error::source(&error).is_none());
+}
+
 #[test]
 fn machine_produces_guest_hello_in_both_modes_with_no_internals_exposed() {
     for config in [C::lz32(), C::lz64()] {
         let text = b"Hello, Lazalith";
-        let mut machine = make_machine(config, text.len(), text);
+        let mut machine = ready_machine(config, text.len(), text);
+        let before_inspection = machine.architectural_state().clone();
+        let mut expected_instruction = [0u8; 8];
+        expected_instruction.copy_from_slice(&text_code(text)[..8]);
+        assert_eq!(
+            machine.inspect_instruction(I::new(0)).unwrap(),
+            expected_instruction
+        );
+        assert_eq!(machine.architectural_state(), &before_inspection);
         let run = machine.run(2 * text.len() as u64 + 2).unwrap();
         assert_eq!(run.halted_at, Some(2 * text.len() as u64 + 2));
         assert_eq!(run.executed, 2 * text.len() as u64 + 2);
+        assert_eq!(machine.state(), MachineState::Halted);
         assert!(machine.is_halted());
         assert_eq!(
             machine.devices().device(DeviceId::new(1)).unwrap().output(),
             text
         );
-        assert!(matches!(machine.step(), Err(MachineError::Halted)));
+        assert_invalid_transition(machine.step(), MachineOperation::Step, MachineState::Halted);
         assert_eq!(
             machine.architectural_state().pc(),
             I::new(8 * (2 * text.len() + 2) as u64)
@@ -94,7 +136,7 @@ fn machine_produces_guest_hello_in_both_modes_with_no_internals_exposed() {
 #[test]
 fn machine_clock_is_deterministic_and_fault_preserves_state_and_time() {
     for config in [C::lz32(), C::lz64()] {
-        let mut machine = make_machine(config, 1, b"AB");
+        let mut machine = ready_machine(config, 1, b"AB");
         machine.advance_clock(CycleCount::new(7)).unwrap();
         assert_eq!(machine.clock().elapsed(), CycleCount::new(7));
         assert_eq!(
@@ -105,29 +147,66 @@ fn machine_clock_is_deterministic_and_fault_preserves_state_and_time() {
                 .elapsed(),
             CycleCount::new(7)
         );
+        machine.set_trap_vector(I::new(0)).unwrap();
         machine.run(4).unwrap();
         let before = machine.architectural_state().clone();
-        let error = machine.step().unwrap_err();
+        let event = match machine.step().unwrap() {
+            lazalith_machine::MachineEvent::Trapped { event } => event,
+            other => panic!("expected trap, got {other:?}"),
+        };
+        assert_eq!(event.cause, TrapCause::DeviceAccess);
+        assert_eq!(event.payload, 0);
+        assert_eq!(event.resume_pc, before.pc());
         assert!(matches!(
-            error,
-            lazalith_machine::MachineError::Fault(boxed) if matches!(
-                boxed.cause,
-                CpuFaultCause::Memory {
-                    source: lazalith_memory::MemoryFault {
-                        kind: MemoryFaultKind::Device(lazalith_devices::DeviceError::Capacity),
-                        ..
-                    },
-                    ..
-                }
-            )
+            machine.last_trap_fault(),
+            Some(CpuFault { cause: CpuFaultCause::Memory { source, .. }, .. })
+                if matches!(
+                    source.kind,
+                    MemoryFaultKind::Device(lazalith_devices::DeviceError::Capacity)
+                )
         ));
-        assert_eq!(machine.architectural_state(), &before);
+        assert_eq!(machine.state(), MachineState::Running);
+        assert_eq!(machine.architectural_state().pc(), I::new(0));
+        let frame = machine.trap_controller().frame().unwrap();
+        assert_eq!(frame.snapshot().pc(), before.pc());
+        assert_eq!(frame.snapshot().sp(), before.sp());
+        assert_eq!(frame.snapshot().status(), before.status().bits());
+        for register in 0..16 {
+            assert_eq!(
+                frame
+                    .snapshot()
+                    .register(lazalith_types::RegisterIndex::try_from(register).unwrap()),
+                before.registers().read_raw(register).unwrap()
+            );
+        }
         assert_eq!(machine.clock().elapsed(), CycleCount::new(7));
+        assert_eq!(
+            machine
+                .devices()
+                .device(DeviceId::new(1))
+                .unwrap()
+                .elapsed(),
+            CycleCount::new(7)
+        );
         assert_eq!(
             machine.devices().device(DeviceId::new(1)).unwrap().output(),
             b"A"
         );
         assert!(!machine.is_halted());
+        let retained_fault = machine
+            .last_trap_fault()
+            .map(|_| machine.last_trap_fault().unwrap() as *const CpuFault<MemoryFault>);
+        assert!(retained_fault.is_some());
+        assert!(matches!(
+            machine.step().unwrap(),
+            lazalith_machine::MachineEvent::Stepped { .. }
+        ));
+        assert_eq!(
+            machine
+                .last_trap_fault()
+                .map(|_| { machine.last_trap_fault().unwrap() as *const CpuFault<MemoryFault> }),
+            retained_fault
+        );
         assert!(machine.advance_clock(CycleCount::new(u64::MAX)).is_err());
         assert_eq!(machine.clock().elapsed(), CycleCount::new(7));
     }
@@ -137,12 +216,12 @@ fn machine_clock_is_deterministic_and_fault_preserves_state_and_time() {
 fn repeated_construction_is_deterministic_and_run_is_bounded() {
     for config in [C::lz32(), C::lz64()] {
         let text = b"Hello, Lazalith";
-        let mut first = make_machine(config, text.len(), text);
-        let mut second = make_machine(config, text.len(), text);
+        let mut first = ready_machine(config, text.len(), text);
+        let mut second = ready_machine(config, text.len(), text);
         let bounded = first.run(3).unwrap();
         assert_eq!(bounded.halted_at, None);
         assert_eq!(bounded.executed, 3);
-        assert!(!first.is_halted());
+        assert_eq!(first.state(), MachineState::Running);
         let full = first.run(100).unwrap();
         assert_eq!(full.executed, 32 - 3);
         assert_eq!(full.halted_at, Some(32));
@@ -164,8 +243,9 @@ fn repeated_construction_is_deterministic_and_run_is_bounded() {
 #[test]
 fn stepping_then_running_counts_every_successful_instruction() {
     for config in [C::lz32(), C::lz64()] {
-        let mut machine = make_machine(config, 0, b"");
+        let mut machine = ready_machine(config, 0, b"");
         machine.step().unwrap();
+        assert_eq!(machine.state(), MachineState::Reset);
         let result = machine.run(10).unwrap();
         assert_eq!(result.executed, 1);
         assert_eq!(result.halted_at, Some(2));
@@ -174,23 +254,22 @@ fn stepping_then_running_counts_every_successful_instruction() {
 }
 
 #[test]
-fn run_returns_trap_without_reexecuting_unchanged_pc() {
+fn run_delivers_traps_and_stops_at_the_handler_without_reexecution() {
     for config in [C::lz32(), C::lz64()] {
-        for (opcode, request) in [
-            (0x50, lazalith_cpu::TrapRequest::Syscall),
-            (0x51, lazalith_cpu::TrapRequest::Software(0)),
+        for (opcode, cause, payload) in [
+            (0x50, TrapCause::Syscall, 0i32),
+            (0x51, TrapCause::SoftwareTrap, -7i32),
         ] {
+            let mut rom = vec![0u8; 0x108];
+            rom[..4].copy_from_slice(&[opcode, 0, 0, 0]);
+            rom[4..8].copy_from_slice(&payload.to_le_bytes());
+            rom[0x100..0x108].copy_from_slice(&[0x52, 0, 0, 0, 0, 0, 0, 0]);
             let mut machine = LazalithMachine::new(MachineSetup::<lazalith_devices::NoDevice> {
                 config,
                 devices: DeviceManager::new(),
                 regions: vec![
-                    MemoryRegion::rom(
-                        config,
-                        P::new(0),
-                        &[opcode, 0, 0, 0, 0, 0, 0, 0],
-                        RP::new(false, false, true, true),
-                    )
-                    .unwrap(),
+                    MemoryRegion::rom(config, P::new(0), &rom, RP::new(false, false, true, true))
+                        .unwrap(),
                 ],
                 pc: I::new(0),
                 sp: V::new(0x100),
@@ -198,12 +277,37 @@ fn run_returns_trap_without_reexecuting_unchanged_pc() {
                 initial_time: CycleCount::new(0),
             })
             .unwrap();
+            machine.reset();
+            machine.set_trap_vector(I::new(0x100)).unwrap();
             let before = machine.architectural_state().clone();
             let result = machine.run(100).unwrap();
+            let expected_payload = match config.word_width() {
+                lazalith_types::WordWidth::W32 => payload as u32 as u64,
+                lazalith_types::WordWidth::W64 => payload as i64 as u64,
+            };
             assert_eq!(result.executed, 1);
-            assert_eq!(result.trap, Some((request, I::new(8))));
+            assert_eq!(
+                result.trap,
+                Some(lazalith_machine::TrapEvent {
+                    cause,
+                    payload: expected_payload,
+                    resume_pc: I::new(8),
+                    interrupt: None,
+                })
+            );
             assert_eq!(result.halted_at, None);
-            assert_eq!(machine.architectural_state(), &before);
+            assert_eq!(machine.state(), MachineState::Running);
+            assert_eq!(machine.architectural_state().pc(), I::new(0x100));
+            assert!(!machine.architectural_state().status().interrupts_enabled());
+            let frame = machine.trap_controller().frame().unwrap();
+            assert_eq!(frame.snapshot().pc(), before.pc());
+            assert_eq!(frame.snapshot().sp(), before.sp());
+            assert_eq!(frame.snapshot().status(), before.status().bits());
+            assert_eq!(frame.cause(), cause);
+            assert_eq!(frame.payload(), expected_payload);
+            assert_eq!(frame.resume_pc(), I::new(8));
+            machine.step().unwrap();
+            assert_eq!(machine.state(), MachineState::Halted);
         }
     }
 }
@@ -235,6 +339,7 @@ fn construction_synchronizes_preticked_devices_without_double_advancing() {
             );
         } else {
             let machine = result.unwrap();
+            assert_eq!(machine.state(), MachineState::Created);
             assert_eq!(machine.clock().elapsed(), CycleCount::new(initial));
             assert_eq!(
                 machine.devices().clock().elapsed(),
@@ -265,11 +370,26 @@ fn construction_and_loader_failures_preserve_explicit_setup_contracts() {
         initial_time: CycleCount::new(0),
     };
     let mut invalid_machine = LazalithMachine::new(invalid_setup).unwrap();
+    invalid_machine.reset();
     assert!(matches!(
         invalid_machine.step(),
-        Err(lazalith_machine::MachineError::Fault(_))
+        Err(lazalith_machine::MachineError::TrapEntry {
+            attempt: _,
+            original: Some(original),
+            failure
+        }) if matches!(
+            original.cause,
+            CpuFaultCause::Fetch(lazalith_memory::MemoryFault {
+                kind: MemoryFaultKind::Unmapped,
+                ..
+            })
+        ) && matches!(
+            failure.cause,
+            CpuFaultCause::Control(lazalith_cpu::ControlStateError::InvalidControlState { .. })
+        )
     ));
-    let mut machine = make_machine(config, 8, b"Hello, Lazalith");
+    assert_eq!(invalid_machine.state(), MachineState::Faulted);
+    let mut machine = ready_machine(config, 8, b"Hello, Lazalith");
     assert!(machine.load_bytes(P::new(0), &[9]).is_err());
     assert!(
         machine
@@ -289,13 +409,15 @@ fn construction_and_loader_failures_preserve_explicit_setup_contracts() {
             .is_err()
     );
     assert!(machine.load_bytes(P::new(0x1000), &[1]).is_err());
-    let mut second_machine = make_machine(config, 8, b"Hello, Lazalith");
-    assert!(second_machine.run(1000).is_err());
-    assert!(!second_machine.is_halted());
+    let mut second_machine = ready_machine(config, 8, b"Hello, Lazalith");
     assert!(matches!(
-        second_machine.step(),
-        Err(lazalith_machine::MachineError::Fault(boxed)) if matches!(
-            boxed.cause,
+        second_machine.run(1000),
+        Err(lazalith_machine::MachineError::TrapEntry {
+            attempt: _,
+            original: Some(original),
+            failure
+        }) if matches!(
+            original.cause,
             CpuFaultCause::Memory {
                 source: lazalith_memory::MemoryFault {
                     kind: MemoryFaultKind::Device(lazalith_devices::DeviceError::Capacity),
@@ -303,6 +425,658 @@ fn construction_and_loader_failures_preserve_explicit_setup_contracts() {
                 },
                 ..
             }
+        ) && matches!(
+            failure.cause,
+            CpuFaultCause::Control(lazalith_cpu::ControlStateError::InvalidControlState { .. })
         )
     ));
+    assert_eq!(second_machine.state(), MachineState::Faulted);
+    assert!(!second_machine.is_halted());
+    assert_invalid_transition(
+        second_machine.step(),
+        MachineOperation::Step,
+        MachineState::Faulted,
+    );
+}
+
+#[test]
+fn created_requires_reset_and_zero_length_runs_honor_lifecycle() {
+    for config in [C::lz32(), C::lz64()] {
+        let mut machine = make_machine(config, 1, b"A");
+        assert_eq!(machine.state(), MachineState::Created);
+        let before = machine.architectural_state().clone();
+        assert_invalid_transition(
+            machine.step(),
+            MachineOperation::Step,
+            MachineState::Created,
+        );
+        assert_invalid_transition(machine.run(0), MachineOperation::Run, MachineState::Created);
+        assert_invalid_transition(
+            machine.pause(),
+            MachineOperation::Pause,
+            MachineState::Created,
+        );
+        assert_eq!(machine.state(), MachineState::Created);
+        assert_eq!(machine.architectural_state(), &before);
+
+        machine.reset();
+        assert_eq!(machine.state(), MachineState::Reset);
+        machine.reset();
+        assert_eq!(machine.state(), MachineState::Reset);
+        assert!(matches!(
+            machine.step().unwrap(),
+            lazalith_machine::MachineEvent::Stepped {
+                application: lazalith_cpu::OutcomeApplication::Continue,
+            }
+        ));
+        assert_eq!(machine.state(), MachineState::Reset);
+        assert_eq!(machine.architectural_state().pc(), I::new(8));
+        assert_invalid_transition(
+            machine.pause(),
+            MachineOperation::Pause,
+            MachineState::Reset,
+        );
+
+        assert_eq!(machine.run(0).unwrap().executed, 0);
+        assert_eq!(machine.state(), MachineState::Running);
+        machine.pause().unwrap();
+        assert_eq!(machine.state(), MachineState::Paused);
+        assert_invalid_transition(
+            machine.pause(),
+            MachineOperation::Pause,
+            MachineState::Paused,
+        );
+        assert_eq!(machine.run(0).unwrap().executed, 0);
+        assert_eq!(machine.state(), MachineState::Running);
+        machine.pause().unwrap();
+        assert_eq!(machine.state(), MachineState::Paused);
+        machine.reset();
+        assert_eq!(machine.state(), MachineState::Reset);
+        assert_eq!(machine.run(0).unwrap().executed, 0);
+        assert_eq!(machine.state(), MachineState::Running);
+        machine.reset();
+        assert_eq!(machine.state(), MachineState::Reset);
+    }
+}
+
+#[test]
+fn running_pause_and_step_transitions_reach_halt_then_reject_execution() {
+    for config in [C::lz32(), C::lz64()] {
+        let mut machine = ready_machine(config, 1, b"A");
+        assert_eq!(machine.run(1).unwrap().executed, 1);
+        assert_eq!(machine.state(), MachineState::Running);
+        assert_eq!(machine.architectural_state().pc(), I::new(8));
+        assert!(matches!(
+            machine.step().unwrap(),
+            lazalith_machine::MachineEvent::Stepped {
+                application: lazalith_cpu::OutcomeApplication::Continue,
+            }
+        ));
+        assert_eq!(machine.state(), MachineState::Running);
+        assert_eq!(machine.architectural_state().pc(), I::new(16));
+        machine.pause().unwrap();
+        assert_eq!(machine.state(), MachineState::Paused);
+        assert!(matches!(
+            machine.step().unwrap(),
+            lazalith_machine::MachineEvent::Stepped {
+                application: lazalith_cpu::OutcomeApplication::Continue,
+            }
+        ));
+        assert_eq!(machine.state(), MachineState::Paused);
+        assert_eq!(machine.architectural_state().pc(), I::new(24));
+        assert_eq!(
+            machine.devices().device(DeviceId::new(1)).unwrap().output(),
+            b"A"
+        );
+        let halted = machine.run(1).unwrap();
+        assert_eq!((halted.executed, halted.halted_at), (1, Some(4)));
+        assert_eq!(machine.state(), MachineState::Halted);
+        assert_eq!(machine.architectural_state().pc(), I::new(32));
+
+        let halted = machine.architectural_state().clone();
+        assert_invalid_transition(machine.step(), MachineOperation::Step, MachineState::Halted);
+        assert_invalid_transition(machine.run(0), MachineOperation::Run, MachineState::Halted);
+        assert_invalid_transition(
+            machine.run(100),
+            MachineOperation::Run,
+            MachineState::Halted,
+        );
+        assert_invalid_transition(
+            machine.pause(),
+            MachineOperation::Pause,
+            MachineState::Halted,
+        );
+        assert_eq!(machine.state(), MachineState::Halted);
+        assert_eq!(machine.architectural_state(), &halted);
+
+        machine.reset();
+        assert_eq!(machine.state(), MachineState::Reset);
+        assert_eq!(machine.architectural_state().pc(), I::new(0));
+        assert_eq!(
+            machine.devices().device(DeviceId::new(1)).unwrap().output(),
+            b""
+        );
+        assert_eq!(machine.run(4).unwrap().halted_at, Some(8));
+    }
+}
+
+#[test]
+fn faulted_is_terminal_until_reset_clears_cpu_and_device_state() {
+    for config in [C::lz32(), C::lz64()] {
+        let mut machine = ready_machine(config, 1, b"AB");
+        assert!(machine.run(5).is_err());
+        assert_eq!(machine.state(), MachineState::Faulted);
+        assert_eq!(machine.architectural_state().pc(), I::new(32));
+        assert_eq!(
+            machine.devices().device(DeviceId::new(1)).unwrap().output(),
+            b"A"
+        );
+        let faulted = machine.architectural_state().clone();
+        assert_invalid_transition(
+            machine.step(),
+            MachineOperation::Step,
+            MachineState::Faulted,
+        );
+        assert_invalid_transition(machine.run(0), MachineOperation::Run, MachineState::Faulted);
+        assert_invalid_transition(
+            machine.run(100),
+            MachineOperation::Run,
+            MachineState::Faulted,
+        );
+        assert_invalid_transition(
+            machine.pause(),
+            MachineOperation::Pause,
+            MachineState::Faulted,
+        );
+        assert_eq!(machine.architectural_state(), &faulted);
+
+        machine.reset();
+        assert_eq!(machine.state(), MachineState::Reset);
+        assert_eq!(machine.architectural_state().pc(), I::new(0));
+        assert_eq!(
+            machine
+                .architectural_state()
+                .registers()
+                .read_raw(1)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            machine.devices().device(DeviceId::new(1)).unwrap().output(),
+            b""
+        );
+        assert_eq!(machine.run(3).unwrap().executed, 3);
+        assert_eq!(machine.state(), MachineState::Running);
+        assert_eq!(
+            machine.devices().device(DeviceId::new(1)).unwrap().output(),
+            b"A"
+        );
+    }
+}
+
+#[test]
+fn reset_restores_cpu_devices_and_epoch_but_preserves_memory_and_count() {
+    let config = C::lz64();
+    let mut devices = DeviceManager::new();
+    devices
+        .insert(
+            DeviceId::new(1),
+            lazalith_devices::ConsoleDevice::new(1).unwrap(),
+        )
+        .unwrap();
+    let mut machine = LazalithMachine::new(MachineSetup {
+        config,
+        devices,
+        regions: vec![
+            MemoryRegion::ram(config, P::new(0x800), 256, RP::new(true, true, false, true))
+                .unwrap(),
+        ],
+        pc: I::new(0),
+        sp: V::new(0x900),
+        status: 4,
+        initial_time: CycleCount::new(7),
+    })
+    .unwrap();
+    machine
+        .load_region(
+            MemoryRegion::rom(
+                config,
+                P::new(0),
+                &text_code(b"X"),
+                RP::new(true, false, true, true),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    machine
+        .map_device(
+            DeviceId::new(1),
+            P::new(0x1000),
+            RP::new(false, true, false, true),
+        )
+        .unwrap();
+    machine.load_bytes(P::new(0x800), &[43]).unwrap();
+    machine.reset();
+    let initial = machine.architectural_state().clone();
+
+    assert_eq!(machine.state(), MachineState::Reset);
+    assert_eq!(machine.clock().elapsed(), CycleCount::new(7));
+    assert_eq!(machine.devices().clock().elapsed(), CycleCount::new(7));
+    assert_eq!(
+        machine
+            .devices()
+            .device(DeviceId::new(1))
+            .unwrap()
+            .elapsed(),
+        CycleCount::new(7)
+    );
+    assert_eq!(machine.architectural_state().status().bits(), 4);
+    machine.advance_clock(CycleCount::new(3)).unwrap();
+    assert_eq!(machine.run(4).unwrap().halted_at, Some(4));
+    assert_eq!(machine.state(), MachineState::Halted);
+    assert_eq!(
+        machine.devices().device(DeviceId::new(1)).unwrap().output(),
+        b"X"
+    );
+
+    machine.reset();
+    assert_eq!(machine.state(), MachineState::Reset);
+    assert_eq!(machine.architectural_state(), &initial);
+    assert_eq!(machine.clock().elapsed(), CycleCount::new(7));
+    assert_eq!(
+        machine
+            .devices()
+            .device(DeviceId::new(1))
+            .unwrap()
+            .elapsed(),
+        CycleCount::new(7)
+    );
+    assert_eq!(machine.architectural_state().pc(), I::new(0));
+    assert_eq!(machine.architectural_state().sp(), V::new(0x900));
+    assert_eq!(machine.architectural_state().status().bits(), 4);
+    assert_eq!(
+        machine
+            .architectural_state()
+            .registers()
+            .read_raw(1)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        machine.devices().device(DeviceId::new(1)).unwrap().output(),
+        b""
+    );
+    let mut ram = [0u8; 1];
+    machine.peek_memory(P::new(0x800), &mut ram).unwrap();
+    assert_eq!(ram, [43]);
+    assert_eq!(machine.run(4).unwrap().halted_at, Some(8));
+    assert_eq!(
+        machine.devices().device(DeviceId::new(1)).unwrap().output(),
+        b"X"
+    );
+}
+
+fn trap_machine(
+    config: C,
+    first: [u8; 8],
+    handler: [u8; 8],
+    status: u64,
+) -> LazalithMachine<lazalith_devices::NoDevice> {
+    let mut rom = vec![0u8; 0x108];
+    rom[..8].copy_from_slice(&first);
+    rom[0x100..0x108].copy_from_slice(&handler);
+    let mut machine = LazalithMachine::new(MachineSetup {
+        config,
+        devices: DeviceManager::new(),
+        regions: vec![
+            MemoryRegion::rom(config, P::new(0), &rom, RP::new(false, false, true, true)).unwrap(),
+            MemoryRegion::ram(
+                config,
+                P::new(0x800),
+                0x100,
+                RP::new(true, true, false, true),
+            )
+            .unwrap(),
+        ],
+        pc: I::new(0),
+        sp: V::new(0x880),
+        status,
+        initial_time: CycleCount::new(0),
+    })
+    .unwrap();
+    machine.reset();
+    machine
+}
+
+fn trap_program_machine(
+    config: C,
+    program: &[u8],
+    status: u64,
+) -> LazalithMachine<lazalith_devices::NoDevice> {
+    let mut rom = vec![0u8; 0x108];
+    rom[..program.len()].copy_from_slice(program);
+    rom[0x100..0x108].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+    let mut machine = LazalithMachine::new(MachineSetup {
+        config,
+        devices: DeviceManager::new(),
+        regions: vec![
+            MemoryRegion::rom(config, P::new(0), &rom, RP::new(false, false, true, true)).unwrap(),
+            MemoryRegion::ram(
+                config,
+                P::new(0x800),
+                0x100,
+                RP::new(true, true, false, true),
+            )
+            .unwrap(),
+        ],
+        pc: I::new(0),
+        sp: V::new(0x880),
+        status,
+        initial_time: CycleCount::new(0),
+    })
+    .unwrap();
+    machine.reset();
+    machine.set_trap_vector(I::new(0x100)).unwrap();
+    machine
+}
+
+fn trap_image_machine(
+    config: C,
+    program: &[u8],
+    handler: &[u8],
+    status: u64,
+) -> LazalithMachine<lazalith_devices::NoDevice> {
+    let mut rom = vec![0u8; 0x110];
+    rom[..program.len()].copy_from_slice(program);
+    let handler_end = 0x100 + handler.len();
+    rom.get_mut(0x100..handler_end)
+        .unwrap()
+        .copy_from_slice(handler);
+    let mut machine = LazalithMachine::new(MachineSetup {
+        config,
+        devices: DeviceManager::new(),
+        regions: vec![
+            MemoryRegion::rom(config, P::new(0), &rom, RP::new(false, false, true, true)).unwrap(),
+            MemoryRegion::ram(
+                config,
+                P::new(0x800),
+                0x100,
+                RP::new(true, true, false, true),
+            )
+            .unwrap(),
+        ],
+        pc: I::new(0),
+        sp: V::new(0x880),
+        status,
+        initial_time: CycleCount::new(0),
+    })
+    .unwrap();
+    machine.reset();
+    machine.set_trap_vector(I::new(0x100)).unwrap();
+    machine
+}
+
+#[test]
+fn fault_causes_preserve_width_division_address_alignment_and_decode_categories() {
+    for config in [C::lz32(), C::lz64()] {
+        for (opcode, cause) in [
+            (0x15, TrapCause::DivideByZero),
+            (0x17, TrapCause::DivideByZero),
+        ] {
+            let program = [opcode, 0, 0, 0, 0, 0, 0, 0];
+            let decoded = decode(config, &program).unwrap();
+            assert_eq!(decoded.opcode(), Opcode::try_from(opcode).unwrap());
+            let mut machine = trap_program_machine(config, &program, 0);
+            let result = machine.run(1).unwrap();
+            assert_eq!(result.trap.unwrap().cause, cause);
+        }
+        for (opcode, cause) in [
+            (0x16, TrapCause::DivisionOverflow),
+            (0x18, TrapCause::DivisionOverflow),
+        ] {
+            let mut program = if config.word_width() == lazalith_types::WordWidth::W32 {
+                li(0, i32::MIN).to_vec()
+            } else {
+                let mut program = li(0, 1).to_vec();
+                program.extend_from_slice(&li(1, 63));
+                program.extend_from_slice(&[0x24, 0, 1, 0, 0, 0, 0, 0]);
+                program
+            };
+            program.extend_from_slice(&li(1, -1));
+            program.extend_from_slice(&[opcode, 0, 1, 0, 0, 0, 0, 0]);
+            let decoded = decode(config, &program[program.len() - 8..]).unwrap();
+            assert_eq!(decoded.opcode(), Opcode::try_from(opcode).unwrap());
+            let mut machine = trap_program_machine(config, &program, 0);
+            let result = machine.run((program.len() / 8) as u64).unwrap();
+            assert_eq!(result.trap.unwrap().cause, cause);
+        }
+
+        let address_overflow = [0x30, 0x11, 0, 0, 0xff, 0xff, 0xff, 0xff];
+        let mut machine = trap_program_machine(config, &address_overflow, 0);
+        assert_eq!(
+            machine.run(1).unwrap().trap.unwrap().cause,
+            TrapCause::AddressOverflow
+        );
+
+        let mut alignment = li(1, 1).to_vec();
+        alignment.extend_from_slice(&[0x41, 0x10, 0, 0, 0, 0, 0, 0]);
+        let mut machine = trap_program_machine(config, &alignment, 0);
+        assert_eq!(
+            machine.run(2).unwrap().trap.unwrap().cause,
+            TrapCause::Alignment
+        );
+
+        let mut control = li(1, 1).to_vec();
+        control.extend_from_slice(&[0x05, 0x10, 0, 0, 0, 0, 0, 0]);
+        let mut machine = trap_program_machine(config, &control, 0);
+        assert_eq!(
+            machine.run(2).unwrap().trap.unwrap().cause,
+            TrapCause::Alignment
+        );
+    }
+
+    let mut machine = trap_program_machine(C::lz32(), &[0x30, 0x10, 0x30, 0, 0, 0, 0, 0], 0);
+    assert_eq!(
+        machine.run(1).unwrap().trap.unwrap().cause,
+        TrapCause::InvalidWidth
+    );
+}
+
+#[test]
+fn ei_and_rfe_defer_then_deliver_the_next_lowest_interrupt() {
+    for config in [C::lz32(), C::lz64()] {
+        let mut program = vec![0x54, 0, 0, 0, 0, 0, 0, 0];
+        program.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        let handler = [0x54, 0, 0, 0, 0, 0, 0, 0, 0x53, 0, 0, 0, 0, 0, 0, 0];
+        let mut machine = trap_image_machine(config, &program, &handler, 0);
+        machine.step().unwrap();
+        machine.step().unwrap();
+        assert!(machine.architectural_state().status().interrupts_enabled());
+        machine.request_interrupt(InterruptId::new(7)).unwrap();
+        machine.request_interrupt(InterruptId::new(1)).unwrap();
+
+        let first = machine.run(1).unwrap();
+        assert_eq!(first.executed, 0);
+        assert_eq!(first.trap.unwrap().interrupt, Some(InterruptId::new(1)));
+        assert_eq!(machine.architectural_state().pc(), I::new(0x100));
+        machine.step().unwrap();
+        assert_eq!(machine.architectural_state().pc(), I::new(0x108));
+        machine.step().unwrap();
+        assert!(!machine.trap_controller().has_active_frame());
+        assert_eq!(machine.architectural_state().pc(), I::new(0x10));
+        assert!(machine.architectural_state().status().interrupts_enabled());
+
+        let second = machine.run(1).unwrap();
+        assert_eq!(second.executed, 0);
+        assert_eq!(second.trap.unwrap().interrupt, Some(InterruptId::new(7)));
+        assert_eq!(machine.architectural_state().pc(), I::new(0x100));
+    }
+}
+
+#[test]
+fn rfe_releases_retained_fault_diagnostic() {
+    for config in [C::lz32(), C::lz64()] {
+        let mut machine = trap_image_machine(config, &[0xff; 8], &[0x53, 0, 0, 0, 0, 0, 0, 0], 0);
+        machine.run(1).unwrap();
+        assert!(machine.last_trap_fault().is_some());
+        machine.step().unwrap();
+        assert!(!machine.trap_controller().has_active_frame());
+        assert!(machine.last_trap_fault().is_none());
+        assert_eq!(machine.architectural_state().pc(), I::new(0));
+    }
+}
+
+#[test]
+fn interrupts_wait_for_running_boundaries_deliver_lowest_first_and_defer_in_frame() {
+    for config in [C::lz32(), C::lz64()] {
+        let mut machine = trap_machine(
+            config,
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0x52, 0, 0, 0, 0, 0, 0, 0],
+            16,
+        );
+        machine.set_trap_vector(I::new(0x100)).unwrap();
+        assert!(machine.request_interrupt(InterruptId::new(7)).unwrap());
+        assert!(!machine.request_interrupt(InterruptId::new(7)).unwrap());
+        assert!(machine.request_interrupt(InterruptId::new(1)).unwrap());
+
+        assert!(matches!(
+            machine.step().unwrap(),
+            lazalith_machine::MachineEvent::Stepped { .. }
+        ));
+        assert_eq!(machine.architectural_state().pc(), I::new(8));
+        assert_eq!(machine.interrupts().len(), 2);
+        assert_eq!(machine.run(0).unwrap().executed, 0);
+        let delivered = machine.run(1).unwrap();
+        assert_eq!(delivered.executed, 0);
+        assert_eq!(
+            delivered.trap,
+            Some(lazalith_machine::TrapEvent {
+                cause: TrapCause::ExternalInterrupt,
+                payload: 1,
+                resume_pc: I::new(8),
+                interrupt: Some(InterruptId::new(1)),
+            })
+        );
+        assert_eq!(machine.interrupts().peek(), Some(InterruptId::new(7)));
+        assert!(machine.trap_controller().has_active_frame());
+
+        let halted = machine.run(1).unwrap();
+        assert_eq!(halted.halted_at, Some(2));
+        assert_eq!(machine.state(), MachineState::Halted);
+        assert_eq!(machine.interrupts().peek(), Some(InterruptId::new(7)));
+        machine.reset();
+        assert!(machine.interrupts().is_empty());
+        assert!(!machine.trap_controller().has_active_frame());
+    }
+}
+
+#[test]
+fn masked_interrupts_remain_pending_without_changing_cpu_state() {
+    for config in [C::lz32(), C::lz64()] {
+        let mut machine = trap_machine(
+            config,
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0x52, 0, 0, 0, 0, 0, 0, 0],
+            0,
+        );
+        machine.set_trap_vector(I::new(0x100)).unwrap();
+        machine.request_interrupt(InterruptId::new(4)).unwrap();
+        let result = machine.run(1).unwrap();
+        assert_eq!(result.executed, 1);
+        assert_eq!(result.trap, None);
+        assert_eq!(machine.architectural_state().pc(), I::new(8));
+        assert!(!machine.architectural_state().status().interrupts_enabled());
+        assert_eq!(machine.interrupts().peek(), Some(InterruptId::new(4)));
+    }
+}
+
+#[test]
+fn double_trap_is_terminal_and_retains_the_first_frame() {
+    for config in [C::lz32(), C::lz64()] {
+        let mut machine = trap_machine(
+            config,
+            [0x50, 0, 0, 0, 0, 0, 0, 0],
+            [0x50, 0, 0, 0, 0, 0, 0, 0],
+            0,
+        );
+        machine.set_trap_vector(I::new(0x100)).unwrap();
+        let first = machine.run(1).unwrap();
+        assert!(first.trap.is_some());
+        let first_frame = machine.trap_controller().frame().unwrap().clone();
+        let before = machine.architectural_state().clone();
+
+        assert!(matches!(
+            machine.step(),
+            Err(MachineError::TrapEntry {
+            attempt: _,
+                original: None,
+                failure
+            }) if matches!(failure.cause, CpuFaultCause::DoubleTrap)
+        ));
+        assert_eq!(machine.state(), MachineState::Faulted);
+        assert_eq!(machine.architectural_state(), &before);
+        assert_eq!(machine.trap_controller().frame(), Some(&first_frame));
+        let double = machine.trap_controller().double_trap().unwrap();
+        assert_eq!(double.cause(), TrapCause::Syscall);
+        assert_eq!(double.second().pc(), before.pc());
+    }
+}
+
+#[test]
+fn failed_trap_target_fetch_is_terminal_without_installing_a_frame() {
+    for config in [C::lz32(), C::lz64()] {
+        let mut machine = trap_machine(
+            config,
+            [0x50, 0, 0, 0, 0, 0, 0, 0],
+            [0x52, 0, 0, 0, 0, 0, 0, 0],
+            0,
+        );
+        machine.set_trap_vector(I::new(0x200)).unwrap();
+        let before = machine.architectural_state().clone();
+        assert!(matches!(
+            machine.run(1),
+            Err(MachineError::TrapEntry {
+            attempt: _,
+                original: None,
+                failure
+            }) if matches!(
+                failure.cause,
+                CpuFaultCause::TrapEntry(_)
+            )
+        ));
+        assert_eq!(machine.state(), MachineState::Faulted);
+        assert_eq!(machine.architectural_state(), &before);
+        assert!(!machine.trap_controller().has_active_frame());
+    }
+}
+
+#[test]
+fn failed_external_entry_retains_attempt_and_leaves_request_pending() {
+    for config in [C::lz32(), C::lz64()] {
+        let mut machine = trap_machine(
+            config,
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            16,
+        );
+        machine.set_trap_vector(I::new(0x200)).unwrap();
+        machine.request_interrupt(InterruptId::new(5)).unwrap();
+        let before = machine.architectural_state().clone();
+        assert!(matches!(
+            machine.run(1),
+            Err(MachineError::TrapEntry {
+                attempt,
+                original: None,
+                failure
+            }) if attempt.cause() == TrapCause::ExternalInterrupt
+                && attempt.payload() == 5
+                && attempt.resume_pc() == before.pc()
+                && matches!(failure.cause, CpuFaultCause::TrapEntry(_))
+        ));
+        assert_eq!(machine.state(), MachineState::Faulted);
+        assert_eq!(machine.architectural_state(), &before);
+        assert_eq!(machine.interrupts().peek(), Some(InterruptId::new(5)));
+        assert!(!machine.trap_controller().has_active_frame());
+    }
 }

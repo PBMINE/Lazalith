@@ -1,17 +1,139 @@
 use crate::{AccessSize, AccessType, MemoryAddress, MemoryFault, MemoryFaultKind, MemoryRegion};
-use alloc::vec::Vec;
+use alloc::{collections::TryReserveError, sync::Arc, vec::Vec};
+use core::{
+    error::Error,
+    fmt,
+    hash::{Hash, Hasher},
+};
 use lazalith_types::{ArchitectureConfig, PhysicalAddress, VirtualAddress};
+
+#[derive(Clone, Debug)]
+pub struct AddressSpaceIdentity {
+    marker: Arc<u8>,
+}
+
+impl PartialEq for AddressSpaceIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.marker, &other.marker)
+    }
+}
+
+impl Eq for AddressSpaceIdentity {}
+
+impl Hash for AddressSpaceIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.marker).hash(state);
+    }
+}
+
+#[derive(Debug)]
+pub enum AddressSpaceSwapError {
+    Configuration {
+        expected: ArchitectureConfig,
+        actual: ArchitectureConfig,
+    },
+    Allocation(TryReserveError),
+    CapacityOverflow,
+    Overlap {
+        existing_start: PhysicalAddress,
+        existing_end: PhysicalAddress,
+        incoming_start: PhysicalAddress,
+        incoming_end: PhysicalAddress,
+    },
+}
+
+impl fmt::Display for AddressSpaceSwapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Configuration { expected, actual } => {
+                write!(
+                    f,
+                    "address-space configuration {actual:?} differs from {expected:?}"
+                )
+            }
+            Self::Allocation(source) => write!(f, "address-space swap allocation failed: {source}"),
+            Self::CapacityOverflow => f.write_str("address-space swap capacity overflowed"),
+            Self::Overlap {
+                existing_start,
+                existing_end,
+                incoming_start,
+                incoming_end,
+            } => write!(
+                f,
+                "address-space swap overlaps {existing_start:?}..={existing_end:?} with {incoming_start:?}..={incoming_end:?}"
+            ),
+        }
+    }
+}
+
+impl Error for AddressSpaceSwapError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Allocation(source) => Some(source),
+            Self::Configuration { .. } | Self::CapacityOverflow | Self::Overlap { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct AddressSpace {
     config: ArchitectureConfig,
+    identity: AddressSpaceIdentity,
     regions: Vec<MemoryRegion>,
 }
 
+pub trait UserSpace {
+    fn config(&self) -> ArchitectureConfig;
+    fn identity(&self) -> &AddressSpaceIdentity;
+    fn regions(&self) -> &[MemoryRegion];
+    fn peek_user(&mut self, address: PhysicalAddress, output: &mut [u8])
+    -> Result<(), MemoryFault>;
+    fn initialize_user(
+        &mut self,
+        address: PhysicalAddress,
+        bytes: &[u8],
+    ) -> Result<(), MemoryFault>;
+}
+
+impl UserSpace for AddressSpace {
+    fn config(&self) -> ArchitectureConfig {
+        self.config
+    }
+
+    fn identity(&self) -> &AddressSpaceIdentity {
+        &self.identity
+    }
+
+    fn regions(&self) -> &[MemoryRegion] {
+        &self.regions
+    }
+
+    fn peek_user(
+        &mut self,
+        address: PhysicalAddress,
+        output: &mut [u8],
+    ) -> Result<(), MemoryFault> {
+        self.validate_user_range(address, output.len() as u64, false)?;
+        self.peek(address, output)
+    }
+
+    fn initialize_user(
+        &mut self,
+        address: PhysicalAddress,
+        bytes: &[u8],
+    ) -> Result<(), MemoryFault> {
+        self.validate_user_range(address, bytes.len() as u64, true)?;
+        self.initialize(address, bytes)
+    }
+}
+
 impl AddressSpace {
-    pub const fn new(config: ArchitectureConfig) -> Self {
+    pub fn new(config: ArchitectureConfig) -> Self {
         Self {
             config,
+            identity: AddressSpaceIdentity {
+                marker: Arc::new(0),
+            },
             regions: Vec::new(),
         }
     }
@@ -19,8 +141,210 @@ impl AddressSpace {
     pub const fn config(&self) -> ArchitectureConfig {
         self.config
     }
+    pub const fn identity(&self) -> &AddressSpaceIdentity {
+        &self.identity
+    }
     pub fn regions(&self) -> &[MemoryRegion] {
         &self.regions
+    }
+
+    pub(crate) fn swap_user_regions(
+        &mut self,
+        other: &mut Self,
+    ) -> Result<(), AddressSpaceSwapError> {
+        if self.config != other.config {
+            return Err(AddressSpaceSwapError::Configuration {
+                expected: self.config,
+                actual: other.config,
+            });
+        }
+        let self_kernel_count = self
+            .regions
+            .iter()
+            .filter(|region| !region.permissions().user)
+            .count();
+        let self_user_count = self.regions.len() - self_kernel_count;
+        let other_kernel_count = other
+            .regions
+            .iter()
+            .filter(|region| !region.permissions().user)
+            .count();
+        let other_user_count = other.regions.len() - other_kernel_count;
+        for incoming in other
+            .regions
+            .iter()
+            .filter(|region| region.permissions().user)
+        {
+            for existing in self
+                .regions
+                .iter()
+                .filter(|region| !region.permissions().user)
+            {
+                if incoming.start() <= existing.end() && existing.start() <= incoming.end() {
+                    return Err(AddressSpaceSwapError::Overlap {
+                        existing_start: existing.start(),
+                        existing_end: existing.end(),
+                        incoming_start: incoming.start(),
+                        incoming_end: incoming.end(),
+                    });
+                }
+            }
+        }
+        for incoming in self
+            .regions
+            .iter()
+            .filter(|region| region.permissions().user)
+        {
+            for existing in other
+                .regions
+                .iter()
+                .filter(|region| !region.permissions().user)
+            {
+                if incoming.start() <= existing.end() && existing.start() <= incoming.end() {
+                    return Err(AddressSpaceSwapError::Overlap {
+                        existing_start: existing.start(),
+                        existing_end: existing.end(),
+                        incoming_start: incoming.start(),
+                        incoming_end: incoming.end(),
+                    });
+                }
+            }
+        }
+        let mut self_kernel = Vec::new();
+        let mut self_user = Vec::new();
+        let mut other_kernel = Vec::new();
+        let mut other_user = Vec::new();
+        let self_result_len = self_kernel_count
+            .checked_add(other_user_count)
+            .ok_or(AddressSpaceSwapError::CapacityOverflow)?;
+        let other_result_len = other_kernel_count
+            .checked_add(self_user_count)
+            .ok_or(AddressSpaceSwapError::CapacityOverflow)?;
+        self_kernel
+            .try_reserve_exact(self_result_len)
+            .map_err(AddressSpaceSwapError::Allocation)?;
+        self_user
+            .try_reserve_exact(self_user_count)
+            .map_err(AddressSpaceSwapError::Allocation)?;
+        other_kernel
+            .try_reserve_exact(other_result_len)
+            .map_err(AddressSpaceSwapError::Allocation)?;
+        other_user
+            .try_reserve_exact(other_user_count)
+            .map_err(AddressSpaceSwapError::Allocation)?;
+        for region in self.regions.drain(..) {
+            if region.permissions().user {
+                self_user.push(region);
+            } else {
+                self_kernel.push(region);
+            }
+        }
+        for region in other.regions.drain(..) {
+            if region.permissions().user {
+                other_user.push(region);
+            } else {
+                other_kernel.push(region);
+            }
+        }
+        self.regions = self_kernel;
+        self.regions.extend(other_user);
+        other.regions = other_kernel;
+        other.regions.extend(self_user);
+        core::mem::swap(&mut self.identity, &mut other.identity);
+        Ok(())
+    }
+
+    fn validate_user_range(
+        &self,
+        address: PhysicalAddress,
+        length: u64,
+        write: bool,
+    ) -> Result<(), MemoryFault> {
+        let size = length;
+        if size == 0 {
+            return Ok(());
+        }
+        let end = self
+            .config
+            .word_width()
+            .checked_access_end(address.as_u64(), size)
+            .map_err(|error| {
+                MemoryFault::new(
+                    MemoryAddress::Physical(address),
+                    if write {
+                        AccessType::Data(crate::DataAccessKind::Write)
+                    } else {
+                        AccessType::Data(crate::DataAccessKind::Read)
+                    },
+                    AccessSize::Bytes(size),
+                    MemoryFaultKind::Width(error),
+                )
+            })?;
+        let last = PhysicalAddress::new(end);
+        let region = self
+            .regions
+            .iter()
+            .find(|region| address >= region.start() && address <= region.end())
+            .ok_or_else(|| {
+                MemoryFault::new(
+                    MemoryAddress::Physical(address),
+                    if write {
+                        AccessType::Data(crate::DataAccessKind::Write)
+                    } else {
+                        AccessType::Data(crate::DataAccessKind::Read)
+                    },
+                    AccessSize::Bytes(size),
+                    MemoryFaultKind::Unmapped,
+                )
+            })?;
+        if last > region.end() {
+            return Err(MemoryFault::new(
+                MemoryAddress::Physical(address),
+                if write {
+                    AccessType::Data(crate::DataAccessKind::Write)
+                } else {
+                    AccessType::Data(crate::DataAccessKind::Read)
+                },
+                AccessSize::Bytes(size),
+                MemoryFaultKind::CrossRegion {
+                    region_start: region.start(),
+                    region_end: region.end(),
+                },
+            ));
+        }
+        if !region.permissions().user
+            || (if write {
+                !region.permissions().write
+            } else {
+                !region.permissions().read
+            })
+        {
+            return Err(MemoryFault::new(
+                MemoryAddress::Physical(address),
+                if write {
+                    AccessType::Data(crate::DataAccessKind::Write)
+                } else {
+                    AccessType::Data(crate::DataAccessKind::Read)
+                },
+                AccessSize::Bytes(size),
+                MemoryFaultKind::Permission {
+                    permissions: region.permissions(),
+                },
+            ));
+        }
+        if write && region.kind() != crate::RegionKind::Ram {
+            return Err(MemoryFault::new(
+                MemoryAddress::Physical(address),
+                AccessType::Data(crate::DataAccessKind::Write),
+                AccessSize::Bytes(size),
+                MemoryFaultKind::ReadOnly {
+                    region_start: region.start(),
+                    region_end: region.end(),
+                    kind: region.kind(),
+                },
+            ));
+        }
+        Ok(())
     }
 
     pub fn translate_identity(

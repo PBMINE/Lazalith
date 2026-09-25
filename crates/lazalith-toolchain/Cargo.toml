@@ -1,0 +1,15 @@
+[package]
+name = "lazalith-toolchain"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lazalith-diagnostics = { path = "../lazalith-diagnostics" }
+lazalith-isa = { path = "../lazalith-isa" }
+lazalith-os = { path = "../lazalith-os" }
+lazalith-os-abi = { path = "../lazalith-os-abi" }
+lazalith-types = { path = "../lazalith-types" }
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 use crate::{
-    AccessSize, AccessType, AddressSpace, DataAccess, DataAccessKind, MemoryAddress, MemoryFault,
-    MemoryFaultKind, RegionPermissions,
+    AccessSize, AccessType, AddressSpace, AddressSpaceSwapError, DataAccess, DataAccessKind,
+    MemoryAddress, MemoryFault, MemoryFaultKind, RegionPermissions,
 };
 use alloc::vec::Vec;
 use lazalith_devices::{Device, DeviceId, DeviceManager, DeviceOffset, NoDevice};
@@ -39,8 +39,23 @@ impl<D: Device> Bus<D> {
     pub const fn address_space(&self) -> &AddressSpace {
         &self.space
     }
+    pub fn swap_user_address_space(
+        &mut self,
+        other: &mut AddressSpace,
+    ) -> Result<(), AddressSpaceSwapError> {
+        self.space.swap_user_regions(other)
+    }
+    pub fn user_address_space_mut(&mut self) -> &mut AddressSpace {
+        &mut self.space
+    }
+    pub fn has_device_mappings(&self) -> bool {
+        !self.mappings.is_empty()
+    }
     pub const fn devices(&self) -> &DeviceManager<D> {
         &self.devices
+    }
+    pub fn reset_devices(&mut self, elapsed: lazalith_types::CycleCount) {
+        self.devices.reset_at(elapsed);
     }
     pub fn tick_devices(
         &mut self,

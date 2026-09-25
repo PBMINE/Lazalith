@@ -22,15 +22,15 @@ pub use width::{ArithmeticResult, WidthError};
 pub use config::{ArchitectureConfig, FeatureSet, InvalidFeatureSet, WordWidth};
 
 pub use architecture::{
-    CycleCount, DeviceId, DeviceOffset, InstructionAddress, InstructionCount, InvalidRegisterIndex,
-    PhysicalAddress, RegisterIndex, VirtualAddress,
+    CycleCount, DeviceId, DeviceOffset, InstructionAddress, InstructionCount, InterruptId,
+    InvalidRegisterIndex, PhysicalAddress, RegisterIndex, VirtualAddress,
 };
 
-use alloc::{boxed::Box, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, collections::TryReserveError, string::String, sync::Arc, vec::Vec};
 use core::{
     error::Error,
     fmt,
-    ops::{Add, Sub},
+    hash::{Hash, Hasher},
 };
 
 /// A byte offset into a source file.
@@ -49,27 +49,25 @@ impl ByteOffset {
     pub const fn as_usize(self) -> usize {
         self.0 as usize
     }
+
+    pub const fn checked_add(self, rhs: Self) -> Option<Self> {
+        match self.0.checked_add(rhs.0) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    pub const fn checked_sub(self, rhs: Self) -> Option<Self> {
+        match self.0.checked_sub(rhs.0) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
 }
 
 impl fmt::Display for ByteOffset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
-    }
-}
-
-impl Add for ByteOffset {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Self(self.0.checked_add(rhs.0).expect("byte offset overflow"))
-    }
-}
-
-impl Sub for ByteOffset {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self(self.0.checked_sub(rhs.0).expect("byte offset underflow"))
     }
 }
 
@@ -98,25 +96,27 @@ impl fmt::Display for SourceId {
 pub struct SourceFile {
     name: String,
     text: Box<str>,
+    length: u32,
     line_starts: Vec<u32>,
+    identity: Arc<()>,
 }
 
 impl SourceFile {
     /// Builds the file and its authoritative line map in one pass.
-    pub fn new(
-        name: impl Into<String>,
-        text: impl Into<Box<str>>,
-    ) -> Result<Self, EmptySourceName> {
+    pub fn new(name: impl Into<String>, text: impl Into<Box<str>>) -> Result<Self, SourceError> {
         let name = name.into();
         if name.is_empty() {
-            return Err(EmptySourceName);
+            return Err(SourceError::EmptyName);
         }
         let text = text.into();
-        let line_starts = line_starts_for(&text);
+        let length = validate_source_length(text.len())?;
+        let line_starts = line_starts_for(&text)?;
         Ok(Self {
             name,
             text,
+            length,
             line_starts,
+            identity: Arc::new(()),
         })
     }
 
@@ -154,16 +154,57 @@ impl SourceFile {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EmptySourceName;
+#[derive(Debug)]
+pub enum SourceError {
+    EmptyName,
+    TextTooLarge { length: usize, max: u32 },
+    SourceIdExhausted { file_count: usize },
+    Allocation { source: TryReserveError },
+}
 
-impl fmt::Display for EmptySourceName {
+impl fmt::Display for SourceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("source file name must not be empty")
+        match self {
+            Self::EmptyName => f.write_str("source file name must not be empty"),
+            Self::TextTooLarge { length, max } => {
+                write!(f, "source text length {length} exceeds maximum {max}")
+            }
+            Self::SourceIdExhausted { file_count } => {
+                write!(f, "cannot assign a source id after {file_count} files")
+            }
+            Self::Allocation { source } => write!(f, "source allocation failed: {source}"),
+        }
     }
 }
 
-impl Error for EmptySourceName {}
+impl Error for SourceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Allocation { source } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<TryReserveError> for SourceError {
+    fn from(source: TryReserveError) -> Self {
+        Self::Allocation { source }
+    }
+}
+
+fn validate_source_length(length: usize) -> Result<u32, SourceError> {
+    const MAX: u32 = u32::MAX - 1;
+    match u32::try_from(length) {
+        Ok(length) if length <= MAX => Ok(length),
+        _ => Err(SourceError::TextTooLarge { length, max: MAX }),
+    }
+}
+
+fn allocate_source_id(file_count: usize) -> Result<SourceId, SourceError> {
+    u32::try_from(file_count)
+        .map(SourceId::new)
+        .map_err(|_| SourceError::SourceIdExhausted { file_count })
+}
 
 /// The single authoritative source map for the platform. Other components
 /// must resolve locations through this type rather than re-deriving
@@ -183,9 +224,10 @@ impl SourceManager {
         &mut self,
         name: impl Into<String>,
         text: impl Into<Box<str>>,
-    ) -> Result<SourceId, EmptySourceName> {
+    ) -> Result<SourceId, SourceError> {
+        let id = allocate_source_id(self.files.len())?;
         let file = SourceFile::new(name, text)?;
-        let id = SourceId::new(self.files.len() as u32);
+        self.files.try_reserve(1)?;
         self.files.push(file);
         Ok(id)
     }
@@ -216,17 +258,17 @@ impl SourceManager {
 
     /// Resolves a validated span to exact start/end positions.
     pub fn resolve(&self, span: &SourceSpan) -> Option<ResolvedSpan<'_>> {
-        let start = self.line_column(span.id, span.start)?;
+        let file = self.file(span.id)?;
+        if !Arc::ptr_eq(&file.identity, &span.identity) {
+            return None;
+        }
+        let start = resolve_line_column(file, span.start)?;
         let end = if span.end == span.start {
             start
         } else {
-            self.line_column(span.id, span.end)?
+            resolve_line_column(file, span.end)?
         };
-        Some(ResolvedSpan {
-            file: self.files.get(span.id.0 as usize)?,
-            start,
-            end,
-        })
+        Some(ResolvedSpan { file, start, end })
     }
 }
 
@@ -285,14 +327,18 @@ impl fmt::Display for ResolvedSpan<'_> {
     }
 }
 
-fn line_starts_for(text: &str) -> Vec<u32> {
-    let mut starts = vec![0u32];
+fn line_starts_for(text: &str) -> Result<Vec<u32>, SourceError> {
+    validate_source_length(text.len())?;
+    let mut starts = Vec::new();
+    starts.try_reserve(1)?;
+    starts.push(0);
     for (index, byte) in text.bytes().enumerate() {
         if byte == b'\n' {
+            starts.try_reserve(1)?;
             starts.push(index as u32 + 1);
         }
     }
-    starts
+    Ok(starts)
 }
 
 fn resolve_line_column(file: &SourceFile, offset: ByteOffset) -> Option<LineColumn> {
@@ -337,11 +383,32 @@ impl Error for InvalidSpan {}
 /// A byte range within one source file. Constructed only through
 /// [`SourceManager::source_span`], which validates it; resolution cannot
 /// fail for a span kept with its own manager.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct SourceSpan {
     id: SourceId,
     start: ByteOffset,
     end: ByteOffset,
+    identity: Arc<()>,
+}
+
+impl PartialEq for SourceSpan {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.start == other.start
+            && self.end == other.end
+            && Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
+
+impl Eq for SourceSpan {}
+
+impl Hash for SourceSpan {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.start.hash(state);
+        self.end.hash(state);
+        Arc::as_ptr(&self.identity).hash(state);
+    }
 }
 
 impl SourceSpan {
@@ -362,7 +429,7 @@ impl SourceSpan {
             });
         };
         let text = file.text();
-        if end.as_u32() > text.len() as u32 {
+        if end.as_u32() > file.length {
             return Err(InvalidSpan {
                 kind: InvalidSpanKind::OutOfBounds,
             });
@@ -372,7 +439,12 @@ impl SourceSpan {
                 kind: InvalidSpanKind::InteriorBoundary,
             });
         }
-        Ok(Self { id, start, end })
+        Ok(Self {
+            id,
+            start,
+            end,
+            identity: Arc::clone(&file.identity),
+        })
     }
 
     pub fn id(&self) -> SourceId {
@@ -547,7 +619,9 @@ mod tests {
     fn multi_line_spans_report_distinct_end_lines() {
         let (manager, id) = manager();
         let start = find(&manager, id, "let x");
-        let end = find(&manager, id, "let z") + ByteOffset::new(5);
+        let end = find(&manager, id, "let z")
+            .checked_add(ByteOffset::new(5))
+            .unwrap();
         let span = manager.source_span(id, start, end).unwrap();
         let resolved = manager.resolve(&span).unwrap();
         assert_eq!((resolved.start().line, resolved.start().column), (1, 1));
@@ -585,7 +659,9 @@ mod tests {
     #[test]
     fn rejects_offsets_that_split_utf8_characters() {
         let (manager, id) = manager();
-        let offset = find(&manager, id, "é") + ByteOffset::new(1);
+        let offset = find(&manager, id, "é")
+            .checked_add(ByteOffset::new(1))
+            .unwrap();
         assert!(manager.line_column(id, offset).is_none());
         let error = manager
             .source_span(id, ByteOffset::new(offset.as_u32() - 1), offset)
@@ -622,8 +698,8 @@ mod tests {
     fn offsets_compose_arithmetically() {
         let a = ByteOffset::new(4);
         let b = ByteOffset::new(10);
-        assert_eq!(a + b, ByteOffset::new(14));
-        assert_eq!(b - a, ByteOffset::new(6));
+        assert_eq!(a.checked_add(b), Some(ByteOffset::new(14)));
+        assert_eq!(b.checked_sub(a), Some(ByteOffset::new(6)));
         assert_eq!(a.as_u32(), 4);
         assert_eq!(a.as_usize(), 4);
         assert_eq!(b.to_string(), "10");
@@ -639,16 +715,16 @@ mod tests {
     }
 
     #[test]
-    fn spans_are_copyable_value_types() {
+    fn spans_are_cloneable_value_types() {
         let (manager, id) = manager();
         let span = manager
             .source_span(id, ByteOffset::new(0), ByteOffset::new(3))
             .unwrap();
-        let copy = span;
-        assert_eq!(span, copy);
-        assert_eq!(copy.id(), id);
-        let collected: Vec<SourceSpan> = vec![span, copy];
+        let cloned = span.clone();
+        assert_eq!(span, cloned);
+        assert_eq!(cloned.id(), id);
+        assert_eq!(format!("{cloned:?}"), format!("{span:?}"));
+        let collected: Vec<SourceSpan> = vec![span, cloned];
         assert_eq!(collected.len(), 2);
-        assert_eq!(format!("{copy:?}"), format!("{span:?}"));
     }
 }

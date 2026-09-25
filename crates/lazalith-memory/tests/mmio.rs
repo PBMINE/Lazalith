@@ -141,6 +141,35 @@ fn manager_validates_before_effects_and_resets_owned_devices() {
 }
 
 #[test]
+fn bus_resets_devices_at_a_new_epoch_without_removing_mappings() {
+    let mut bus = bus(C::lz64(), true);
+    bus.tick_devices(CycleCount::new(9)).unwrap();
+    let write = bus
+        .data_access(V::new(66), 0, S::Byte, K::Write, U::User)
+        .unwrap();
+    lazalith_memory::CpuMemory::write_data(&mut bus, write, 0x141).unwrap();
+
+    bus.reset_devices(CycleCount::new(4));
+
+    assert_eq!(bus.devices().clock().elapsed(), CycleCount::new(4));
+    for id in [1, 2] {
+        let device = bus.devices().device(Id::new(id)).unwrap();
+        assert_eq!(device.ticks, 4);
+        assert_eq!(device.bytes, [0; 8]);
+    }
+    bus.reset_devices(CycleCount::new(0));
+    assert_eq!(bus.devices().clock().elapsed(), CycleCount::new(0));
+    for id in [1, 2] {
+        assert_eq!(bus.devices().device(Id::new(id)).unwrap().ticks, 0);
+    }
+    let write = bus
+        .data_access(V::new(66), 0, S::Byte, K::Write, U::User)
+        .unwrap();
+    lazalith_memory::CpuMemory::write_data(&mut bus, write, 0x142).unwrap();
+    assert_eq!(bus.devices().device(Id::new(1)).unwrap().bytes[2], 0x42);
+}
+
+#[test]
 fn manager_tick_overflow_is_atomic_across_devices() {
     let mut devices = manager(true);
     devices.tick(CycleCount::new(u64::MAX)).unwrap();
