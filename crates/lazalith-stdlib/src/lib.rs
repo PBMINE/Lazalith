@@ -1069,19 +1069,23 @@ mod std {
             if count.len() as u64 < 8u64 {
                 return false;
             }
-            let mut result: [u8; 16] = [0u8; 16];
+            // Word-backed for the same reason `poll`'s record is: the ABI's
+            // records are word-aligned and an array of bytes is not, so a byte
+            // array would work or fail depending on where the frame put it.
+            let mut result: [u64; 2] = [0u64, 0u64];
             let status: i64 = display_present(
                 framebuffer.as_mut_slice().as_ptr(),
-                result.as_mut_slice().as_ptr()
+                result.as_ptr() as u64 as ptr<u8>
             );
             if !std::core::succeeded(status) {
                 return false;
             }
-            std::core::write_u64_to(count, rt::sys::read_u64(result.as_slice(), 0));
-            // Byte eight of an `IoResult` is its status, and zero is `Ok`. The
-            // frame count is left in `count` either way, so a caller that wants
-            // to know how far it got can read it after a refusal.
-            return rt::sys::read_u32(result.as_slice(), 8) == 0u32;
+            // `IoResult` is a count then a status, and on this target that is the
+            // low word's two halves.
+            std::core::write_u64_to(count, result[0]);
+            // The frame count is left in `count` either way, so a caller that
+            // wants to know how far it got can read it after a refusal.
+            return result[1] % 4294967296u64 == 0u64;
         }
 
         /// The window's width, as `display_open` reported it.
@@ -1448,6 +1452,320 @@ mod std {
                 start = start + 8u64;
             }
         }
+    }    /// Queued input, polled rather than delivered.
+    ///
+    /// There is no `next_event` and nothing that blocks. A program asks what has
+    /// happened and gets an answer, which is what keeps a graphical program's
+    /// behaviour a function of its input rather than of when it was scheduled.
+    ///
+    /// The array is the caller's own memory and the driver fills it, so a program
+    /// that stops polling simply stops receiving events.
+    pub mod input {
+        // The one call that reaches the device. A program has no other way to
+        // name it: there is no call that returns an event, and none that injects
+        // one.
+        extern "syscall" fn input_poll(
+            events: ptr<u8>,
+            capacity: u32,
+            result: ptr<u8>
+        ) -> i64;
+
+        /// The event kinds, as the ABI numbers them.
+        ///
+        /// These are the numbers a `kind` field holds. A kind this build does not
+        /// name is still delivered, as its own number, because a program running
+        /// against a newer device must be able to *hold* an event it does not
+        /// understand and skip it.
+        pub fn key_down() -> u32 {
+            return 1u32;
+        }
+        /// A key came up.
+        pub fn key_up() -> u32 {
+            return 2u32;
+        }
+        /// The pointer moved.
+        pub fn mouse_move() -> u32 {
+            return 3u32;
+        }
+        /// A mouse button went down.
+        pub fn mouse_down() -> u32 {
+            return 4u32;
+        }
+        /// A mouse button came up.
+        pub fn mouse_up() -> u32 {
+            return 5u32;
+        }
+        /// A character was typed.
+        pub fn text() -> u32 {
+            return 6u32;
+        }
+        /// The program was asked to quit.
+        pub fn quit() -> u32 {
+            return 7u32;
+        }
+
+        /// A key this build does not name.
+        pub fn key_unknown() -> u32 {
+            return 0u32;
+        }
+        /// Left control.
+        pub fn key_left_control() -> u32 {
+            return 1u32;
+        }
+        /// Right control.
+        pub fn key_right_control() -> u32 {
+            return 2u32;
+        }
+        /// Left shift.
+        pub fn key_left_shift() -> u32 {
+            return 3u32;
+        }
+        /// Right shift.
+        pub fn key_right_shift() -> u32 {
+            return 4u32;
+        }
+        /// Left alt.
+        pub fn key_left_alt() -> u32 {
+            return 5u32;
+        }
+        /// Right alt.
+        pub fn key_right_alt() -> u32 {
+            return 6u32;
+        }
+        /// The left super key, which is Windows or Command.
+        pub fn key_left_super() -> u32 {
+            return 7u32;
+        }
+        /// The right super key.
+        pub fn key_right_super() -> u32 {
+            return 8u32;
+        }
+        /// Backspace.
+        pub fn key_backspace() -> u32 {
+            return 9u32;
+        }
+        /// Tab.
+        pub fn key_tab() -> u32 {
+            return 10u32;
+        }
+        /// Return, enter, or the keypad's enter.
+        pub fn key_enter() -> u32 {
+            return 11u32;
+        }
+        /// Escape.
+        pub fn key_escape() -> u32 {
+            return 12u32;
+        }
+        /// Space.
+        pub fn key_space() -> u32 {
+            return 13u32;
+        }
+        /// The minus key, `-`.
+        pub fn key_minus() -> u32 {
+            return 14u32;
+        }
+        /// The equals key, `=`.
+        pub fn key_equals() -> u32 {
+            return 15u32;
+        }
+        /// Backslash, `\`.
+        pub fn key_backslash() -> u32 {
+            return 16u32;
+        }
+
+        /// The first letter key code, `a`.
+        pub fn key_letter_first() -> u32 {
+            return 17u32;
+        }
+        /// The last letter key code, `z`.
+        pub fn key_letter_last() -> u32 {
+            return 42u32;
+        }
+        /// The first digit key code, `0`.
+        pub fn key_digit_first() -> u32 {
+            return 43u32;
+        }
+        /// The last digit key code, `9`.
+        pub fn key_digit_last() -> u32 {
+            return 52u32;
+        }
+        /// Comma, `,`.
+        pub fn key_comma() -> u32 {
+            return 53u32;
+        }
+        /// Period, `.`.
+        pub fn key_period() -> u32 {
+            return 54u32;
+        }
+        /// Forward slash, `/`.
+        pub fn key_slash() -> u32 {
+            return 55u32;
+        }
+        /// Semicolon, `;`.
+        pub fn key_semicolon() -> u32 {
+            return 56u32;
+        }
+        /// One past the last key code this build assigns.
+        pub fn key_max() -> u32 {
+            return 57u32;
+        }
+
+        /// How many bytes one event record occupies: a kind, a code, and a pair
+        /// of coordinates.
+        pub fn record_bytes() -> u64 {
+            return 16u64;
+        }
+
+        /// How many bytes the result record occupies: a count and a status.
+        pub fn result_bytes() -> u64 {
+            return 16u64;
+        }
+
+        /// Drains up to `capacity` events into `events` and returns how many.
+        ///
+        /// A return of zero means **nothing pending**, not an error: a program
+        /// that polls once per frame is supposed to get zero most of the time.
+        ///
+        /// If the queue holds more events than the array can take, the rest stays
+        /// queued and the next call continues from there. Nothing is ever dropped
+        /// silently, which is the whole reason the device is a queue rather than a
+        /// sample of the current key state.
+        ///
+        /// Both the call's status and the count come back checked, because they
+        /// are separate claims: a call can be refused *and* report a count, and a
+        /// program that read the count without the status would take a refusal for
+        /// a partial success.
+        ///
+        /// The array holds whole records, so `capacity` is bounded by its length
+        /// here rather than by the kernel: a program cannot ask for more events
+        /// than it has room for, and gets zero instead of a fault.
+        pub fn poll(events: &mut [u8], capacity: u32) -> u32 {
+            if (events.len() as u64) < (capacity as u64) * record_bytes() {
+                return 0u32;
+            }
+            // The record is backed by *words*, not by bytes. The ABI's records
+            // are word-aligned, and an array of bytes has an alignment of one: a
+            // frame that happened to place one at an aligned address would work
+            // and one that did not would be refused for a misalignment the
+            // program never chose and cannot see. Backing it with a pair of
+            // words makes the alignment the compiler's decision.
+            //
+            // The fields are read as words for the same reason. `IoResult` is a
+            // count then a status, which on this target is the low word's two
+            // halves — so `words[0]` is the count and the low half of `words[1]`
+            // is the status, with no byte view needed.
+            let mut result: [u64; 2] = [0u64, 0u64];
+            let status: i64 = input_poll(
+                events.as_mut_slice().as_ptr(),
+                capacity,
+                result.as_ptr() as u64 as ptr<u8>
+            );
+            if !std::core::succeeded(status) {
+                return 0u32;
+            }
+            if result[1] % 4294967296u64 != 0u64 {
+                return 0u32;
+            }
+            let count: u64 = result[0];
+            if count > capacity as u64 {
+                return 0u32;
+            }
+            return count as u32;
+        }
+
+        /// How many events `poll` can take from an array of `len` bytes.
+        ///
+        /// A whole number of records, so a caller sizing a buffer does not have to
+        /// divide by sixteen itself and get it subtly wrong.
+        pub fn capacity_for(len: u64) -> u32 {
+            return (len / record_bytes()) as u32;
+        }
+
+        /// The `kind` of the event in the record at `at`.
+        pub fn kind_of(events: &[u8], at: u64) -> u32 {
+            return rt::sys::read_u32(events, at * record_bytes());
+        }
+
+        /// The `code` of the event in the record at `at`: a key code, a mouse
+        /// button, or a Unicode value.
+        pub fn code_of(events: &[u8], at: u64) -> u32 {
+            return rt::sys::read_u32(events, at * record_bytes() + 4u64);
+        }
+
+        /// The `x` of the event in the record at `at`, or zero for an event that
+        /// has no position.
+        pub fn x_of(events: &[u8], at: u64) -> i32 {
+            return rt::sys::read_u32(events, at * record_bytes() + 8u64) as i32;
+        }
+
+        /// The `y` of the event in the record at `at`, or zero for an event that
+        /// has no position.
+        pub fn y_of(events: &[u8], at: u64) -> i32 {
+            return rt::sys::read_u32(events, at * record_bytes() + 12u64) as i32;
+        }
+
+        /// Whether the event in the record at `at` is of `kind`.
+        pub fn is(events: &[u8], at: u64, kind: u32) -> bool {
+            return kind_of(events, at) == kind;
+        }
+
+        /// Whether `code` names a letter key.
+        pub fn is_letter(code: u32) -> bool {
+            return code >= key_letter_first() && code <= key_letter_last();
+        }
+
+        /// Whether `code` names a digit key.
+        pub fn is_digit(code: u32) -> bool {
+            return code >= key_digit_first() && code <= key_digit_last();
+        }
+
+        /// The lower-case letter a key code names, or zero if it names none.
+        ///
+        /// The letters are one contiguous range in ASCII order, so the letter is
+        /// the code's distance from the start of the range: classification
+        /// without a table.
+        pub fn letter_of(code: u32) -> u32 {
+            if is_letter(code) {
+                return 97u32 + (code - key_letter_first());
+            }
+            return 0u32;
+        }
+
+        /// The digit a key code names, or zero if it names none.
+        pub fn digit_of(code: u32) -> u32 {
+            if is_digit(code) {
+                return 48u32 + (code - key_digit_first());
+            }
+            return 0u32;
+        }
+
+        /// The character a `text` event carries, as a Unicode value, or zero.
+        ///
+        /// The code *is* the scalar value, so this is a spelling of the same
+        /// number: a program that reads a text event reads this and nothing else.
+        pub fn text_of(events: &[u8], at: u64) -> u32 {
+            if is(events, at, text()) {
+                return code_of(events, at);
+            }
+            return 0u32;
+        }
+
+        /// The first event in the array that is of `kind`, or `count` if there is
+        /// none.
+        ///
+        /// Returning the count rather than a sentinel means the caller can tell
+        /// "not found" from "found at the last index" without a second value.
+        pub fn find(events: &[u8], count: u32, kind: u32) -> u32 {
+            let mut index: u32 = 0u32;
+            while index < count {
+                if is(events, index as u64, kind) {
+                    return index;
+                }
+                index = index + 1u32;
+            }
+            return count;
+        }
     }
+
 }
 "#;

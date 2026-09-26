@@ -39,6 +39,17 @@ pub enum Syscall {
     ///
     /// Step 70. A present is a synchronisation point, not an upload.
     DisplayPresent = 0x0010,
+    /// Drains queued input events into a caller-provided array.
+    ///
+    /// Step 71. The driver writes whole records into the caller's own memory, so
+    /// a program that stops polling simply stops receiving events: there is no
+    /// event queue the kernel owns, and nothing to allocate per event.
+    ///
+    /// The count of records written goes in the result record rather than in the
+    /// return value, for the same reason `write` and `time` put theirs there: a
+    /// v1 call returns one `i64`, and that word is the status. A remainder stays
+    /// queued at the device — the caller polls again rather than losing input.
+    InputPoll = 0x0011,
 }
 
 impl Syscall {
@@ -59,6 +70,7 @@ impl Syscall {
         Self::ClearScreen,
         Self::DisplayOpen,
         Self::DisplayPresent,
+        Self::InputPoll,
     ];
 
     pub const fn as_u16(self) -> u16 {
@@ -79,7 +91,10 @@ impl Syscall {
             // `display_open` takes the geometry, the framebuffer address and a
             // record; `display_present` takes only the framebuffer address.
             Self::DisplayOpen => 4,
+            // `input_poll` takes the event array, how many records fit in it,
+            // and where to report how many were written.
             Self::DisplayPresent => 2,
+            Self::InputPoll => 3,
         }
     }
 
@@ -97,6 +112,7 @@ impl Syscall {
             | Self::Sleep
             | Self::SpawnProcess
             | Self::DisplayOpen
+            | Self::InputPoll
             | Self::DisplayPresent => 0,
         }
     }
@@ -112,6 +128,8 @@ impl Syscall {
             // to accept the call.
             Self::DisplayOpen => 0x0030,
             Self::DisplayPresent => 0x003c,
+            // `input_poll` names three arguments; the three past them must be zero.
+            Self::InputPoll => 0x0038,
             Self::ClearScreen => 0,
         }
     }
@@ -150,6 +168,7 @@ impl TryFrom<u16> for Syscall {
             0x000e => Ok(Self::ClearScreen),
             0x000f => Ok(Self::DisplayOpen),
             0x0010 => Ok(Self::DisplayPresent),
+            0x0011 => Ok(Self::InputPoll),
             _ => Err(AbiError::UnknownSyscall(u64::from(input))),
         }
     }

@@ -1,8 +1,9 @@
 use crate::abi::{
     AbiError, DIRECTORY_RECORD_SIZE, DISPLAY_RECORD_SIZE, EXIT_STATUS_RECORD_SIZE, FILE_STAT_SIZE,
-    FileHandle, IO_RESULT_SIZE, MAX_ARGUMENT_BYTES, MAX_ARGUMENT_COUNT, MAX_ARGUMENT_TOTAL_BYTES,
-    MAX_PATH_BYTES, MEMORY_ALLOCATION_SIZE, OpenFlags, ProcessHandle, SeekOrigin, Syscall,
-    SyscallArguments, SyscallError, TaggedOutcome, validate_range, validate_reserved_register,
+    FileHandle, INPUT_EVENT_RECORD_SIZE, IO_RESULT_SIZE, MAX_ARGUMENT_BYTES, MAX_ARGUMENT_COUNT,
+    MAX_ARGUMENT_TOTAL_BYTES, MAX_PATH_BYTES, MEMORY_ALLOCATION_SIZE, OpenFlags, ProcessHandle,
+    SeekOrigin, Syscall, SyscallArguments, SyscallError, TaggedOutcome, validate_range,
+    validate_reserved_register,
 };
 use crate::syscall::ValidationError::Abi;
 use crate::{
@@ -878,6 +879,12 @@ pub enum ValidatedSyscallKind {
         framebuffer: VirtualAddress,
         result: VirtualAddress,
     },
+    /// Drain queued input events into the caller's array.
+    InputPoll {
+        events: VirtualAddress,
+        capacity: u32,
+        result: VirtualAddress,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1343,6 +1350,43 @@ impl SyscallDispatcher {
                 Ok(ValidatedSyscall::from_kind(
                     ValidatedSyscallKind::DisplayPresent {
                         framebuffer,
+                        result,
+                    },
+                ))
+            }
+            Syscall::InputPoll => {
+                let events = abi(arguments.pointer(config, 0))?;
+                let capacity = abi(arguments.u32(1))?;
+                let result = abi(arguments.pointer(config, 2))?;
+                // The count comes back in a record rather than in the return
+                // value, so the record is checked before anything is written.
+                validate_memory(
+                    memory,
+                    result,
+                    host_length(IO_RESULT_SIZE, 2)?,
+                    word_bytes,
+                    UserMemoryAccess::Write,
+                    2,
+                )?;
+                // The array is the caller's and the driver writes whole records
+                // into it, so the length is checked here rather than trusted. A
+                // capacity of zero is a poll for "is anything pending", which
+                // touches no memory at all, so there is nothing to validate.
+                //
+                // The product cannot overflow: `capacity` is a `u32` and a record
+                // is sixteen bytes, so the longest array the call can name is
+                // `u32::MAX * 16`, which fits a 64-bit word with room to spare. It
+                // is written this way rather than as a checked multiply because a
+                // checked multiply with an unreachable error would be a branch no
+                // program can take and no test can reach.
+                if capacity != 0 {
+                    let bytes = u64::from(capacity) * INPUT_EVENT_RECORD_SIZE as u64;
+                    validate_memory(memory, events, bytes, 1, UserMemoryAccess::Write, 0)?;
+                }
+                Ok(ValidatedSyscall::from_kind(
+                    ValidatedSyscallKind::InputPoll {
+                        events,
+                        capacity,
                         result,
                     },
                 ))

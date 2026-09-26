@@ -13,7 +13,7 @@ use lazalith_types::{ArchitectureConfig as C, WidthError, WordWidth};
 
 #[test]
 fn syscall_numbers_are_stable_complete_and_unique() {
-    const EXPECTED: [(Syscall, u16); 16] = [
+    const EXPECTED: [(Syscall, u16); 17] = [
         (Syscall::Exit, 0x0001),
         (Syscall::Write, 0x0002),
         (Syscall::Read, 0x0003),
@@ -30,6 +30,7 @@ fn syscall_numbers_are_stable_complete_and_unique() {
         (Syscall::ClearScreen, 0x000e),
         (Syscall::DisplayOpen, 0x000f),
         (Syscall::DisplayPresent, 0x0010),
+        (Syscall::InputPoll, 0x0011),
     ];
 
     assert_eq!(ABI_VERSION, 1);
@@ -49,13 +50,13 @@ fn syscall_numbers_are_stable_complete_and_unique() {
         assert_eq!(Syscall::from_word(C::lz64(), u64::from(raw)), Ok(call));
         assert!(!Syscall::is_reserved(u64::from(raw)));
     }
-    for raw in [0_u16, 0x0011, 0x0100, 0xffff] {
+    for raw in [0_u16, 0x0012, 0x0100, 0xffff] {
         assert_eq!(
             Syscall::try_from(raw),
             Err(AbiError::UnknownSyscall(u64::from(raw)))
         );
     }
-    for raw in [0_u64, 0x0011, 0x0100, 0xffff, 0x0001_0001, u64::MAX] {
+    for raw in [0_u64, 0x0012, 0x0100, 0xffff, 0x0001_0001, u64::MAX] {
         assert_eq!(
             Syscall::from_word(C::lz64(), raw),
             Err(AbiError::UnknownSyscall(raw))

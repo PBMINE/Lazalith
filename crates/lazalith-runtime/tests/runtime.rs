@@ -562,3 +562,88 @@ fn a_widened_value_keeps_the_bytes_it_was_widened_from() {
     assert_eq!(exit, Some(0), "every widening and narrowing held");
     assert_eq!(output, "ok");
 }
+
+/// A repeated array fills every element, and a large one costs a loop.
+///
+/// Two properties in one program, because they come from the same translation. A
+/// repeat is lowered as a counted loop rather than one store per element, which
+/// is what makes a framebuffer-sized array possible at all — unrolled, a
+/// 64000-byte array is megabytes of code. And the loop's bound is `index <
+/// count` rather than a non-zero test, so element zero is inside the loop; a
+/// counter tested for zero would leave the first element of every array
+/// uninitialised, which is the kind of bug that only shows on the element
+/// somebody was not looking at.
+#[test]
+fn a_repeated_array_fills_every_element_at_any_size() {
+    let (output, exit) = build_and_run(
+        r#"
+        fn check_every(data: &[u8], value: u8) -> i32 {
+            let mut at: u64 = 0u64;
+            while at < data.len() as u64 {
+                if data[at as usize] != value {
+                    return 1;
+                }
+                at = at + 1u64;
+            }
+            return 0;
+        }
+
+        fn main() -> i32 {
+            // A small repeat, where an unrolled loop and a counted one agree.
+            let mut small: [u8; 5] = [7u8; 5];
+            if check_every(small.as_slice(), 7u8) != 0 {
+                return 1;
+            }
+            // A wide element, to be sure the stride is the element's size.
+            let mut wide: [u32; 4] = [4294967295u32; 4];
+            let mut at: u64 = 0u64;
+            while at < 4u64 {
+                if wide[at as usize] != 4294967295u32 {
+                    return 2;
+                }
+                at = at + 1u64;
+            }
+            // A single element: the loop must still run exactly once.
+            let mut one: [u8; 1] = [9u8; 1];
+            if one[0] != 9u8 {
+                return 3;
+            }
+            // An array the code section could not hold if the repeat were
+            // unrolled: a couple of hundred bytes is a few thousand instructions
+            // of stores, against a code section limit of a megabyte. The size
+            // is bounded by the *step* budget rather than by the image format,
+            // because the generated code keeps every value in the frame and
+            // reloads it — a fact about an unoptimised backend, not about
+            // repeats. How large a repeat *can* be is a property of the image
+            // format, and the lowering test measures the code instead.
+            let mut framebuffer: [u8; 256] = [0u8; 256];
+            if check_every(framebuffer.as_slice(), 0u8) != 0 {
+                return 4;
+            }
+            // The first and the last element are both writable, which is what a
+            // bound that skipped element zero would have broken.
+            framebuffer[0] = 1u8;
+            framebuffer[255] = 2u8;
+            if framebuffer[0] != 1u8 {
+                return 5;
+            }
+            if framebuffer[255] != 2u8 {
+                return 6;
+            }
+            // And a repeat of a non-zero value over a framebuffer.
+            let mut filled: [u8; 64] = [255u8; 64];
+            if check_every(filled.as_slice(), 255u8) != 0 {
+                return 7;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+    );
+    assert_eq!(
+        exit,
+        Some(0),
+        "every repeat filled its whole array: {output:?}"
+    );
+    assert_eq!(output, "ok");
+}

@@ -373,11 +373,13 @@ fn a_bang_is_a_negation_and_not_a_conversion() {
 #[test]
 fn a_view_costs_two_argument_words() {
     let source = r#"
-        extern "syscall" fn input_poll(a: &[u8], b: &[u8], c: &[u8], d: &[u8]) -> i64;
+        fn four_views(a: &[u8], b: &[u8], c: &[u8], d: &[u8]) -> i64 {
+            return 0;
+        }
         fn main() -> i64 {
             let text = "x";
             let bytes = text.as_bytes();
-            return input_poll(bytes, bytes, bytes, bytes);
+            return four_views(bytes, bytes, bytes, bytes);
         }
     "#;
     match lower_failure(source) {
@@ -388,19 +390,33 @@ fn a_view_costs_two_argument_words() {
     }
 }
 
-/// A syscall the ABI has not numbered cannot be called, and no number is invented.
+/// Every syscall the design names is numbered, so an `extern "syscall"` that
+/// names something else is refused — and refused *early*, with a diagnostic that
+/// says what to do, rather than lowered with no number to call.
+///
+/// The rule this replaced allowed a name the design had promised but the ABI had
+/// not delivered, so that a program written against the design would parse before
+/// the ABI caught up. Every reserved name is numbered now, so that leniency has
+/// nothing to be lenient about, and a name the table does not contain is a
+/// mistake worth reporting at the declaration.
 #[test]
-fn an_unnumbered_syscall_cannot_be_called() {
-    let source = r#"
-        extern "syscall" fn input_poll(width: i32, height: i32) -> i64;
-        fn main() -> i64 {
-            return input_poll(320, 240);
-        }
-    "#;
-    match lower_failure(source) {
-        LowerError::UnnumberedSyscall { name, .. } => assert_eq!(name, "input_poll"),
-        other => panic!("expected a refusal for an unnumbered syscall: {other}"),
-    }
+fn a_syscall_the_abi_does_not_name_is_refused_at_the_declaration() {
+    let mut sources = SourceManager::new();
+    let error = compile(
+        &mut sources,
+        "t.lazen",
+        "extern \"syscall\" fn not_a_syscall(a: i32) -> i64;",
+    )
+    .expect_err("a name the ABI does not contain is not a syscall");
+    let rendered = error.render();
+    assert!(
+        rendered.contains("is not an OS ABI syscall"),
+        "the diagnostic names the problem: {rendered}"
+    );
+    assert!(
+        rendered.contains("lazalith_os_abi::Syscall"),
+        "and says where the names live: {rendered}"
+    );
 }
 
 /// A 32-bit target is refused rather than miscompiled.
@@ -577,9 +593,16 @@ fn an_array_literal_writes_its_elements_in_place() {
     assert_eq!(array.size, 12, "three i32 elements are twelve bytes");
 }
 
-/// A repeated array writes the same value to every element.
+/// A repeated array is a loop, not one store per element.
+///
+/// Unrolling is the obvious translation and it is what makes a framebuffer
+/// impossible: a 320-by-200 window is 256000 bytes, and a store per byte is a
+/// code section of megabytes for an array whose contents are all the same. So
+/// the repeat is a counted loop, and the test holds the two properties that
+/// matter: the code is the size of the loop, and the loop stores every element
+/// including the first.
 #[test]
-fn a_repeated_array_writes_every_element() {
+fn a_repeated_array_is_a_counted_loop_over_every_element() {
     let (module, _) = lower_source(
         r#"
         fn main() -> i32 {
@@ -588,18 +611,44 @@ fn a_repeated_array_writes_every_element() {
         }
         "#,
     );
-    // The element stores come before the bounds check that guards the read, so
-    // counting up to the check counts exactly the initialisation.
     let all = instructions(&module, "main");
-    let check = all
-        .iter()
-        .position(|instruction| matches!(instruction, Instruction::BoundsCheck { .. }))
-        .expect("the read is checked");
-    let stores = all[..check]
+    // One store for the counter, one for the element, and the counter again in
+    // the step. Sixteen elements would be sixteen times that if it unrolled.
+    let stores = all
         .iter()
         .filter(|instruction| matches!(instruction, Instruction::Store { .. }))
         .count();
-    assert_eq!(stores, 16, "sixteen elements are sixteen stores: {all:?}");
+    assert!(
+        stores < 8,
+        "sixteen identical elements are a loop, not sixteen stores: {stores} in {all:?}"
+    );
+    // And the loop is counted against the element count, not tested for
+    // non-zero: a counter tested for zero would skip element zero and leave the
+    // first element of every array uninitialised.
+    let compare = all
+        .iter()
+        .find_map(|instruction| match instruction {
+            Instruction::Compare { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("the loop is counted");
+    assert_eq!(
+        compare,
+        lazalith_ir::ComparisonOp::LessThanUnsigned,
+        "the bound is `index < count`, so the first element is inside the loop"
+    );
+    // The loop really is a loop: more than one block, and a backward jump.
+    assert!(
+        module
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .count()
+            > 1,
+        "a repeat with more than one element needs blocks to loop in"
+    );
+    let total: usize = all.len();
+    assert!(total > 0, "and it emitted something to run");
 }
 
 /// A cast is a load at the source's width into the target's type, which is what

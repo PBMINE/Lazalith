@@ -4,6 +4,7 @@ extern crate alloc;
 
 mod console;
 mod display;
+pub mod host_input;
 pub mod input;
 pub use console::ConsoleDevice;
 pub use display::{
@@ -11,6 +12,13 @@ pub use display::{
     REGISTER_ABI_VERSION, REGISTER_BYTES, REGISTER_FRAMEBUFFER, REGISTER_HEIGHT,
     REGISTER_LAST_PRESENT, REGISTER_PRESENT, REGISTER_PRESENT_COUNT, REGISTER_STATUS,
     REGISTER_WIDTH, STATUS_PRESENTED, frame_bytes, pixel_at, zeroed_framebuffer,
+};
+pub use host_input::{
+    HostAction, HostKey, HostScript, KEY_BACKSLASH, KEY_BACKSPACE, KEY_COMMA, KEY_DIGIT_FIRST,
+    KEY_DIGIT_LAST, KEY_ENTER, KEY_EQUALS, KEY_ESCAPE, KEY_LEFT_ALT, KEY_LEFT_CONTROL,
+    KEY_LEFT_SHIFT, KEY_LEFT_SUPER, KEY_LETTER_FIRST, KEY_LETTER_LAST, KEY_MAX, KEY_MINUS,
+    KEY_PERIOD, KEY_RIGHT_ALT, KEY_RIGHT_CONTROL, KEY_RIGHT_SHIFT, KEY_RIGHT_SUPER, KEY_SEMICOLON,
+    KEY_SLASH, KEY_SPACE, KEY_TAB, KEY_UNKNOWN, digit_of, is_digit, is_letter, letter_of,
 };
 pub use input::{
     EVENT_BYTES, Event, EventKind, EventKindValue, INPUT_ABI_VERSION, InputDevice, InputError,

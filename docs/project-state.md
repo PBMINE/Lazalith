@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-27 (Steps 1–70 complete and verified)
+Last updated: 2026-09-27 (Steps 1–71 complete and verified)
 
 ## Where the roadmap stands
 
@@ -1182,11 +1182,121 @@ extension, which is two cases out of four.
 `a_wide_constant_is_the_number_it_was_written_as` covers all six shapes and was
 **verified to fail with the old code**, which produced `1` for four of them.
 
+## Step 71 — The LazOS Input Driver and the Host Input Adapter
+
+`InputService` in `crates/lazalith-os/src/input.rs` with 13 tests in
+`crates/lazalith-os/tests/input.rs`; `HostInputAdapter`, `HostKey` and
+`HostScript` in `crates/lazalith-devices/src/host_input.rs` with 13 tests in
+`crates/lazalith-devices/tests/host_input.rs`; `std::input` in
+`crates/lazalith-stdlib/src/lib.rs` with 8 end-to-end tests in
+`crates/lazalith-stdlib/tests/stdlib.rs`. The ABI additions are
+`Syscall::InputPoll = 0x0011` and the 16-byte `InputEventRecord`. That was the
+last reserved name, so `RESERVED_DESIGN_SYSCALLS` is now empty and an
+`extern "syscall"` the ABI does not name is refused at its declaration.
+
+### The adapter is the only component that knows what a keyboard is
+
+`HostKey` is numbered with SDL3's `SDL_Scancode` values, and those numbers are
+the one thing in Lazalith that cannot be checked against anything inside the
+build. They were read out of SDL 3.4.16's `SDL_scancode.h` and pinned by
+`the_host_numbering_is_sdl3s`, which states them as numbers rather than as a
+comment — three of them were wrong when first written and the test is where that
+showed up. Step 77 is then a pass-through rather than a second translation, and
+if SDL ever renumbers one, the fix is that one enum.
+
+`no_host_code_reaches_the_guest` is the property the file exists for: if a host
+number could reach the guest, a host renumbering would renumber the guest.
+
+### Lazen's key codes are frozen, and are not a host's
+
+A program compiled against this table has to keep working when the host adapter
+changes. So the guest-visible codes are Lazen's own, and they are deliberately
+*different numbers* from the host's — which is what makes the translation a real
+step rather than a rename.
+
+The letters occupy **one contiguous range in ASCII order** and the digits
+another, so a program classifies a key with two comparisons and reads which
+letter with a subtraction. That is the entire reason for the numbering:
+classification without a table. `key_codes_classify_without_a_table` walks both
+ranges in a Lazen program and checks every value against the arithmetic, with no
+table anywhere in the program.
+
+`docs/lazen-input.md` listed the letters as four ranges, which cannot be right:
+`'q'..'p'` and `'z'..'m'` are not contiguous in ASCII order, and the ranges
+overlap. The doc has been corrected to the two contiguous ranges, and the
+right-hand super key — named by the design, absent from its table — is now
+assigned.
+
+### The remainder stays queued, and this is tested through the ABI
+
+A poll writes whole records into the caller's array and returns how many. If the
+queue holds more than the array takes, the rest **stays queued at the device**.
+`a_poll_that_cannot_take_everything_keeps_the_rest` holds that through the real
+syscall, and it was **verified to fail when the driver is changed to take at most
+one event** — three tests fail, because a drain that discarded the remainder
+loses input silently and a program polling once per frame loses any key tapped
+faster than that.
+
+A return of zero means *nothing pending*, not an error, and
+`a_poll_with_nothing_pending_is_zero` polls five times to say so.
+
+### The count comes back in a record, like every other value
+
+A v1 call returns one `i64` and that word is the status, so the count goes in an
+`IoResult` — the same reason `write` and `time` report through a record. The
+driver writes that record on *every* path including a refusal, so a program whose
+array turned out to be unusable can read how far it got. The SDK reads both the
+call's status and the record's, because they are separate claims: a refused call
+that also reported a count would be read as a partial success otherwise.
+
+### The records are word-backed, and that was a real bug
+
+The ABI's records are word-aligned and the kernel checks it. An SDK scratch of
+`[u8; 16]` has an alignment of *one*, so whether the call worked depended on
+where the frame layout happened to put it: Step 70's `present` worked by luck
+and Step 71's `poll` did not, failing with `Misaligned` in one frame and not
+another. Both now back their scratch with `[u64; 2]` and read the record as
+words — `IoResult` is a count then a status, which on this target is the low
+word's two halves, so no byte view is needed. The test
+`a_program_reacts_to_scripted_keyboard_input` was verified to fail with the byte
+array put back.
+
+### A repeated array is a loop, not a store per element
+
+Found by the same test: a framebuffer-sized array is initialised in the *code*
+section, and one store per byte is a code section of megabytes for an array
+whose contents are all the same. A 64000-byte array did not link. `ArrayRepeat`
+is now a counted loop, so the code is the size of the loop rather than the size
+of the data, and a 64000-byte array builds.
+
+The loop's bound is `index < count` and it is tested *before* the body, because
+branching on the counter alone would skip element zero and leave the first
+element of every array uninitialised. `a_repeated_array_is_a_counted_loop_over_every_element`
+holds both the code size and the bound, and
+`a_repeated_array_fills_every_element_at_any_size` runs it as a program.
+
+### Limits
+
+- The host numbering is pinned against SDL 3.4.16 and Step 77 must confirm it
+  against the SDL3 it links. That is the one number here with no in-build check.
+- A repeat is bounded by the *step* budget, not by the image format, because the
+  generated code keeps every value in the frame and reloads it. A 256KB window
+  is a real window and the backend is unoptimised; Step 72 will need either a
+  larger budget or a cheaper `clear`.
+- `REGISTER_POLL` is still writable and drains nothing. The events now travel
+  through the ABI, so the register is the last part of the Step 69 surface that
+  is a placeholder rather than a finished shape.
+- Text is the host's to compose. `HostAction::Printable` is a convenience, not a
+  rule, because case, dead keys and input methods are host concerns and the
+  design puts text editing in the GUI library.
+
 ### Next step
 
-Step 71 is the **input driver and the host input adapter**: numbering
-`input_poll`, a driver that drains the Step 69 queue through the ABI, and the
-adapter that is the only component that knows what a keyboard is.
+Step 72 is the **first graphical Lazen application**: a program that creates a
+window, draws, receives keyboard input, and updates its state — and knows
+neither SDL3 nor the kernel. `a_window_draws_and_quits_on_a_scripted_key` is
+already that program in miniature, so Step 72 is its real shape rather than a new
+idea.
 
 ## Steps 1–50 Retrospective Audit and Repair
 

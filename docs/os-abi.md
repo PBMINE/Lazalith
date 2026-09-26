@@ -107,7 +107,9 @@ transfer after committing the transferred bytes.
 | `0x000d` | `WaitProcess` | yes | Wait for a child and return its exit status |
 | `0x000e` | `ClearScreen` | yes | Clear the virtual terminal |
 | `0x000f` | `DisplayOpen` | yes | Open a window over the caller's framebuffer |
+
 | `0x0010` | `DisplayPresent` | yes | Record the caller's frame as the visible one |
+| `0x0011` | `InputPoll` | yes | Drain queued input events into the caller's array |
 | `0x0100`–`0xffff` | Reserved | rejected | Future ABI extension range |
 
 Unknown and reserved numbers return `SyscallError::UnknownSyscall`. LZ64
@@ -402,7 +404,52 @@ once. It is invalid for a non-child handle.
 All arguments are zero. It emits a defined virtual-terminal clear operation
 through the terminal service, not an SDL call and not raw framebuffer access.
 
+### `InputEventRecord`
+
+```text
+size 16
+0x00  u32 kind
+0x04  u32 code
+0x08  i32 x
+0x0c  i32 y
+```
+
+`InputPoll` writes a run of these into the caller's array. Every field is
+defined for every kind and an unused field is zero, so a reader never has to ask
+which fields are meaningful.
+
+The `kind` is a `u32` and not an enum precisely so an **unknown kind is held
+rather than refused**: a program running against a newer device must be able to
+receive an event it does not understand, skip it, and carry on. A record that
+was rejected would make forward compatibility impossible.
+
+The position fields are **signed**. A pointer can be dragged off the top or left
+of a window, and a program clamping it needs to know which side it went, so the
+bytes are their two's-complement value rather than a `u32` that happens to be
+small.
+
+### `InputPoll(events, capacity, out_io_result)`
+
+Drains up to `capacity` records into the caller's array and reports how many were
+written in the result record's `transferred` field. The count goes in a record
+rather than in the return value for the same reason `write` and `time` do: a v1
+call returns one word, and that word is the status.
+
+`events` must be writable and must hold `capacity * 16` bytes, and
+`out_io_result` must be writable and at least `IO_RESULT_SIZE` bytes. Both are
+checked before the device is touched. `capacity` is a `u32` and a record is
+sixteen bytes, so the byte count cannot overflow a word; what it can do is name
+more memory than the guest has, and the range check is what refuses that.
+
+A capacity of zero is a poll for "is anything pending": it writes no memory at
+all, so there is nothing to validate.
+
+If the device holds more events than the array can take, **the remainder stays
+queued** and the next call continues from there. Events are never dropped
+silently.
+
 ### `DisplayOpen(width, height, framebuffer, out_display_record)`
+
 
 The window is over the caller's own memory. `framebuffer` must be writable and
 must hold `width * height * 4` bytes; the product is checked for overflow before
@@ -455,9 +502,10 @@ Payload details are documented per call where useful; the dispatcher never
 returns a raw negative Linux errno. Errors retain a cause chain internally and
 map to the ABI code at the boundary.
 
-For the display calls the detail is the **offending argument index**: `2` for the
-framebuffer, `3` for the `display_open` record, and `1` for the
-`display_present` result. A caller that gets `InvalidPointer` can therefore say
+For the display and input calls the detail is the **offending argument
+index**: `2` for the `display_open` framebuffer, `3` for its record, `1` for the
+`display_present` result, `0` for the `input_poll` event array, and `2` for its
+result record. A caller that gets `InvalidPointer` can therefore say
 which of its four arguments was bad, which is the difference between a diagnostic
 and a shrug.
 

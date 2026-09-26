@@ -517,3 +517,111 @@ impl DisplayRecord {
         )
     }
 }
+
+/// The event record's size, fixed by the ABI.
+///
+/// One record per queued event, in an array the caller owns, is what lets a v1
+/// program receive input at all: there is no variadic call and no length the
+/// driver chooses, so the caller lays out the array and the driver fills it.
+pub const INPUT_EVENT_RECORD_SIZE: usize = 16;
+
+/// One queued input event, as the guest sees it.
+///
+/// Four fields, every one of them defined for every kind, and an unused field
+/// zero. That is the whole point of a fixed record: a reader never has to ask
+/// which fields are meaningful, so matching on the kind and reading the rest
+/// needs no branch.
+///
+/// The `kind` is a `u32` and not an enum precisely so an **unknown kind is held
+/// rather than refused**. A program running against a newer device must be able
+/// to receive an event it does not understand, skip it, and carry on; a record
+/// that was rejected would make forward compatibility impossible and would turn
+/// a newer device into one that breaks older programs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InputEventRecord {
+    kind: u32,
+    code: u32,
+    x: i32,
+    y: i32,
+}
+
+impl InputEventRecord {
+    /// A record for a key or text event, which carry no position.
+    pub const fn new(kind: u32, code: u32) -> Self {
+        Self {
+            kind,
+            code,
+            x: 0,
+            y: 0,
+        }
+    }
+
+    /// A record for a pointer event, which carries an absolute position.
+    pub const fn pointer(kind: u32, code: u32, x: i32, y: i32) -> Self {
+        Self { kind, code, x, y }
+    }
+
+    /// The event's kind, as a number.
+    ///
+    /// A kind this ABI does not name is still returned, as its own number.
+    pub const fn kind(&self) -> u32 {
+        self.kind
+    }
+
+    /// The event's code: a key code, a mouse button, or a Unicode value.
+    pub const fn code(&self) -> u32 {
+        self.code
+    }
+
+    /// The pointer's absolute `x`, or zero for an event that has no position.
+    pub const fn x(&self) -> i32 {
+        self.x
+    }
+
+    /// The pointer's absolute `y`, or zero for an event that has no position.
+    pub const fn y(&self) -> i32 {
+        self.y
+    }
+
+    /// The record's bytes, little-endian, in the ABI's field order.
+    pub fn encode(&self) -> [u8; INPUT_EVENT_RECORD_SIZE] {
+        let mut output = [0u8; INPUT_EVENT_RECORD_SIZE];
+        output[..4].copy_from_slice(&self.kind.to_le_bytes());
+        output[4..8].copy_from_slice(&self.code.to_le_bytes());
+        output[8..12].copy_from_slice(&self.x.to_le_bytes());
+        output[12..16].copy_from_slice(&self.y.to_le_bytes());
+        output
+    }
+
+    /// A record from its bytes.
+    ///
+    /// A short input is refused rather than padded: a record's size is the ABI's,
+    /// and a caller that offered fewer bytes than one record occupies has not
+    /// offered a record.
+    ///
+    /// The position fields are read as *signed* and re-interpreted, not converted.
+    /// A pointer can be dragged off the top or left of a window, and a program
+    /// clamping it needs to know which side it went; a checked `u32`-to-`i32`
+    /// conversion would reject exactly those records, which are the ones worth
+    /// delivering.
+    pub fn decode(input: &[u8]) -> Result<Self, AbiError> {
+        if input.len() != INPUT_EVENT_RECORD_SIZE {
+            return Err(AbiError::InvalidArgument { index: 0 });
+        }
+        Ok(Self {
+            kind: read_u32(input, 0)?,
+            code: read_u32(input, 4)?,
+            x: read_i32(input, 8),
+            y: read_i32(input, 12),
+        })
+    }
+}
+
+/// A record's signed field at `at`.
+///
+/// The bytes are the field's two's-complement representation and are read as
+/// such: an `i32` is not a `u32` that happens to be small, it is a signed
+/// quantity whose high bit is part of its value.
+fn read_i32(input: &[u8], at: usize) -> i32 {
+    i32::from_le_bytes([input[at], input[at + 1], input[at + 2], input[at + 3]])
+}

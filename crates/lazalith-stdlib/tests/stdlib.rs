@@ -1023,3 +1023,600 @@ fn a_program_that_never_opens_a_window_has_no_frame() {
         "no display call means no window and no frame"
     );
 }
+
+// ---------------------------------------------------------------- Step 71: input
+
+/// Runs `source` with `script` already queued on the kernel's input device.
+///
+/// This is the whole of the host input path in one line: a host — a script here,
+/// SDL3 in Step 77 — queues guest-visible records on the device, and the program
+/// polls for them through the driver. Nothing about the host is visible from the
+/// program, which is the property the test below is about.
+fn run_with_script(source: &str, script: lazalith_devices::HostScript) -> (String, Option<u32>) {
+    let config = ArchitectureConfig::lz64();
+    let program = RuntimeProgram::build(source, &BuildOptions::lz64("stdlib.lz"))
+        .unwrap_or_else(|error| panic!("{source} should build: {error}"));
+    let bytes = program.to_image_bytes().expect("the image serialises");
+    let image = LzxImage::from_bytes(&bytes).expect("the image reads back");
+
+    let boot = BootImage::new(config, supervisor_kernel(config), 0).unwrap();
+    let mut machine = boot
+        .start(DeviceManager::<NoDevice>::new())
+        .expect("the machine starts");
+    machine
+        .set_trap_vector(InstructionAddress::new(KERNEL_LOAD_ADDRESS + 8))
+        .expect("a trap vector");
+    machine.step().expect("the handoff");
+
+    let mut kernel = LazalithKernel::new(
+        STEP_BUDGET,
+        VirtualTerminal::new(b"").unwrap(),
+        VirtualFileSystem::with_defaults().unwrap(),
+    )
+    .expect("the kernel starts");
+    script
+        .replay(kernel.input_mut().device_mut())
+        .expect("the script fits the queue");
+    kernel
+        .start_image(image, ProcessId::new(1).unwrap(), ThreadId::new(1).unwrap())
+        .expect("the program is scheduled");
+
+    let mut exit = None;
+    for _ in 0..STEP_BUDGET {
+        let step = match kernel.step(&mut machine) {
+            Ok(step) => step,
+            Err(lazalith_os::KernelError::Scheduler(
+                lazalith_os::SchedulerError::NoRunnableProcess,
+            )) => break,
+            Err(error) => panic!("a step: {error}"),
+        };
+        match step.outcome {
+            Some(KernelServiceOutcome::Exit(code)) => {
+                exit = Some(code);
+                break;
+            }
+            Some(KernelServiceOutcome::Fault(error)) => panic!("the program faulted: {error:?}"),
+            Some(KernelServiceOutcome::Return(_)) | None => {}
+        }
+    }
+    let exit = exit.expect("the program finished within its budget");
+    let output = String::from_utf8_lossy(kernel.terminal().terminal().output()).into_owned();
+    (output, Some(exit))
+}
+
+/// A Lazen program reads keyboard input from a script, with no host present.
+///
+/// This is the verification `docs/lazen-input.md` asks for: a program compiled
+/// and run headlessly, driven by a scripted event source, reacts to keyboard
+/// input. Every check is a *return value* rather than a printed assertion, and
+/// each exit code names the check that failed.
+#[test]
+fn a_program_reacts_to_scripted_keyboard_input() {
+    use lazalith_devices::{HostAction, HostKey, HostScript};
+
+    let mut script = HostScript::new();
+    // "hi" typed, then a key released, then a key the adapter does not name.
+    script.push(HostAction::Printable(HostKey::H));
+    script.push(HostAction::Printable(HostKey::I));
+    script.push(HostAction::KeyUp(HostKey::H));
+    script.push(HostAction::KeyDown(HostKey::Unknown));
+
+    let (output, exit) = run_with_script(
+        r#"
+        fn main() -> i32 {
+            // Sixteen records is room for everything the script queues.
+            let mut events: [u8; 256] = [0u8; 256];
+            let got: u32 = std::input::poll(events.as_mut_slice(), 16u32);
+            if got != 6u32 {
+                return 1;
+            }
+            // 'h' arrived as its key and then as its text, in that order.
+            if !std::input::is(events.as_slice(), 0u64, std::input::key_down()) {
+                return 2;
+            }
+            if std::input::letter_of(std::input::code_of(events.as_slice(), 0u64)) != 104u32 {
+                return 3;
+            }
+            if !std::input::is(events.as_slice(), 1u64, std::input::text()) {
+                return 4;
+            }
+            if std::input::text_of(events.as_slice(), 1u64) != 104u32 {
+                return 5;
+            }
+            // 'i' the same way.
+            if std::input::letter_of(std::input::code_of(events.as_slice(), 2u64)) != 105u32 {
+                return 6;
+            }
+            if std::input::text_of(events.as_slice(), 3u64) != 105u32 {
+                return 7;
+            }
+            // The release carried no text, which is what makes key and text two
+            // events rather than one event with an optional character.
+            if !std::input::is(events.as_slice(), 4u64, std::input::key_up()) {
+                return 8;
+            }
+            if std::input::x_of(events.as_slice(), 4u64) != 0 {
+                return 9;
+            }
+            // A key the adapter does not name still arrived, as `Unknown`.
+            if !std::input::is(events.as_slice(), 5u64, std::input::key_down()) {
+                return 10;
+            }
+            if std::input::code_of(events.as_slice(), 5u64) != 0u32 {
+                return 11;
+            }
+            // A second poll finds nothing: the queue is drained, not sampled.
+            if std::input::poll(events.as_mut_slice(), 16u32) != 0u32 {
+                return 12;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+        script,
+    );
+    assert_eq!(
+        exit,
+        Some(0),
+        "the program read the whole script: {output:?}"
+    );
+    assert_eq!(output, "ok");
+}
+
+/// A poll too small for the queue takes what fits and keeps the rest.
+///
+/// The property the device exists for: a program polling once per frame must not
+/// lose a key tapped faster than that. Five events queued and two asked for,
+/// three times over, leaves one still queued — and a poll with room finds it.
+#[test]
+fn a_poll_too_small_keeps_the_rest_of_the_queue() {
+    use lazalith_devices::{HostAction, HostKey, HostScript};
+
+    let mut script = HostScript::new();
+    for _ in 0..5 {
+        script.push(HostAction::KeyDown(HostKey::A));
+    }
+    let (output, exit) = run_with_script(
+        r#"
+        fn main() -> i32 {
+            let mut events: [u8; 256] = [0u8; 256];
+            let mut total: u32 = 0u32;
+            // Two at a time, twice: four delivered and one still queued.
+            let mut round: u32 = 0u32;
+            while round < 2u32 {
+                if std::input::poll(events.as_mut_slice(), 2u32) != 2u32 {
+                    return 1;
+                }
+                total = total + 2u32;
+                round = round + 1u32;
+            }
+            if total != 4u32 {
+                return 2;
+            }
+            // The fifth is still there, which is the whole point: a drain that
+            // discarded the remainder would leave nothing and lose a key press.
+            let mut more: [u8; 256] = [0u8; 256];
+            if std::input::poll(more.as_mut_slice(), 8u32) != 1u32 {
+                return 3;
+            }
+            // And it is the same event, not a fresh one: a key that is still `a`.
+            if std::input::letter_of(std::input::code_of(more.as_slice(), 0u64)) != 97u32 {
+                return 4;
+            }
+            // Now the queue is empty, and a poll says so.
+            if std::input::poll(more.as_mut_slice(), 8u32) != 0u32 {
+                return 5;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+        script,
+    );
+    assert_eq!(exit, Some(0), "the remainder was kept: {output:?}");
+}
+
+/// A poll that cannot take everything still delivers what it can.
+///
+/// Five events queued, three asked for: the program gets three, and the other two
+/// are still there for the next call. A drain that discarded the remainder would
+/// make the second poll return zero and lose two key presses silently.
+#[test]
+fn a_poll_delivers_what_it_can_and_keeps_the_rest() {
+    use lazalith_devices::{HostAction, HostKey, HostScript};
+
+    let mut script = HostScript::new();
+    for _ in 0..5 {
+        script.push(HostAction::KeyDown(HostKey::B));
+    }
+    let (output, exit) = run_with_script(
+        r#"
+        fn main() -> i32 {
+            let mut events: [u8; 256] = [0u8; 256];
+            if std::input::poll(events.as_mut_slice(), 3u32) != 3u32 {
+                return 1;
+            }
+            // Two are left, and a poll with room finds them.
+            if std::input::poll(events.as_mut_slice(), 8u32) != 2u32 {
+                return 2;
+            }
+            if std::input::poll(events.as_mut_slice(), 8u32) != 0u32 {
+                return 3;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+        script,
+    );
+    assert_eq!(exit, Some(0), "nothing was lost: {output:?}");
+}
+
+/// A poll with nothing pending is zero, and zero is not an error.
+///
+/// A program that polls once per frame is supposed to get zero most of the time,
+/// so a zero that read as a failure would make every frame look like a problem.
+#[test]
+fn a_poll_with_nothing_pending_is_zero() {
+    let (output, exit) = run_with_script(
+        r#"
+        fn main() -> i32 {
+            let mut events: [u8; 256] = [0u8; 256];
+            let mut round: u32 = 0u32;
+            while round < 5u32 {
+                if std::input::poll(events.as_mut_slice(), 8u32) != 0u32 {
+                    return 1;
+                }
+                round = round + 1u32;
+            }
+            // A capacity of zero is the cheapest way to ask, and writes nothing.
+            if std::input::poll(events.as_mut_slice(), 0u32) != 0u32 {
+                return 2;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+        lazalith_devices::HostScript::new(),
+    );
+    assert_eq!(exit, Some(0), "an empty queue is not a failure: {output:?}");
+}
+
+/// A poll that asks for more events than its array holds is refused by the SDK.
+///
+/// The SDK checks the array against the capacity before the call, so a program
+/// that mis-sized its buffer gets zero rather than the kernel faulting it. The
+/// queue is untouched, so the events are still there for a correctly sized poll.
+#[test]
+fn a_poll_larger_than_the_array_is_refused_without_losing_anything() {
+    use lazalith_devices::{HostAction, HostKey, HostScript};
+
+    let mut script = HostScript::new();
+    script.push(HostAction::KeyDown(HostKey::A));
+    script.push(HostAction::KeyDown(HostKey::C));
+    let (output, exit) = run_with_script(
+        r#"
+        fn main() -> i32 {
+            // Room for one record, asked for two.
+            let mut small: [u8; 16] = [0u8; 16];
+            if std::input::poll(small.as_mut_slice(), 2u32) != 0u32 {
+                return 1;
+            }
+            // A correctly sized array still finds both events, so the refusal
+            // cost nothing.
+            let mut roomy: [u8; 256] = [0u8; 256];
+            if std::input::poll(roomy.as_mut_slice(), 4u32) != 2u32 {
+                return 2;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+        script,
+    );
+    assert_eq!(exit, Some(0), "the refusal lost nothing: {output:?}");
+}
+
+/// A program reads a pointer event's position, including a negative one.
+///
+/// A pointer can be dragged off the top or left of a window, and a program
+/// clamping it needs to know which side it went.
+#[test]
+fn a_pointer_event_carries_its_position() {
+    use lazalith_devices::{HostAction, HostScript};
+
+    let mut script = HostScript::new();
+    script.push(HostAction::MouseMove(120, 45));
+    script.push(HostAction::MouseDown(1, -3, -7));
+    let (output, exit) = run_with_script(
+        r#"
+        fn main() -> i32 {
+            let mut events: [u8; 256] = [0u8; 256];
+            if std::input::poll(events.as_mut_slice(), 4u32) != 2u32 {
+                return 1;
+            }
+            if !std::input::is(events.as_slice(), 0u64, std::input::mouse_move()) {
+                return 2;
+            }
+            if std::input::x_of(events.as_slice(), 0u64) != 120 {
+                return 3;
+            }
+            if std::input::y_of(events.as_slice(), 0u64) != 45 {
+                return 4;
+            }
+            if !std::input::is(events.as_slice(), 1u64, std::input::mouse_down()) {
+                return 5;
+            }
+            if std::input::code_of(events.as_slice(), 1u64) != 1u32 {
+                return 6;
+            }
+            // A negative position survived, so a program can tell which edge the
+            // pointer went off.
+            if std::input::x_of(events.as_slice(), 1u64) != -3 {
+                return 7;
+            }
+            if std::input::y_of(events.as_slice(), 1u64) != -7 {
+                return 8;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+        script,
+    );
+    assert_eq!(exit, Some(0), "the position arrived: {output:?}");
+}
+
+/// `find` locates an event by kind, and reports "not found" as the count.
+///
+/// A program looking for a quit event, or for the first key, should not have to
+/// write the loop itself.
+#[test]
+fn a_program_can_find_an_event_by_its_kind() {
+    use lazalith_devices::{HostAction, HostKey, HostScript};
+
+    let mut script = HostScript::new();
+    script.push(HostAction::KeyDown(HostKey::A));
+    script.push(HostAction::MouseMove(1, 1));
+    script.push(HostAction::KeyDown(HostKey::B));
+    script.push(HostAction::Quit);
+    let (output, exit) = run_with_script(
+        r#"
+        fn main() -> i32 {
+            let mut events: [u8; 256] = [0u8; 256];
+            let count: u32 = std::input::poll(events.as_mut_slice(), 8u32);
+            if count != 4u32 {
+                return 1;
+            }
+            // The second key press is at index two, not the first.
+            let quit: u32 = std::input::find(events.as_slice(), count, std::input::quit());
+            if quit != 3u32 {
+                return 2;
+            }
+            let second: u32 = std::input::find(events.as_slice(), count, std::input::key_down());
+            if second != 0u32 {
+                return 3;
+            }
+            if std::input::letter_of(std::input::code_of(events.as_slice(), second as u64))
+                != 97u32 {
+                return 4;
+            }
+            // A kind that is not there is reported as the count, so "not found"
+            // and "found at the end" cannot be confused.
+            let absent: u32 = std::input::find(events.as_slice(), count, std::input::mouse_up());
+            if absent != count {
+                return 5;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+        script,
+    );
+    assert_eq!(exit, Some(0), "the events were found: {output:?}");
+}
+
+/// A guest cannot inject its own events.
+///
+/// There is no call that adds to the queue, so a program cannot hand itself a key
+/// press. This is the property that makes the device worth having: a program that
+/// could lie about input would be testing its own imagination.
+#[test]
+fn a_program_cannot_inject_its_own_events() {
+    let (output, exit) = run_with_script(
+        r#"
+        fn main() -> i32 {
+            let mut events: [u8; 256] = [0u8; 256];
+            // Poll every way a program can, and nothing appears.
+            let mut round: u32 = 0u32;
+            while round < 4u32 {
+                if std::input::poll(events.as_mut_slice(), 8u32) != 0u32 {
+                    return 1;
+                }
+                round = round + 1u32;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+        lazalith_devices::HostScript::new(),
+    );
+    assert_eq!(exit, Some(0), "a program invented no events: {output:?}");
+}
+
+/// The key codes a program tests are Lazen's, and they classify without a table.
+///
+/// The program below does not know any key *name* — it compares codes and reads a
+/// letter by its distance from the start of a range. That is the property the
+/// numbering exists for, and it is what makes a program portable across hosts.
+#[test]
+fn key_codes_classify_without_a_table() {
+    let (output, exit) = run_with_script(
+        r#"
+        fn main() -> i32 {
+            if std::input::key_letter_first() != 17u32 { return 1; }
+            if std::input::key_letter_last() != 42u32 { return 2; }
+            if std::input::key_digit_first() != 43u32 { return 3; }
+            if std::input::key_digit_last() != 52u32 { return 4; }
+            if std::input::key_max() != 57u32 { return 5; }
+            // Every letter is where its distance from the start says it is.
+            let mut code: u32 = std::input::key_letter_first();
+            let mut letter: u32 = 97u32;
+            while code <= std::input::key_letter_last() {
+                if std::input::letter_of(code) != letter {
+                    return 6;
+                }
+                if !std::input::is_letter(code) {
+                    return 7;
+                }
+                if std::input::is_digit(code) {
+                    return 8;
+                }
+                code = code + 1u32;
+                letter = letter + 1u32;
+            }
+            if letter != 123u32 {
+                return 9;
+            }
+            // The same for digits.
+            code = std::input::key_digit_first();
+            letter = 48u32;
+            while code <= std::input::key_digit_last() {
+                if std::input::digit_of(code) != letter {
+                    return 10;
+                }
+                code = code + 1u32;
+                letter = letter + 1u32;
+            }
+            if letter != 58u32 {
+                return 11;
+            }
+            // A named key is neither.
+            if std::input::letter_of(std::input::key_space()) != 0u32 { return 12; }
+            if std::input::digit_of(std::input::key_comma()) != 0u32 { return 13; }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+        lazalith_devices::HostScript::new(),
+    );
+    assert_eq!(exit, Some(0), "every key classified: {output:?}");
+}
+
+/// A graphical program opens a window, draws, and quits on a scripted key.
+///
+/// The whole chain in one program: the Step 70 display driver, the Step 71 input
+/// driver, and a program that knows neither the host nor the kernel. It is
+/// Step 72's shape, and it is here because the input path is only worth having
+/// if a program can actually use it.
+///
+/// The window is 32 by 24 because a Lazen frame is initialised in the *code*
+/// section, and a large one would not fit in the image — which is a fact about
+/// v1's zero initialisation, not about this test.
+#[test]
+fn a_window_draws_and_quits_on_a_scripted_key() {
+    use lazalith_devices::{HostAction, HostKey, HostScript};
+
+    let mut script = HostScript::new();
+    script.push(HostAction::MouseMove(10, 10));
+    script.push(HostAction::Printable(HostKey::Q));
+    script.push(HostAction::Quit);
+    let (output, exit) = run_with_script(
+        r#"
+        fn main() -> i32 {
+            let mut framebuffer: [u8; 3072] = [0u8; 3072];
+            let mut record: [u8; 24] = [0u8; 24];
+            if !std::graphics::open(
+                32u32,
+                24u32,
+                framebuffer.as_mut_slice(),
+                record.as_mut_slice()
+            ) {
+                return 1;
+            }
+            let white: u32 = std::graphics::white();
+            let blue: u32 = std::graphics::rgba(0u8, 0u8, 255u8, 255u8);
+            let surface: u64 = std::graphics::pack_surface(32u32, 24u32);
+            std::graphics::clear(framebuffer.as_mut_slice(), blue);
+            std::graphics::draw_text(
+                framebuffer.as_mut_slice(),
+                surface,
+                std::graphics::pack_ink(2u32, 2u32, white),
+                "Hi"
+            );
+
+            // A frame loop that runs until the script says to stop. The quit
+            // event is the third in the queue, so the loop sees it on its first
+            // poll and presents twice more before stopping.
+            let mut events: [u8; 256] = [0u8; 256];
+            let mut frames: u32 = 0u32;
+            let mut quit: bool = false;
+            let mut round: u32 = 0u32;
+            while round < 3u32 && !quit {
+                let count: u32 = std::input::poll(events.as_mut_slice(), 16u32);
+                let mut at: u32 = 0u32;
+                while at < count && !quit {
+                    if std::input::is(events.as_slice(), at as u64, std::input::quit()) {
+                        quit = true;
+                    }
+                    at = at + 1u32;
+                }
+                let mut count_bytes: [u8; 8] = [0u8; 8];
+                if !std::graphics::present(
+                    framebuffer.as_mut_slice(),
+                    count_bytes.as_mut_slice()
+                ) {
+                    return 2;
+                }
+                frames = frames + 1u32;
+                round = round + 1u32;
+            }
+            if !quit {
+                return 3;
+            }
+            if frames != 1u32 {
+                return 4;
+            }
+            // The text really is on the frame. 'H' row 0 is `.##..##.`, so
+            // columns 1, 2, 5 and 6 of the glyph are lit; the text starts at
+            // x = 2, so x = 3 is the glyph's first lit pixel. The pixel beside
+            // it is *blue*, not black: `draw_text` draws the glyph's lit pixels
+            // and leaves the rest of the canvas as it found it, so a check that
+            // expected zero here would be testing a clear the program never did.
+            if std::graphics::get_pixel(
+                framebuffer.as_slice(),
+                32u32,
+                24u32,
+                3u32,
+                2u32
+            ) != white {
+                return 5;
+            }
+            if std::graphics::get_pixel(
+                framebuffer.as_slice(),
+                32u32,
+                24u32,
+                2u32,
+                2u32
+            ) != blue {
+                return 6;
+            }
+            // And the background is the other colour, so the text is not the
+            // whole frame.
+            if std::graphics::get_pixel(
+                framebuffer.as_slice(),
+                32u32,
+                24u32,
+                30u32,
+                22u32
+            ) != blue {
+                return 7;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+        script,
+    );
+    assert_eq!(exit, Some(0), "the program drew and quit: {output:?}");
+}

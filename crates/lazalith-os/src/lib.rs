@@ -8,6 +8,7 @@ pub mod display;
 mod error;
 mod filesystem;
 mod init;
+pub mod input;
 mod kernel;
 mod lzx;
 mod memory;
@@ -28,6 +29,7 @@ pub use filesystem::{
 pub use init::{
     INIT_CODE_LENGTH, INIT_EXIT_CODE, INIT_SYSCALL_NUMBER, InitImageError, build_init_image,
 };
+pub use input::InputService;
 pub use kernel::{KernelError, KernelServiceOutcome, KernelStep, LazalithKernel};
 pub use lzx::{
     LZX_ABI_VERSION, LZX_CODE_PERMISSIONS, LZX_DATA_PERMISSIONS, LZX_FORMAT_VERSION,

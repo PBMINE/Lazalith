@@ -4055,17 +4055,19 @@ pub const ABI_SYSCALLS: &[(&str, Syscall)] = &[
     ("clear_screen", Syscall::ClearScreen),
     ("display_open", Syscall::DisplayOpen),
     ("display_present", Syscall::DisplayPresent),
+    ("input_poll", Syscall::InputPoll),
 ];
 
 /// Syscall names the Lazen design reserves for a later ABI step.
 ///
-/// `docs/lazen-graphics.md` and `docs/lazen-input.md` specify these calls, but
-/// the ABI does not number them yet. The frontend accepts such a declaration
-/// and records that it is unmapped, so it never invents a syscall number.
-/// `input_poll` is the one the design reserves that the ABI still does not
-/// number: the input driver is Step 71, and numbering a call before its driver
-/// exists would give a program a number that answers with nothing.
-pub const RESERVED_DESIGN_SYSCALLS: &[&str] = &["input_poll"];
+/// `docs/lazen-graphics.md` and `docs/lazen-input.md` specified these calls
+/// before the ABI numbered them, and every one of them is numbered now. The list
+/// is kept because it is the frontend's rule for what to do with a declaration
+/// that has no number: it is accepted and recorded as unmapped, so the compiler
+/// never invents a syscall number. A name in this list is one the design has
+/// promised and the ABI has not yet delivered, and an empty list is the honest
+/// state once every promised call exists.
+pub const RESERVED_DESIGN_SYSCALLS: &[&str] = &[];
 
 /// The syscall a declared name maps to, if the ABI has one.
 pub fn abi_syscall(name: &str) -> Option<Syscall> {

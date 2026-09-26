@@ -1,4 +1,5 @@
 use crate::display::DisplayService;
+use crate::input::InputService;
 use crate::{
     DispatchOutcome, FileSystemService, KernelService, LzxArchitecture, LzxError, LzxImage,
     NativeShellImageError, ProcessError, ProcessId, RoundRobinScheduler, SchedulerError,
@@ -59,13 +60,15 @@ pub struct KernelStep {
 ///
 /// Dispatch needs *one* service to hand a validated syscall to, but a kernel has
 /// more than one: the terminal owns the console and the filesystem, the display
-/// driver owns the window. Routing them through a composite keeps `dispatch`
+/// driver owns the window, and the input driver owns the event queue. Routing
+/// them through a composite keeps `dispatch`
 /// unchanged and keeps each owner responsible for its own calls — a syscall
 /// reaching the wrong owner is a routing bug that shows up immediately as an
 /// "unknown syscall" rather than as a subtly wrong answer.
 pub struct KernelServices {
     terminal: TerminalService,
     display: DisplayService,
+    input: InputService,
 }
 
 impl KernelServices {
@@ -88,6 +91,16 @@ impl KernelServices {
     pub fn display_mut(&mut self) -> &mut DisplayService {
         &mut self.display
     }
+
+    /// The input driver, for a host adapter that feeds a script.
+    pub const fn input(&self) -> &InputService {
+        &self.input
+    }
+
+    /// The input driver, mutably, for a host adapter that feeds a script.
+    pub fn input_mut(&mut self) -> &mut InputService {
+        &mut self.input
+    }
 }
 
 impl KernelService for KernelServices {
@@ -99,6 +112,7 @@ impl KernelService for KernelServices {
         match syscall.kind() {
             ValidatedSyscallKind::DisplayOpen { .. }
             | ValidatedSyscallKind::DisplayPresent { .. } => self.display.invoke(syscall, memory),
+            ValidatedSyscallKind::InputPoll { .. } => self.input.invoke(syscall, memory),
             _ => self.terminal.invoke(syscall, memory),
         }
     }
@@ -137,6 +151,7 @@ impl LazalithKernel {
             services: KernelServices {
                 terminal: TerminalService::new(terminal, FileSystemService::new(filesystem)),
                 display: DisplayService::new(architecture),
+                input: InputService::new(),
             },
         })
     }
@@ -232,5 +247,19 @@ impl LazalithKernel {
     /// The display driver, mutably, for a host that sets a window up directly.
     pub fn display_mut(&mut self) -> &mut DisplayService {
         self.services.display_mut()
+    }
+
+    /// The input driver, for a host adapter that feeds a script of events.
+    pub const fn input(&self) -> &InputService {
+        self.services.input()
+    }
+
+    /// The input driver, mutably, for a host adapter that feeds a script.
+    ///
+    /// A Lazen program cannot reach this: the SDK's `poll` goes through
+    /// `input_poll`. A graphical host queues its events here, and a test queues
+    /// a script here, and the program cannot tell the two apart.
+    pub fn input_mut(&mut self) -> &mut InputService {
+        self.services.input_mut()
     }
 }

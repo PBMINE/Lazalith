@@ -1061,14 +1061,74 @@ impl<'a> FunctionLowering<'a> {
                         span: expr.span().clone(),
                     });
                 }
+                // A repeat is lowered as a *loop*, not as one store per element.
+                //
+                // Unrolling is the obvious translation and it is what makes a
+                // framebuffer impossible: a 320-by-200 window is 256000 bytes,
+                // and a store per byte is a code section of megabytes for an
+                // array whose contents are all the same. The loop is the same
+                // stores with a counter, and the code section stays the size of
+                // the loop rather than the size of the data.
+                if *length == 0 {
+                    return Ok(());
+                }
                 let base = self.place_address(place)?;
                 let size = element.size_in_bytes(WordWidth::W64).max(1);
                 let item = self.value(value)?;
-                for index in 0..*length {
-                    let offset = u32::try_from(index).unwrap_or(u32::MAX) * size;
-                    let address = self.add_offset(base, offset)?;
-                    self.store_to(address, item, element)?;
-                }
+                let total = self.constant(*length as i64, &Type::Usize)?;
+                let counter = self.temporary(8, Type::Usize, SlotPurpose::Local)?;
+                let zero = self.constant(0i64, &Type::Usize)?;
+                let counter_address = self.frame_address(counter)?;
+                self.store_to(counter_address, zero, &Type::Usize)?;
+
+                let blocks =
+                    self.loop_layout("repeat.test", "repeat.body", "repeat.step", "repeat.exit")?;
+                self.jump(blocks.test.id)?;
+                // The test is `counter < count`, and it comes *before* the body,
+                // so element zero is stored. Branching on the counter alone
+                // would skip it, because zero is false.
+                self.fill(&blocks.test)?;
+                let index = self.load_slot(counter, &Type::Usize)?;
+                let test = self.emit(Instruction::Compare {
+                    op: if is_signed(&Type::Usize) {
+                        ComparisonOp::LessThanSigned
+                    } else {
+                        ComparisonOp::LessThanUnsigned
+                    },
+                    left: index,
+                    right: total,
+                })?;
+                self.close(Terminator::Branch {
+                    condition: test,
+                    then_block: blocks.body.id,
+                    otherwise: blocks.exit.id,
+                })?;
+
+                self.fill(&blocks.body)?;
+                let offset = self.scale(index, size)?;
+                let address = self.emit(Instruction::Binary {
+                    op: BinaryOp::Add,
+                    left: base,
+                    right: offset,
+                    ty: IrType::Pointer,
+                })?;
+                self.store_to(address, item, element)?;
+                self.jump(blocks.step.id)?;
+
+                self.fill(&blocks.step)?;
+                let index = self.load_slot(counter, &Type::Usize)?;
+                let step = self.constant(1i64, &Type::Usize)?;
+                let next = self.emit(Instruction::Binary {
+                    op: BinaryOp::Add,
+                    left: index,
+                    right: step,
+                    ty: ir_type(&Type::Usize)?,
+                })?;
+                let counter_address = self.frame_address(counter)?;
+                self.store_to(counter_address, next, &Type::Usize)?;
+                self.jump(blocks.test.id)?;
+
+                self.fill(&blocks.exit)?;
                 Ok(())
             }
             (_, _) => {
