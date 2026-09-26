@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-27 (Steps 1–72 complete and verified)
+Last updated: 2026-09-27 (Steps 1–73 complete and verified)
 
 ## Where the roadmap stands
 
@@ -19,14 +19,16 @@ Step  68      complete: the virtual display device (9188e6a)
 Step  69      complete: the virtual input device
 Step  70      complete: the LazOS display driver and the Lazen SDK (a8da827)
 Step  71      complete: the LazOS input driver and the host adapter (38be9ca)
-Step  72      complete: the first graphical Lazen application
-Steps 73–75   NOT started. No GUI, debug, or snapshot code exists.
+Step  72      complete: the first graphical Lazen application (831c1a7)
+Step  73      complete: the first-party GUI library
+Steps 74–75   NOT started. No debug or snapshot code exists.
 ```
 
-The 757 workspace tests all pass, including the 4 in
+The 764 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
-input drivers.
+input drivers, and the 7 in `crates/lazalith-gui/tests/gui.rs` that draw with the
+widget set and read the frame back.
 
 This milestone added code generation. Steps 1–62 are unchanged except for the
 defects Step 63 found by running the generated code, each of which is listed
@@ -3594,3 +3596,119 @@ Step 73 is the **first-party GUI library** — `Window`, `Panel`, `Button`, `Lab
 nothing about SDL3. `examples/window/main.lz` is the shape of a program that would
 use it, and the open block of work is a layout and a widget set that a program
 draws with `std::graphics` rather than one that reaches past it.
+
+## Step 73 — The First-Party GUI Library
+
+`lazalith-gui` is a new crate whose whole content is the `gui` module, written in
+Lazen and composed after the standard library by `library_text`. Seven tests in
+`crates/lazalith-gui/tests/gui.rs` write Lazen programs that use it and read the
+frame the device presented. The design is written down in `docs/lazen-gui.md`.
+
+The step's claim — that the layer above the SDK is a library and the layer below
+it is a host, and neither leaks into the other — is checkable rather than
+aspirational: nothing in the 900 lines of the module names a window handle, a
+device, an event queue, or SDL3.
+
+### The ABI's six argument words shaped the whole API
+
+This is the constraint that decided every signature, and it was found the hard
+way. The first version of the library had
+
+```
+draw_label(canvas, width, height, x, y, text, colour)
+```
+
+which is **nine** argument words, and every program in the workspace stopped
+building with `calling gui::draw_label needs 9 argument words, and the ABI has
+6`. A `&mut [u8]` canvas is an address and a length; a `&str` is the same. So a
+drawing function has spent four of its six words on *what to draw on* and *what
+to write*, and has two left — which is exactly enough for a packed canvas size
+and a packed rectangle, and not for a colour as well.
+
+So the library packs its geometry, using packers the standard library already had:
+`pack_surface` for a canvas's size, `pack_rect` for a rectangle, `pack_ink` for a
+position and a colour. `draw_label(canvas, canvas_size, ink, text)` is six words,
+`draw_button(canvas, canvas_size, rect, text)` is six, and a function the compiler
+accepts is a function a program can call.
+
+Two things this cost are visible in the API rather than hidden in it. A button's
+colours are the library's, because theming one needs two words more than there
+are; a program that wants its own draws the face with `draw_panel` and the text at
+`button_label_at`, and both exist for exactly that. And `draw_canvas` blits over
+the whole destination canvas, because a source view and a destination rectangle
+are two words between them and there is no seventh.
+
+### Widgets are geometry, not objects
+
+Lazen v1 has no structs, so a widget cannot be a value with fields. There is no
+`Button` to build or store: there is a rectangle, a state word, and
+`draw_button`. The cost is real and is written down — a widget cannot carry
+behaviour, so a program that wants a button to act on release writes that itself
+— and the exchange is that a widget is three words of arguments rather than an
+allocation, with no lifetime to get wrong.
+
+### Three defects the tests found, all of them real
+
+**A menu packed a 32-bit colour beside two 16-bit fields.** `pack_menu` wanted
+items, a selection, and the bar's colour, which is 64 bits plus 32, so the
+colour and the selection *overlapped*: a menu with the second item selected read
+back its selection as zero and drew as if the colour were a very dark selection.
+The bar's colour is a drawing parameter now, and `pack_menu(items, selected)` is
+two fields that fit.
+
+**`draw_text`'s surface is the canvas, not the text.** `draw_label` passed
+`pack_surface(text_len * 8, 8)` — the string's own extent. But `draw_text` uses
+the surface as the bounds every glyph is clipped against, so passing the text's
+extent clips the text to a box at the *canvas origin*, and a label vanishes the
+moment it is placed away from (0, 0). This one is worth recording because it
+looks like a font bug and is an argument bug, and because `draw_text`'s own
+documentation says the surface is a canvas's size while its parameter name
+suggests otherwise.
+
+**The pixel layout is A, R, G, B from offset zero.** Four of the seven tests
+failed on their first run with `[0, 0, 0, 255]` where they expected opaque
+black. `rgba` packs `0xAARRGGBB`, which *read little-endian* is B, G, R, A — the
+reverse of the order the bytes are in memory. The tests now say so where the
+colours are read, because this is the mistake every reader of this file would
+otherwise make once.
+
+### The hit test and the drawing have to agree
+
+A rectangle is half-open on its far edges, so a widget at x = 0 with a width of 8
+covers columns 0 to 7. `a_button_is_clicked_exactly_where_it_is_drawn` clicks six
+points — two inside, four one pixel outside on each side — and each is its own
+program run, because `button_clicked` is a pure function of the events it is
+given. The events are *polled* rather than handed over as a zeroed array, so the
+press that is tested is one that travelled through the device, the driver and the
+ABI.
+
+### Limits
+
+- **The library is in every program.** v1 resolves names only within one unit, so
+  there is no import machinery and `library_text` appends the GUI module to
+  everything a program is compiled against, whether it uses `gui` or not. The
+  standard library has the same property and the same cost. It is worth paying
+  once and worth revisiting when v1 grows a way to import a module.
+- **A button cannot be themed through its own call**, and a menu's items are
+  rectangles rather than strings, for the reason in the section above: v1 has no
+  array of `str`, and the ABI has no seventh argument word. Both are v1 limits
+  rather than design choices, and both are written into `docs/lazen-gui.md`.
+- **A text field has no cursor.** Insertion appends and the caret is always at
+  the end. A cursor in the middle needs somewhere to put it between calls, and
+  the only place v1 offers is another out-parameter, which would make every call
+  site declare one and read it back.
+- **A widget is expensive to draw.** `put_pixel` costs about 2300 instructions on
+  this backend, so the tests use a 32-by-24 window and one-character labels. A
+  widget set for a real window needs the register allocator or the bulk memory
+  operation that `docs/lazen-graphics.md` says is missing; the library's shape
+  does not have to change when either arrives.
+
+### Next step
+
+Step 74 is the **debug API**: `DebugController` and `DebugSession`, with run,
+pause, step, continue, breakpoints, watchpoints, register and memory inspection,
+stack, disassembly, snapshot and restore — and no way for a frontend to touch CPU
+internals directly. The kernel already has the pieces a debugger needs
+(`RoundRobinScheduler` validates the active binding on every step, and
+`process_mut` from Step 72 makes guest memory readable), so the shape of the work
+is an API over what exists rather than new machinery.

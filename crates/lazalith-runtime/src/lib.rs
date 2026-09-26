@@ -46,27 +46,37 @@ pub use source::PRELUDE;
 pub use startup::{StartupError, startup_object, startup_source};
 
 /// The whole of what a program is compiled against: the runtime's own text, then
-/// the standard library's.
+/// the standard library's, then the GUI library's.
 ///
-/// The two are separate crates and separate constants because they answer
+/// The three are separate crates and separate constants because they answer
 /// different questions. `PRELUDE` is the minimum a program links: the syscall
 /// wrappers, the entry sequence's requirements, and the memory and text helpers
 /// those wrappers need. `STDLIB` is what a program *chooses* to use — `core`,
 /// `io`, `text`, `math`, `collections`, `fs`, `time`, `process` — and it is
 /// written on top of the prelude rather than beside it, so every standard library
-/// call is a call through the same wrappers a raw program would use.
+/// call is a call through the same wrappers a raw program would use. `GUI` is the
+/// first-party widget set, written on top of *both*, so a widget is a call
+/// through the standard library rather than a second path to the hardware.
 ///
 /// Keeping them apart is what lets a program opt out of the standard library. A
 /// freestanding program that wants one syscall and nothing else builds with the
 /// prelude alone, and pays for nothing it did not use.
+///
+/// The GUI library is appended for the same reason the standard library is, and
+/// with the same cost: v1 resolves names only within one unit, so there is no
+/// import machinery and every program carries the code for all of it. That is a
+/// price worth paying once, and it is a price to revisit when v1 grows a way to
+/// import a module rather than when it grows another module.
 pub fn library_text() -> String {
     use alloc::string::String as StdString;
     let mut text = StdString::from(PRELUDE);
-    if !text.ends_with('\n') {
+    for part in [lazalith_stdlib::STDLIB, lazalith_gui::GUI] {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
         text.push('\n');
+        text.push_str(part);
     }
-    text.push('\n');
-    text.push_str(lazalith_stdlib::STDLIB);
     text
 }
 

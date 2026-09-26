@@ -83,6 +83,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazalith-gui"
+version = "0.1.0"
+dependencies = [
+ "lazalith-boot",
+ "lazalith-cpu",
+ "lazalith-devices",
+ "lazalith-isa",
+ "lazalith-os",
+ "lazalith-runtime",
+ "lazalith-types",
+]
+
+[[package]]
 name = "lazalith-ir"
 version = "0.1.0"
 dependencies = [
@@ -149,6 +162,7 @@ dependencies = [
  "lazalith-compiler",
  "lazalith-cpu",
  "lazalith-devices",
+ "lazalith-gui",
  "lazalith-isa",
  "lazalith-machine",
  "lazalith-memory",

@@ -1,0 +1,27 @@
+[package]
+name = "lazalith-gui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "The Lazen GUI library, as Lazen source"
+license = "MIT OR Apache-2.0"
+
+# The library itself has no dependencies, for the same reason
+# `lazalith-stdlib` has none: the library is *text*, and this crate exists only
+# to hold it. Whatever composes the text with the prelude and the standard
+# library does that in `lazalith-runtime`, and depending on the runtime here
+# would make the two crates depend on each other.
+#
+# The test dependencies are the opposite: a widget set that was only ever
+# type-checked is a widget set nobody has seen draw.
+[dev-dependencies]
+lazalith-boot = { path = "../lazalith-boot" }
+lazalith-cpu = { path = "../lazalith-cpu" }
+lazalith-devices = { path = "../lazalith-devices" }
+lazalith-isa = { path = "../lazalith-isa" }
+lazalith-os = { path = "../lazalith-os" }
+lazalith-runtime = { path = "../lazalith-runtime" }
+lazalith-types = { path = "../lazalith-types" }
+
+[lints]
+workspace = true
