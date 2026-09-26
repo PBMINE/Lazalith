@@ -2,11 +2,12 @@
 
 This document is Step 52 of the roadmap: it fixes a candidate syntax by writing
 real example programs *before* any parser exists. The examples are the
-specification. Every program in this file is reused as a parser and resolver
-test fixture in `crates/lazalith-compiler/tests/sources/`, so the syntax cannot
+specification. Every program in this file is a test fixture in
+`crates/lazalith-compiler/tests/documented_examples.rs`, so the syntax cannot
 drift silently away from the documentation.
 
-No parser is implemented in this step. The compiler arrives in Step 61.
+The parser was written in Step 61, from this document rather than from any
+existing code.
 
 ## Notation
 
@@ -15,6 +16,11 @@ Types and keywords are lowercase. `//` starts a line comment; `/* */` is
 deliberately **not** supported in v1, so that comment handling cannot diverge
 between the lexer, the documentation, and the compiler.
 
+A string literal contains raw bytes with exactly six escapes: `\n`, `\r`, `\t`,
+`\0`, `\\`, and `\"`. There is no `\u`, no `\x`, and no octal or decimal escape,
+because each of those needs a decoding rule the compiler would then have to
+agree with the standard library about. A string literal may not span a line.
+
 ## 1. Hello world
 
 ```lazen
@@ -22,7 +28,8 @@ extern "syscall" fn write(fd: i32, buffer: &[u8], length: u64, result: ptr<u8>) 
 
 fn main() -> i32 {
     let message = "Hello, Lazalith\n";
-    write(1, message.as_bytes());
+    let bytes = message.as_bytes();
+    write(1, bytes, message.len() as u64, bytes.as_ptr());
     0
 }
 ```
@@ -31,6 +38,11 @@ fn main() -> i32 {
 argument order exactly; the compiler maps the name to the shared
 `lazalith_os_abi::Syscall` value and refuses a declaration whose arity exceeds
 the ABI's own argument count.
+
+A call must pass exactly the declared arguments, no more and no fewer. There is
+no default argument and no partial call: a call that omits an argument is a
+`T0004` arity error, because filling in a value the program did not write would
+be a guess.
 
 ## 2. Variables
 
@@ -53,6 +65,10 @@ fn main() -> i32 {
 Types are inferred where unambiguous, and an explicit type is allowed where it
 aids the reader. `mut` is required to assign after declaration; omitting it is a
 semantic error, not a warning.
+
+Lazen v1 has no floating-point type, so the `1.5` above is rejected with
+`T0103 float literals are not part of Lazen v1`. Every other line in this
+example is valid.
 
 ## 3. Functions
 
@@ -320,8 +336,16 @@ platform whose heap is not yet served.
 
 ## 14. How these examples are validated
 
-Every program in this document is a test fixture. `crates/lazalith-compiler`'s
-lexer, parser, and resolver tests parse these sources, and its type checker
-tests use them for both acceptance and rejection cases. A change to the grammar
-requires changing this document in the same commit, which keeps the
-specification and the implementation in agreement.
+Every program in this document is a test fixture.
+`crates/lazalith-compiler/tests/documented_examples.rs` compiles each of them
+through the real frontend, and rejects each documented omission with the code
+this document names. A change to the grammar requires changing this document in
+the same commit, which keeps the specification and the implementation in
+agreement.
+
+Where this document and the compiler disagreed while the compiler was being
+written, this document was corrected rather than the compiler, because a
+specification that cannot compile is not a specification. The three corrections
+were: section 1's call now passes all four arguments its declaration names,
+section 7's `u32` parameter is given a `u32` binding, and the notation section
+now specifies the six string escapes the examples rely on.

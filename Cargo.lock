@@ -18,6 +18,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazalith-compiler"
+version = "0.1.0"
+dependencies = [
+ "lazalith-diagnostics",
+ "lazalith-ir",
+ "lazalith-isa",
+ "lazalith-os-abi",
+ "lazalith-types",
+]
+
+[[package]]
 name = "lazalith-cpu"
 version = "0.1.0"
 dependencies = [

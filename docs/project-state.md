@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-25 (Steps 1–60 verified; Steps 61–75 not started)
+Last updated: 2026-09-26 (Steps 1–61 verified; Steps 62–75 not started)
 
 ## Where the roadmap stands
 
@@ -33,6 +33,50 @@ records, and no `match`, with the reason for each exclusion. That decision was
 made *because* of the failed attempt, and it is the right one: every remaining
 step depends on a type system and a lowering pass that can be audited, and a
 closed v1 type set is what makes that possible.
+
+# Lazalith — Project State
+
+Last updated: 2026-09-26 (Steps 1–61 verified; Steps 62–75 not started)
+
+## Where the roadmap stands
+
+```text
+Steps 1–50    complete, audited, repaired, verified, committed (31dbf86)
+Steps 51–59   complete: the Lazen design cluster (documentation only)
+Step  60      complete: lazalith-ir, the shared low-level IR (66d29cf)
+Step  61      complete: lazalith-compiler, the Lazen frontend
+Steps 62–75   NOT started. No lowering, code generation, runtime, driver, GUI,
+              or debug code exists.
+```
+
+This milestone added the Lazen frontend. Steps 1–60 are unchanged and still
+pass; the 181 new tests in `crates/lazalith-compiler` and the 533 workspace tests
+all pass, and the frontend compiles every program in `docs/lazen-syntax.md`.
+
+### What deliberately did not land
+
+An attempt was made to carry Steps 61–63 in the Step 60 milestone. The frontend
+reached a working lexer, a recursive-descent parser, and a name resolver, but
+the type checker and lowering pass were drafted against a larger language than
+the milestone could finish and verify, and the drafted lowering was itself
+unsound (it treated a function-address intrinsic as a frame pointer, lowered
+`continue` to `unreachable`, and dropped slice lengths). Rather than commit code
+that compiles-but-is-wrong, or leave a non-compiling crate in the tree, the
+compiler crate was removed and that milestone was closed at Step 60.
+
+The consequence for the design documents is that they now describe the language
+that will actually be built, not a larger one: `docs/lazen-syntax.md` and
+`docs/lazen-types.md` record that Lazen v1 has no `optional`, no enums, no
+records, and no `match`, with the reason for each exclusion. That decision was
+made *because* of the failed attempt, and it is the right one: every remaining
+step depends on a type system and a lowering pass that can be audited, and a
+closed v1 type set is what makes that possible.
+
+Step 61 was then rebuilt from the documents rather than from the deleted code,
+and the three mistakes that made the attempt unsound are now structural: the
+frontend emits frame *offsets* and never a frame pointer, it records a slice or a
+`str` as both a pointer and a length, and it has no lowering at all, so none of
+those decisions can be wrong yet.
 
 ## Steps 51–60 Dependency Map and Entry Points
 
@@ -168,28 +212,183 @@ grammar. The graphics and input documents specify contracts for the ABI calls
 that Steps 68–71 will implement; the Step 75 audit must check that the documents
 and the implementation agree.
 
+## Step 61 — Lazen Compiler Frontend
+
+`crates/lazalith-compiler` is the Lazen frontend: lexer, parser, AST, resolver,
+type checker, and semantic analysis. It is `no_std` with `unsafe_code = forbid`,
+depends only on `lazalith-types`, `lazalith-diagnostics`, `lazalith-ir`,
+`lazalith-isa`, and `lazalith-os-abi`, and it is headless: no SDL, no runtime, no
+code generation, no machine execution, and no filesystem access.
+
+```text
+source -> lexer -> parser -> AST -> resolver -> type checker -> CheckedProgram
+```
+
+Every failure is a shared `lazalith_diagnostics::Diagnostic` with a stable code, a
+real `SourceSpan`, and the shared `SourceManager`. There is no second diagnostic
+architecture, and no path from source text to a panic.
+
+| File | Contents |
+| --- | --- |
+| `src/lib.rs` | crate documentation, the pipeline map, the public surface |
+| `src/diagnostic.rs` | `StageError`, `CompileError`, the code helper, the renderer bridge |
+| `src/lexer.rs` | tokens, spans, integer suffixes, and every lexical diagnostic |
+| `src/ast.rs` | the typed syntax tree; every node that came from source carries a span |
+| `src/parser.rs` | recursive descent over the documented grammar |
+| `src/resolve.rs` | modules, visibility, imports, scopes, duplicates |
+| `src/types.rs` | the closed v1 type set, every typing rule, the checked program |
+| `src/frontend.rs` | `compile`, the one entry point, which stops at the first failure |
+
+### Diagnostic codes
+
+| Range | Stage | Example |
+| --- | --- | --- |
+| `L0xxx` | lexer | `L0103` a float literal, `L0101` a block comment, `L0113` an unknown escape |
+| `P0xxx` | parser | `P0001` a missing token, `P0100` a `struct`, `P0108` the `?` operator |
+| `N0xxx` | resolution | `N0001` an unknown name, `N0002` a duplicate item, `N0004` a private item |
+| `T0xxx` | types | `T0001` a mismatch, `T0006` an immutable assignment, `T0011` a forbidden cast |
+
+### Decisions recorded in the crate
+
+- **The v1 type set is closed, and the checker is the only place that knows it.**
+  `bool`, `i8`–`i64`, `u8`–`u64`, `usize`, `str`, `&str`, `ptr<T>`, `&[T]`,
+  `&mut [T]`, and `[T; N]`. `optional`, enums, records, and `match` have no
+  representation here at all, so a program that needs one is rejected by name.
+- **`str` and `&str` are one type.** A `str` is already a pointer and a length,
+  so a reference to it would add nothing.
+- **Only a conditional with an `else` can be a value.** Without one there is no
+  value when the condition is false, so the parser records it as a statement, and
+  a statement that ends in a value is a `T0015` discarded-value error.
+- **A raw pointer is never dereferenced.** `ptr<T>` carries no length, so a
+  dereference could not be bounds checked, and v1 has no `unsafe` in which to
+  justify one. `*p` on a `ptr<T>` is `T0010` with that reason.
+- **A value conditional may not bind a name in an arm** (`T0027`). Step 61 records
+  a value conditional's arms without a frame of their own, so a name bound there
+  would have no slot; rather than invent one, the construct is rejected. Step 62
+  allocates slots when it lowers the arms and can lift this.
+- **Inference is narrow on purpose.** An integer literal takes its type from
+  context, or `i32` when it has none; a literal suffix fixes it; a literal that
+  does not fit is `T0017`, never a truncation. Nothing else is inferred and no
+  conversion is implicit, which is why a program that mixes widths says `as`.
+- **A negated literal is range-checked as the negative value it is.** `-128i8` is
+  the minimum value and is valid; `-1u8` is an error. The literal's digits alone
+  are not what the value is.
+- **The builtin methods are a closed set**: `len`, `as_bytes`, `as_slice`,
+  `as_mut_slice`, and `as_ptr`. There are no traits, so an unknown method is
+  rejected with the list of valid ones for the receiver's type.
+- **A frame slot has a number and a byte offset; the frame has no pointer here.**
+  Offsets are data Step 62 needs, computed from the target's word size. The frame
+  *base* is the machine's own stack pointer; the frontend never fabricates one,
+  which is the mistake that made the deleted attempt unsound.
+- **An extern declaration is checked against the shared ABI, and a reserved name
+  carries no number.** `write` and `close` map to `lazalith_os_abi::Syscall`
+  values; `display_open`, `display_present`, and `input_poll` are the calls the
+  graphics and input documents specify, and they are accepted with
+  `syscall: None` because the ABI does not number them yet. A test asserts the
+  name table covers `Syscall::ALL` exactly, so a new ABI syscall cannot slip in
+  unresolvable.
+- **Every documented omission is rejected by name**, with the reason and a
+  pointer to section 13 of `docs/lazen-syntax.md`: records, enums, `match`,
+  `optional`, `some`/`none`, traits, `impl`, `type`, `unsafe`, `?`, `self`, block
+  comments, float literals, `for` over a collection, and the `*T` pointer type.
+
+### Bugs found and fixed while building this step
+
+Each of these was found by a test in this crate, not by inspection:
+
+- The lexer skipped trivia only before the first token, so every token after
+  whitespace was reported as an unknown character.
+- `&mut` was matched without an identifier boundary, so `&mutate` lexed as `&mut`
+  followed by `ate`.
+- A string literal advanced one byte at a time, which split a multi-byte UTF-8
+  character and panicked.
+- `0..10` was lexed as a float literal; a `.` after digits is a float only when a
+  digit follows it.
+- `parse_arguments` consumed the closing parenthesis and its caller expected it
+  again, so no call with an argument list parsed.
+- A cast bound looser than a unary operator, so `&mut handle as ptr<u32>` parsed
+  as `&mut (handle as ptr<u32>)` and was rejected as an unassignable place.
+- `parse_if_arms` consumed `else` and then advanced again, skipping the `{`, so
+  every `if`/`else` failed to parse.
+- A statement's tail-or-statement decision was made from the token *before* the
+  expression, so `f(1);` in a block was taken as a tail and the next `;` was a
+  parse error.
+- Compound assignment was consumed as an addition followed by an `=`.
+- The root module was not in the module map, so no top-level function, extern, or
+  const was ever checked.
+- Name lookup walked every path segment but the last as a module, so
+  `geometry::area` never resolved.
+- Names were looked up only in the root module, so a function could not call a
+  private sibling of its own module, and a `use` alias broke parameter lookup.
+- A conditional used as a value re-checked its arms with an empty scope and a
+  fresh slot allocator, so a name in an arm resolved to nothing and a binding
+  would have been given a slot that collided with the function's.
+- A `&mut [T]` parameter could not be written through, because the parameter
+  binding itself is immutable even though the data it points at is not.
+- `values.as_mut_slice()[0] = 1` was rejected as an unassignable place; the view
+  now resolves to the array it points at.
+- A literal in a context expecting a different type was accepted, so `[1, "two"]`
+  compiled.
+- A call's result was never compared with the type its context required, so
+  `fn f() -> i64` satisfied a `-> i32` function.
+- An integer literal with a context was defaulted to `i32` inside a comparison, so
+  `f() == 0` failed for an `f() -> i64`.
+- A loop's depth was lost when a loop body's last statement was a conditional, so
+  `continue` inside `loop { if c { continue; } }` was rejected.
+- `&mut` used as a name prefix was not reported, and `match`, `some`, and `none`
+  parsed as ordinary names.
+
+### Tests
+
+| File | Tests | Covers |
+| --- | --- | --- |
+| `tests/lexer.rs` | 25 | every token family, spans, boundaries, every lexical diagnostic |
+| `tests/parser.rs` | 35 | every type form, precedence and associativity, tail versus statement, delimiter errors, EOF, nesting limits |
+| `tests/resolver.rs` | 23 | duplicates, scopes, shadowing, visibility, `use`, paths |
+| `tests/typecheck.rs` | 56 | one positive and one negative case per rule, plus source locations |
+| `tests/documented_examples.rs` | 36 | every program in `docs/lazen-syntax.md`, and every documented omission |
+| `tests/smoke.rs` | 6 | the pipeline, frame layout per target, and 60 malformed programs that must not panic |
+
+181 tests in the crate; 533 in the workspace, all passing. The earlier 352
+tests pass unchanged.
+
+### Specification corrections
+
+Building the frontend found three places where the documents contradicted
+themselves. The documents were corrected, because the repository is the source of
+truth and a specification that cannot compile is not a specification:
+
+- Section 1 called `write` with two arguments against its own four-argument
+  declaration. It now passes all four, and the document states that a call must
+  pass exactly the declared arguments.
+- Section 7 passed an `i32` literal to a `u32` parameter. It now annotates the
+  binding, because v1 has no implicit conversion.
+- The notation section did not say whether strings have escapes, while the
+  examples used `\n`. The six v1 escapes are now specified, and the float
+  literal in section 2 is marked as the rejection it is, with its code.
+
+### Remaining limitations
+
+- A value conditional cannot bind a name in an arm (`T0027`), as recorded above.
+- `display_open`, `display_present`, and `input_poll` are accepted but carry no
+  syscall number until the ABI step that adds them.
+- There is no `lazen.toml` reading, no package resolution, and no module file
+  loading: Step 61 compiles one file, which is what the roadmap asks for. The
+  manifest and package rules of `docs/lazen-applications.md` and
+  `docs/lazen-modules.md` are Step 66's work.
+- A `while true { }` is not a way to spell an infinite loop; `loop { }` is, and a
+  function whose body is a `loop` with no `break` satisfies its result type.
+- `aarch64-linux` remains untested.
+
 ## Next step
 
-Step 61, the Lazen compiler frontend, in this order and with these tests:
-
-1. `crates/lazalith-compiler` crate, `no_std`, depending on `lazalith-types`,
-   `lazalith-diagnostics`, `lazalith-ir`, `lazalith-isa`, `lazalith-os-abi`, and
-   `lazalith-toolchain`. Diagnostics go through the shared `Diagnostic`,
-   `SourceManager`, and `SourceSpan`; no compiler-specific string formatting.
-2. Lexer with a span on every token, the escapes in
-   `docs/lazen-syntax.md`, and rejection of block comments, unterminated strings,
-   and malformed integer literals.
-3. Parser producing the AST in `docs/lazen-syntax.md`, error-tolerant so one
-   mistake yields one diagnostic.
-4. Resolver building a flat, fully qualified symbol table, rejecting duplicates,
-   private imports, and unknown import targets, each with a "first defined here"
-   note.
-5. Type checker for the closed v1 type set, producing frame slot offsets and the
-   ten rules from `docs/lazen-types.md`, each with a test that names the rule.
-
-Step 62 then lowers that output into `lazalith-ir`, and Step 63 generates
-instructions and a `.lzo` through the existing `ObjectBuilder`, so the linker,
-the `.lzx` emitter, and the loader are reused rather than reimplemented.
+Step 62 lowers the checked program into `lazalith-ir`. The lowering consumes
+`CheckedProgram` and produces an `IrModule` for the Step 60 verifier, keeping the
+boundary honest: the frontend's frame offsets are data, the IR's blocks and
+terminators are control flow, and no stage may invent a value the previous one did
+not produce. In particular, a `&[T]` must lower as a pointer *and* a length, a
+`str` as a pointer and a length, a `ptr<T>` as one word, and a frame as slots
+addressed from the machine's stack pointer.
 
 ## Steps 1–50 Retrospective Audit and Repair
 
@@ -372,9 +571,11 @@ symbols, ordering, alignment, dword width, BSS, and unknown symbols.
 Full workspace Rust formatting, strict Clippy, check, and all-target tests pass
 with 334 tests and zero doctests after the retrospective repair pass. Current
 Rust source/test line count is 39,404 at that milestone; the workspace now
-holds 352 tests and 41,839 lines after Steps 51-60, whose build output is
+holds 352 tests and 41,839 lines after Steps 51-60, whose build output was
 `/nix/store/b5wqs8lpgjh0sv24vvc23jlvzlr81l38-lazalith-foundations-0.1.0`.
-The Nix build at the end of that repair pass was
+After Step 61 the workspace holds 533 tests and 53,060 lines, with build output
+`/nix/store/69dg0yxw0a7gxab0a282azgpnaafg2rg-lazalith-foundations-0.1.0`.
+The Nix build at the end of the Steps 26-50 repair pass was
 `/nix/store/mkvdplx6wsyb28878jlpbakjk7nvdsfa-lazalith-foundations-0.1.0`.
 aarch64-linux remains untested. The Steps 26–50 audit repaired linker BSS
 alignment accounting, made syscall-admission identity structurally

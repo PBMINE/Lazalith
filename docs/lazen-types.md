@@ -131,3 +131,32 @@ The checker enforces these rules, and each has a test:
 - Because there is no tagged union, a `match` lowering does not exist yet, and
   adding enums later is a change confined to the type table, the checker, and one
   lowering case.
+
+## What Step 61 made concrete
+
+The type checker in `crates/lazalith-compiler` implements this document exactly,
+and four rules that the document left open are now decided. Each is enforced by
+a test in `crates/lazalith-compiler/tests/typecheck.rs`.
+
+| Question | Answer | Why |
+| --- | --- | --- |
+| Is `&str` a separate type from `str`? | no | a `str` is already a pointer and a length, so a reference adds nothing; the two spellings name one type |
+| Can a `ptr<T>` be dereferenced? | no | it carries no length, so a read could not be bounds checked, and v1 has no `unsafe`; take a `&[T]` view instead |
+| Which casts exist? | integer to integer, reference to `ptr<T>`, `ptr<T>` to integer, integer to `ptr<T>`, and any type to itself | each is a machine operation with an exact meaning; a slice, array, or `str` cannot become an integer |
+| How is a `&mut [T]` parameter written through? | by indexing it | the parameter binding is immutable, but the data the reference points at is not, so mutability comes from the view's type rather than from the binding |
+
+Two more rules came out of writing the checker:
+
+- **An integer literal is range-checked as the value it will be.** `-128i8` is the
+  minimum value and is valid; `-1u8` is an error. The digits alone are not the
+  value.
+- **A conditional used as a value may not bind a name in an arm.** Step 61 records
+  a value conditional's arms without a frame of their own, so a name bound there
+  would have no slot to live in. Rather than invent one, the construct is
+  rejected. Step 62 allocates slots when it lowers the arms into the enclosing
+  frame and can lift this restriction.
+
+The type set is closed in the implementation as well as in this document: the
+checker has no representation for `optional`, an enum, a record, or `match`, so
+each of them is rejected by name with the reason from the table above rather than
+approximated.
