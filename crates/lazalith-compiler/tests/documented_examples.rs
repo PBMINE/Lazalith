@@ -64,12 +64,13 @@ fn label_position(rendered: &str) -> (u32, u32) {
 fn section_1_hello_world() {
     let program = accepts(
         r#"
-extern "syscall" fn write(fd: i32, buffer: &[u8], length: u64, result: ptr<u8>) -> i64;
+extern "syscall" fn write(fd: i32, buffer: ptr<u8>, length: u64, result: ptr<u8>) -> i64;
 
 fn main() -> i32 {
     let message = "Hello, Lazalith\n";
     let bytes = message.as_bytes();
-    write(1, bytes, message.len() as u64, bytes.as_ptr());
+    let mut result = [0u8; 16];
+    write(1, bytes.as_ptr(), message.len() as u64, result.as_ptr());
     0
 }
 "#,
@@ -91,7 +92,7 @@ fn main() -> i32 {
 fn section_1_a_call_must_pass_every_argument() {
     let rendered = rejects_with(
         r#"
-extern "syscall" fn write(fd: i32, buffer: &[u8], length: u64, result: ptr<u8>) -> i64;
+extern "syscall" fn write(fd: i32, buffer: ptr<u8>, length: u64, result: ptr<u8>) -> i64;
 
 fn main() -> i32 {
     write(1, 0);
@@ -510,7 +511,7 @@ fn section_7_duplicate_items_are_rejected() {
 fn section_8_pointers() {
     let program = accepts(
         r#"
-extern "syscall" fn write(handle: i32, buffer: &[u8], length: u64, result: ptr<u8>) -> i64;
+extern "syscall" fn write(handle: i32, buffer: ptr<u8>, length: u64, result: ptr<u8>) -> i64;
 
 fn main() -> i32 {
     let message = "Hello, Lazalith\n";
@@ -521,7 +522,7 @@ fn main() -> i32 {
     }
     let mut scratch = [0u8; 16];
     scratch[0] = 65;
-    write(1, bytes, message.len() as u64, scratch.as_mut_slice().as_ptr());
+    write(1, bytes.as_ptr(), message.len() as u64, scratch.as_mut_slice().as_ptr() as ptr<u8>);
     0
 }
 "#,
@@ -536,7 +537,7 @@ fn section_8_a_raw_pointer_is_not_dereferenced() {
     // `ptr<T>` carries no length and there is no `unsafe`.
     let rendered = rejects_with(
         r#"
-extern "syscall" fn write(handle: i32, buffer: &[u8], length: u64, result: ptr<u8>) -> i64;
+extern "syscall" fn write(handle: i32, buffer: ptr<u8>, length: u64, result: ptr<u8>) -> i64;
 
 fn main() -> i32 {
     let message = "hi";
@@ -574,19 +575,19 @@ fn section_8_a_reference_to_an_array_points_at_as_slice() {
 fn section_9_errors_are_integer_statuses() {
     let program = accepts(
         r#"
-extern "syscall" fn open(path: &[u8], path_length: u64, flags: u32, handle: ptr<u32>) -> i64;
-extern "syscall" fn read(handle: u32, buffer: &[u8], length: u64, result: ptr<u8>) -> i64;
+extern "syscall" fn open(path: ptr<u8>, path_length: u64, flags: u32, handle: ptr<u32>) -> i64;
+extern "syscall" fn read(handle: u32, buffer: ptr<u8>, length: u64, result: ptr<u8>) -> i64;
 extern "syscall" fn close(handle: u32) -> i64;
 
 fn read_first_byte(path: &str) -> i32 {
     let mut handle: u32 = 0;
-    let status = open(path.as_bytes(), path.len() as u64, 1, &mut handle as ptr<u32>);
+    let status = open(path.as_ptr(), path.len() as u64, 1, &mut handle as ptr<u32>);
     if status != 0 {
         return -1;
     }
     let mut buffer = [0u8; 256];
     let mut result = [0u8; 16];
-    let read_status = read(handle, buffer.as_slice(), 256, result.as_ptr());
+    let read_status = read(handle, buffer.as_slice().as_ptr(), 256, result.as_ptr());
     let _ = close(handle);
     if read_status != 0 {
         return -2;
