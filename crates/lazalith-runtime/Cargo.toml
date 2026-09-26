@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 lazalith-compiler = { path = "../lazalith-compiler" }
 lazalith-codegen = { path = "../lazalith-codegen" }
+lazalith-stdlib = { path = "../lazalith-stdlib" }
 lazalith-os = { path = "../lazalith-os" }
 lazalith-toolchain = { path = "../lazalith-toolchain" }
 lazalith-types = { path = "../lazalith-types" }

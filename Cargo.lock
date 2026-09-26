@@ -153,7 +153,20 @@ dependencies = [
  "lazalith-machine",
  "lazalith-memory",
  "lazalith-os",
+ "lazalith-stdlib",
  "lazalith-toolchain",
+ "lazalith-types",
+]
+
+[[package]]
+name = "lazalith-stdlib"
+version = "0.1.0"
+dependencies = [
+ "lazalith-boot",
+ "lazalith-devices",
+ "lazalith-isa",
+ "lazalith-os",
+ "lazalith-runtime",
  "lazalith-types",
 ]
 

@@ -27,8 +27,8 @@ use lazalith_cpu::Privilege;
 use lazalith_devices::{DeviceManager, NoDevice};
 use lazalith_isa::{Instruction, Opcode, encode};
 use lazalith_os::{
-    KernelServiceOutcome, LazalithKernel, LzxImage, ProcessId, ProcessState, ThreadId,
-    VirtualFileSystem, VirtualTerminal,
+    KernelError, KernelServiceOutcome, LazalithKernel, LzxImage, ProcessId, ProcessState,
+    SchedulerError, ThreadId, VirtualFileSystem, VirtualTerminal,
 };
 use lazalith_types::{ArchitectureConfig, InstructionAddress};
 
@@ -330,9 +330,19 @@ fn boot_and_run(
 
     let mut exit_code = None;
     for _ in 0..STEP_BUDGET {
-        let step = kernel
-            .step(&mut machine)
-            .map_err(|error| CliError::Refused(error.to_string()))?;
+        // A program that has exited leaves nothing to step. That is the normal end
+        // of a run, not a failure, so it ends the loop — the status was recorded on
+        // the step before. A scheduler that says so with *nothing* exited is a real
+        // problem and falls through to the error below.
+        let step = match kernel.step(&mut machine) {
+            Ok(step) => step,
+            Err(KernelError::Scheduler(SchedulerError::NoRunnableProcess))
+                if exit_code.is_some() =>
+            {
+                break;
+            }
+            Err(error) => return Err(CliError::Refused(error.to_string())),
+        };
         match step.outcome {
             Some(KernelServiceOutcome::Exit(code)) => {
                 exit_code = Some(code);

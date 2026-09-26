@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-26 (Steps 1–66 complete and verified)
+Last updated: 2026-09-26 (Steps 1–67 complete and verified)
 
 ## Where the roadmap stands
 
@@ -13,13 +13,14 @@ Step  62      complete: lowering from the checked tree to lazalith-ir
 Step  63      complete: code generation to a Lazalith object (bb0439b)
 Step  64      complete: lazalith-runtime, the runtime a program links against (7ada7f9)
 Step  65      complete: the first Lazen program, end to end under LazOS (0910c76)
-Step  66      complete: the lazen command-line toolchain
-Steps 67–75   NOT started. No stdlib, driver, GUI, or debug code exists.
+Step  66      complete: the lazen command-line toolchain (a699c5d)
+Step  67      complete: the first Lazen standard library
+Steps 68–75   NOT started. No driver, GUI, or debug code exists.
 ```
 
 This milestone added code generation. Steps 1–62 are unchanged except for the
 defects Step 63 found by running the generated code, each of which is listed
-under its own heading below. The 630 workspace tests all pass, including 22 in
+under its own heading below. The 648 workspace tests all pass, including 24 in
 `crates/lazalith-codegen/tests/codegen.rs` that run generated code on the real
 machine and compare what it wrote and what it exited with, and 10 in
 `crates/lazalith-runtime/tests/runtime.rs` that do the same for a whole program
@@ -785,13 +786,116 @@ inside the user's file and not shifted by the library; `two_files_are_refused`
 guards against silently checking one file of two; `fmt_is_refused_with_a_reason`
 guards against a `fmt` that does nothing and claims success.
 
+## Step 67 — The First Lazen Standard Library
+
+`crates/lazalith-stdlib` holds the library as **Lazen source**, for the same
+reason the runtime's wrappers are text: a standard library that was generated code
+could disagree with the compiler about what the language means. It goes through the
+same frontend, lowering and code generation as a user program.
+
+The eight modules the roadmap names, and nothing more:
+
+```text
+core          integers, checked arithmetic, the status convention
+io            console and reading from a handle
+text          str and byte questions, and decimal formatting
+math          integer arithmetic, no floating point
+collections   fixed-capacity buffers and stacks over caller memory
+fs            open, close, read, write, seek, stat, list
+time          the clock and sleeping
+process       spawn and wait
+```
+
+The rule the roadmap states — *only add APIs the OS actually supports* — is
+enforced by the fourteen numbered syscalls. There is no networking because there
+is no socket syscall, no threads because there is no thread syscall, and
+`collections` means fixed-capacity containers over caller memory because
+`allocate` returns an address a v1 program cannot name as a slice. A `Vec` that
+quietly allocated would be a lie about what a program is linked against.
+
+### The conventions, and why they are what they are
+
+**A fallible call writes its value out and returns a status.** Lazen v1 has no
+tuples, no `Result` and no enums, so `(value, ok)` is not a type a function can
+return. Each such function takes a `&mut [u8]` the value goes into and returns
+`i64`: zero for success, negative for the ABI's error. This is the ABI's own
+convention rather than a library invention, so there is one shape to learn and it
+is the one the hardware already uses. It is also *necessary* rather than merely
+convenient: a handle of 0 is legitimate, so returning 0 for "failed" would be
+indistinguishable from opening the first file.
+
+**The prelude and the standard library are separate, and both are linked by
+default.** `BuildOptions::lz64` composes both; `BuildOptions::freestanding`
+composes only the prelude. That is what keeps the two honest — a bug in `std`
+cannot make a runtime test pass, and a bug in the runtime cannot make a `std` test
+pass. `a_freestanding_program_needs_no_standard_library` proves the smaller build
+still runs.
+
+### Five language and compiler changes this step forced
+
+Building a real library exposed five gaps, each of which produced a *wrong answer*
+rather than a refusal:
+
+- **A narrow parameter was stored a whole word wide.** `f(a: u32, b: u32)` put
+  `b` four bytes after `a`, and storing eight bytes for `a` wrote over `b`'s slot.
+  The smallest failing case was two narrow parameters, not one, and the symptom
+  was a *missing* value rather than a corrupt one.
+- **A view could not be returned.** A view is two words and the convention only
+  had `r0`. The return path now uses `r0` and `r1`, and the caller *stores* both
+  into the result's slot — reading them from registers would break any expression
+  that returns a view in the middle of a larger one.
+- **A nested module could not use a root-absolute path.** `rt::memory::copy`
+  inside `rt::sys` was looked for as `rt::sys::rt::memory`, so deeply nested
+  libraries were impossible to write without a `use` at every level.
+- **A view of memory at an address could not be expressed.** `ptr<T>` is
+  deliberately not dereferenceable, so a program that received an address from the
+  OS had no way to index it. Two builtins were added: `slice_from_raw` and
+  `slice_from_raw_mut`, each taking the length the caller states.
+- **Bytes could not be offered as text.** `str` is a *checked* UTF-8 byte string,
+  and there was no route from arbitrary bytes to one, so a program reading a file
+  could not tell text from noise. The `as_str` builtin is that route, and it
+  *checks* — the validator lives in the prelude as `rt::utf8::valid`, because a
+  Lazen program could not write the check itself.
+
+The UTF-8 validator is the most careful code in the step. It refuses overlong
+encodings and surrogates, because an implementation that only checked the *shape*
+would accept `0xC0 0x80` for `U+0000` and `0xED 0xA0 0x80` for `U+D800` — both of
+which spell a character that also has another spelling, and any comparison between
+two spellings of one character has to fail. Two tests guard this from both sides:
+`text_refuses_overlong_and_surrogate_encodings` and
+`text_accepts_the_characters_next_to_the_refused_ones`, so the ranges cannot be
+fixed by being made too tight.
+
+### Tests
+
+16 end-to-end tests in `crates/lazalith-stdlib/tests/stdlib.rs`. Each builds a
+program that uses the library through its **public** names — `std::text::len`,
+not `rt::mem::equals` — runs it under LazOS, and checks the exit code. A library
+whose own tests reach past its API is not being tested at the interface it offers.
+
+Two regression tests were added to `crates/lazalith-codegen/tests/codegen.rs` for
+the codegen defects above, and both were **verified to fail when the fix is
+reverted** — the narrow-parameter one and the two-word-result one.
+
+### Limits
+
+- `fs::open`, `read`, `write`, `seek`, `size`, `process::spawn` and `wait` are
+  implemented and type-check, and are exercised by the OS's own syscall tests
+  rather than by a Lazen program here. A stdlib test for them needs a filesystem
+  with known contents, which the virtual filesystem provides but no stdlib test
+  populates yet.
+- `text` has no `split` or `trim`. Both are expressible in the closed type set,
+  and both are omitted rather than approximated: a `split` that returned a
+  borrowed sub-view would need sub-view syntax v1 does not have, and returning
+  indices instead is a different function with a different name.
+- `math` has no floating point, and will not until the ISA has it.
+
 ## Next step
 
-Step 67 is the first Lazen standard library — `core`, `io`, `text`, `math`,
-`collections`, `fs`, `time`, `process` — with the rule that only APIs the OS
-actually supports may be added. The numbered syscalls are the boundary: fourteen
-of them exist, so the library is what those fourteen can honestly express, and
-anything else would be a wrapper around a number nothing implements.
+Step 68 is the **Virtual Display Device**: the guest owns the authoritative
+framebuffer, and the device must not depend on SDL3. That means a new device in
+`lazalith-devices` with a framebuffer the guest reads and writes directly, and
+the MMIO-visible surface a display driver in Step 70 will sit on.
 
 ## Steps 1–50 Retrospective Audit and Repair
 

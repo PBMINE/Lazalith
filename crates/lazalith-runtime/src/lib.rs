@@ -45,6 +45,31 @@ mod startup;
 pub use source::PRELUDE;
 pub use startup::{StartupError, startup_object, startup_source};
 
+/// The whole of what a program is compiled against: the runtime's own text, then
+/// the standard library's.
+///
+/// The two are separate crates and separate constants because they answer
+/// different questions. `PRELUDE` is the minimum a program links: the syscall
+/// wrappers, the entry sequence's requirements, and the memory and text helpers
+/// those wrappers need. `STDLIB` is what a program *chooses* to use — `core`,
+/// `io`, `text`, `math`, `collections`, `fs`, `time`, `process` — and it is
+/// written on top of the prelude rather than beside it, so every standard library
+/// call is a call through the same wrappers a raw program would use.
+///
+/// Keeping them apart is what lets a program opt out of the standard library. A
+/// freestanding program that wants one syscall and nothing else builds with the
+/// prelude alone, and pays for nothing it did not use.
+pub fn library_text() -> String {
+    use alloc::string::String as StdString;
+    let mut text = StdString::from(PRELUDE);
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push('\n');
+    text.push_str(lazalith_stdlib::STDLIB);
+    text
+}
+
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -78,13 +103,34 @@ pub struct BuildOptions {
     pub architecture: ArchitectureConfig,
     /// The source name diagnostics point at.
     pub source_path: String,
-    /// The runtime prelude to compile in front of the program.
+    /// The library text compiled in front of the program.
+    ///
+    /// This is one string holding both the runtime prelude and, by default, the
+    /// standard library. It is a field rather than a fixed choice so a program can
+    /// be built freestanding — [`BuildOptions::freestanding`] — and so a caller
+    /// that wants to see exactly what is linked can set it.
     pub prelude: String,
 }
 
 impl BuildOptions {
-    /// Default options for a 64-bit machine.
+    /// Default options for a 64-bit machine: the prelude and the standard library.
     pub fn lz64(source_path: impl Into<String>) -> Self {
+        Self {
+            architecture: ArchitectureConfig::lz64(),
+            source_path: source_path.into(),
+            prelude: library_text(),
+        }
+    }
+
+    /// Options for a 64-bit machine with the runtime alone.
+    ///
+    /// A program built this way has the syscall wrappers and the byte and text
+    /// helpers, and none of `std`. That is the right build for something that wants
+    /// one syscall and nothing else, and it is the build the runtime's own tests
+    /// use, so the two libraries stay independently honest — a bug in `std` cannot
+    /// make a runtime test pass, and a bug in the runtime cannot make a `std` test
+    /// pass.
+    pub fn freestanding(source_path: impl Into<String>) -> Self {
         Self {
             architecture: ArchitectureConfig::lz64(),
             source_path: source_path.into(),

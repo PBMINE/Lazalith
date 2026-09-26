@@ -342,10 +342,12 @@ pub(crate) fn build_options(path: &Path) -> lazalith_runtime::BuildOptions {
     lazalith_runtime::BuildOptions {
         architecture: architecture_for(path),
         source_path: path.to_string_lossy().into_owned(),
-        // The prelude is the runtime library every program links against, and it
-        // is not a file the user chooses or edits. Naming it here rather than
-        // leaving it to a default keeps the option honest: a caller that wanted
+        // The whole library: the runtime's syscall wrappers and the standard
+        // library written on top of them. This is the same text every command
+        // uses, which is what makes `check` accept exactly what `build` builds.
+        // It is not a file the user chooses or edits, so naming it here rather
+        // than leaving it to a default keeps the option honest: a caller wanting
         // a different library would be visible in the call.
-        prelude: String::from(lazalith_runtime::PRELUDE),
+        prelude: lazalith_runtime::library_text(),
     }
 }

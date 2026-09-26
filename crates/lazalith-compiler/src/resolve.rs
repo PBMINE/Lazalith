@@ -790,34 +790,82 @@ pub fn lookup_from<'a>(
 
     // Start in the module that wrote the use, then walk the path's module
     // segments, then look up the item itself.
-    let mut path: Vec<String> = from.to_vec();
-    let mut current = match resolved.modules.get(&path) {
-        Some(module) => module,
-        None if path.is_empty() => &resolved.root,
-        None => return None,
-    };
-    let mut crossed = false;
-    for segment in modules {
-        if !matches!(current.items.get(*segment), Some(Symbol::Module(_))) {
-            return None;
-        };
-        path.push((*segment).to_string());
-        crossed = true;
-        current = resolved.modules.get(&path)?;
-    }
-    if let Some(found) = found(current, last, from) {
+    if let Some(found) = walk(resolved, from, modules, last) {
         return Some(found);
     }
 
     // A nested module also sees the file's top-level items, because the root
     // module encloses every other module.
     if !from.is_empty()
-        && !crossed
+        && !crossed_any(resolved, from, modules)
         && let Some(found) = found(&resolved.root, last, from)
     {
         return Some(found);
     }
+
+    // A path written from the file's top level is absolute, whatever module it
+    // was written in. Without this, `rt::memory::copy` inside `rt::sys` would be
+    // looked for as `rt::sys::rt::memory`, and the only way for a nested module to
+    // reach a sibling would be a `use` at the top level — which reads as a quirk
+    // of the language rather than a rule, and makes deeply nested libraries
+    // impossible to write.
+    if !from.is_empty() {
+        return walk(resolved, &[], modules, last);
+    }
     None
+}
+
+/// Walks `modules` from `from` and looks `last` up in the module it lands in.
+fn walk<'a>(
+    resolved: &'a Resolved,
+    from: &[String],
+    modules: &[&str],
+    last: &str,
+) -> Option<Found<'a>> {
+    let mut path: Vec<String> = from.to_vec();
+    let mut current = match resolved.modules.get(&path) {
+        Some(module) => module,
+        None if path.is_empty() => &resolved.root,
+        None => return None,
+    };
+    for segment in modules {
+        if !matches!(current.items.get(*segment), Some(Symbol::Module(_))) {
+            return None;
+        };
+        path.push((*segment).to_string());
+        current = resolved.modules.get(&path)?;
+    }
+    found(current, last, from)
+}
+
+/// Whether walking `modules` from `from` reaches a module at all.
+///
+/// This is only used to decide whether the enclosing-root fallback applies, so it
+/// answers "did the path name a module" rather than "was the item found": a path
+/// that names a real module and then misses on the item must report that miss, not
+/// fall through and find something else with the same last segment.
+fn crossed_any(resolved: &Resolved, from: &[String], modules: &[&str]) -> bool {
+    if modules.is_empty() {
+        return false;
+    }
+    let mut path: Vec<String> = from.to_vec();
+    let mut current = match resolved.modules.get(&path) {
+        Some(module) => module,
+        None if path.is_empty() => &resolved.root,
+        None => return false,
+    };
+    for segment in modules {
+        if !matches!(current.items.get(*segment), Some(Symbol::Module(_))) {
+            return false;
+        };
+        path.push((*segment).to_string());
+        match resolved.modules.get(&path) {
+            Some(module) => current = module,
+            None => return false,
+        }
+    }
+    let _ = current;
+    true
 }
 
 /// Looks one name up in one module, and decides whether it is visible.

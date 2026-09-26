@@ -696,8 +696,22 @@ impl<'a> FunctionEmitter<'a> {
                 })?;
             for part in 0..=usize::from(size > 8) {
                 let target = slot + if part == 0 { 0 } else { 8 };
+                // Each half of a parameter is stored at *its own* width. A `u32`
+                // is four bytes, and storing a whole word for it would write over
+                // the next parameter's slot — which is not a corrupted value but a
+                // *missing* one, and it fails only when a call has two narrow
+                // parameters. That is why `f(a: u32, b: u32)` was the smallest
+                // failing case and `f(a: u32)` was not.
+                let width = if part == 0 {
+                    data_size(size.min(8)).ok_or_else(|| CodegenError::UnsupportedValueType {
+                        function: self.name.clone(),
+                        detail: format!("a {size}-byte parameter"),
+                    })?
+                } else {
+                    DataSize::Double
+                };
                 if word < Self::ARGUMENT_REGISTERS {
-                    self.put_frame(target, word as u8)?;
+                    self.put_frame_width(target, word as u8, width)?;
                 } else {
                     // A stack argument is measured from the stack pointer, not
                     // from the frame base. The callee was entered one word below
@@ -707,8 +721,8 @@ impl<'a> FunctionEmitter<'a> {
                     // it reserved, plus the eight bytes that separate them.
                     let at = stack_base + (word as u32 - Self::ARGUMENT_REGISTERS as u32) * 8 + 8;
                     self.stack_address(at)?;
-                    self.memory_at(ADDRESS, OPERAND_A, DataSize::Double)?;
-                    self.put_frame(target, OPERAND_A)?;
+                    self.memory_at(ADDRESS, OPERAND_A, width)?;
+                    self.put_frame_width(target, OPERAND_A, width)?;
                 }
                 word += 1;
             }
@@ -951,7 +965,20 @@ impl<'a> FunctionEmitter<'a> {
                 let value = self.define()?;
                 self.call(target, args, result)?;
                 if !matches!(result, IrType::Void) {
-                    self.store_value(value, RETURN_REGISTER)?;
+                    let size = value_size(result).unwrap_or(0);
+                    if size > 8 {
+                        // A two-word result is the callee's `r0` and `r1`, and it is
+                        // written to the result's own slot. Storing it — rather than
+                        // leaving it in registers — is what lets an expression that
+                        // returns a view sit in the middle of a larger expression:
+                        // every later read of that value goes to its slot, and a
+                        // register would be gone by then.
+                        let offset = self.layout.offset(value)?;
+                        self.put_frame(offset, RETURN_REGISTER)?;
+                        self.put_frame(offset + 8, RETURN_REGISTER + 1)?;
+                    } else {
+                        self.store_value(value, RETURN_REGISTER)?;
+                    }
                 }
                 Ok(())
             }
@@ -1355,10 +1382,10 @@ impl<'a> FunctionEmitter<'a> {
         result: &IrType,
     ) -> Result<(), CodegenError> {
         let size = value_size(result).unwrap_or(0);
-        if size > 8 {
-            // `docs/lz64.md` returns one word in `r0`, and a two-word return would
-            // need two registers to name. The frontend's return rule is what keeps
-            // a view from reaching here.
+        if size > 16 {
+            // One word comes back in `r0` and a two-word value in `r0` and `r1`.
+            // No Lazen type is wider than a view, so this is the whole of what
+            // cannot be returned rather than a limit that will be reached.
             return Err(CodegenError::UnsupportedValueType {
                 function: self.name.clone(),
                 detail: format!("a {size}-byte return value"),
@@ -1430,16 +1457,48 @@ impl<'a> FunctionEmitter<'a> {
                 Ok(())
             }
             Terminator::Return(ReturnValue::Value(value)) => {
-                let size = value_size(&self.value_type(*value)?).unwrap_or(0);
-                if size > 8 {
-                    // One word comes back in `r0`, and two words would need two
-                    // registers to name, which the convention does not have.
+                let ty = self.value_type(*value)?;
+                let size = value_size(&ty).unwrap_or(0);
+                if size > 16 {
+                    // One word comes back in `r0` and a two-word value in `r0` and
+                    // `r1`; anything wider would need a third register the
+                    // convention does not have, and no Lazen type is that wide.
                     return Err(CodegenError::UnsupportedValueType {
                         function: self.name.clone(),
                         detail: format!("a {size}-byte return value"),
                     });
                 }
-                self.load_value(*value, RETURN_REGISTER)?;
+                // A view is two words and is returned the same way it is passed:
+                // the address in `r0`, the length in `r1`. Returning it any other way
+                // would mean a caller had to know where the callee put it, which is
+                // the one thing a calling convention exists to prevent.
+                if size > 8 {
+                    // A view returns the same two words it is passed as: the
+                    // address in `r0` and the length in `r1`. Emitting a move per
+                    // word, rather than immediates, is what makes this work for a
+                    // value the compiler cannot know at compile time — which is the
+                    // only kind that reaches here.
+                    let address_offset = self.layout.offset(*value)?;
+                    let length_offset = self.layout.word(*value, 1)?;
+                    self.load_frame(address_offset, ADDRESS)?;
+                    self.emit(
+                        Opcode::Mov,
+                        &[
+                            Operand::Register(register(RETURN_REGISTER)),
+                            Operand::Register(register(ADDRESS)),
+                        ],
+                    )?;
+                    self.load_frame(length_offset, ADDRESS)?;
+                    self.emit(
+                        Opcode::Mov,
+                        &[
+                            Operand::Register(register(RETURN_REGISTER + 1)),
+                            Operand::Register(register(ADDRESS)),
+                        ],
+                    )?;
+                } else {
+                    self.load_value(*value, RETURN_REGISTER)?;
+                }
                 self.epilogue()?;
                 self.terminated = true;
                 Ok(())

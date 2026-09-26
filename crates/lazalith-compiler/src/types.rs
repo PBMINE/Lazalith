@@ -451,6 +451,9 @@ pub enum CheckedExpr {
         method: String,
         /// The receiver.
         receiver: Box<CheckedExpr>,
+        /// The arguments, in order. Every builtin so far took none; the ones that
+        /// name a view's length take one.
+        arguments: Vec<CheckedExpr>,
         /// The method's type.
         ty: Type,
         /// Where it was written.
@@ -870,6 +873,7 @@ pub fn check_for(
         loop_depth: 0,
         current_module: Vec::new(),
         current_result: Type::Unit,
+        current_locals: Vec::new(),
         strings: Vec::new(),
         string_index: BTreeMap::new(),
         functions: Vec::new(),
@@ -939,6 +943,13 @@ struct Checker<'a> {
     functions: Vec<CheckedFunction>,
     externs: Vec<CheckedExtern>,
     constants: Vec<CheckedConstant>,
+    /// The locals and parameters of the function being checked.
+    ///
+    /// Only the parameters are meaningful for borrow rules; a local's own
+    /// `mut` is already in its `Binding`. This exists because the scope a body is
+    /// checked in does not say which bindings are parameters, and a parameter is
+    /// writable without `mut`.
+    current_locals: Vec<LocalSlot>,
 }
 
 impl<'a> Checker<'a> {
@@ -1193,6 +1204,12 @@ impl<'a> Checker<'a> {
         self.current_result = result.clone();
         let mut scope: Vec<Binding> = Vec::new();
         let mut locals: Vec<LocalSlot> = Vec::new();
+        // The parameters are the whole of this function's frame at the point a
+        // body is checked, and knowing which bindings are parameters is what lets
+        // a `&mut [T]` parameter and an `as_str` status be written through without
+        // the caller having said `mut`. It is set once the parameters are laid out
+        // and read from then on, so it is never observed half-built.
+        self.current_locals = Vec::new();
         let mut offset = 0u32;
         let mut parameters = Vec::new();
         for parameter in &item.parameters {
@@ -1227,6 +1244,8 @@ impl<'a> Checker<'a> {
                 offset.saturating_add(locals[locals.len() - 1].ty.size_in_bytes(self.target.word));
         }
         let function_span = item.span.clone();
+        // The parameters are laid out; the body can now be checked against them.
+        self.current_locals = locals.clone();
         let body = self.check_block(
             &item.body,
             &mut scope,
@@ -2195,6 +2214,24 @@ impl<'a> Checker<'a> {
 
     /// Whether an expression names a place that may be written, ignoring an
     /// invalid one: a bad place is reported by the caller that checks it properly.
+    /// Whether `expression` names a parameter of the function being checked.
+    ///
+    /// A parameter's slot belongs to the callee's own frame, so writing to it is
+    /// invisible to the caller and needs no `mut`. This is the rule that lets
+    /// `as_str(status)` work when `status` is a parameter, and it is the same rule
+    /// that already lets a `&mut [T]` parameter be written through.
+    fn argument_is_parameter(&self, expression: &Expr) -> bool {
+        let Expr::Path { path, .. } = expression else {
+            return false;
+        };
+        if path.segments.len() != 1 {
+            return false;
+        }
+        self.current_locals
+            .iter()
+            .any(|slot| slot.is_parameter && slot.name == path.segments[0].text)
+    }
+
     fn place_is_mutable(&self, expression: &Expr, scope: &[Binding]) -> bool {
         // A name that is not a local binding is not a mutable place; the caller
         // reports the real problem.
@@ -2854,7 +2891,10 @@ impl<'a> Checker<'a> {
             },
             ("as_mut_slice", Type::Array { element, .. }) => {
                 let place = self.check_place(receiver, scope);
-                let mutable = place.as_ref().map(CheckedPlace::is_mutable).unwrap_or(false);
+                let mutable = place
+                    .as_ref()
+                    .map(CheckedPlace::is_mutable)
+                    .unwrap_or(false);
                 if !mutable {
                     return Err(self.error(
                         codes::BAD_BORROW,
@@ -2870,22 +2910,154 @@ impl<'a> Checker<'a> {
                     mutable: true,
                 }
             }
-            (
-                "as_ptr",
-                Type::Array { element, .. } | Type::Slice { element, .. },
-            ) => Type::Pointer {
-                pointee: element.clone(),
-            },
+            ("as_ptr", Type::Array { element, .. } | Type::Slice { element, .. }) => {
+                Type::Pointer {
+                    pointee: element.clone(),
+                }
+            }
             // A str is a `&[u8]` view, so its data address is the same operation.
             ("as_ptr", Type::Str) => Type::Pointer {
                 pointee: Box::new(Type::U8),
             },
+            // A view over memory named by an address. This is how a program turns
+            // an address the OS gave it — an allocated block, a buffer it laid out
+            // in its own frame — into something it can index. It is the *only*
+            // route from an address to a view, because `ptr<T>` deliberately
+            // cannot be dereferenced: a pointer carries no length, so a read
+            // through one could not be bounds checked, and v1 has no `unsafe`.
+            // The length is the caller's to state, and stating it wrong is the one
+            // mistake this can make, so the name says so.
+            ("slice_from_raw", Type::Pointer { pointee }) => {
+                if arguments.len() != 1 {
+                    return Err(self.error(
+                        codes::UNKNOWN_METHOD,
+                        format!(
+                            "`slice_from_raw` takes one length, and {} were given",
+                            arguments.len()
+                        ),
+                        &method.span,
+                        &["write `address.slice_from_raw(length)`"],
+                        None,
+                        &[],
+                    ));
+                }
+                Type::Slice {
+                    element: pointee.clone(),
+                    mutable: false,
+                }
+            }
+            // The mutable form. The caller is stating that the memory really is
+            // writable, which is the same claim `&mut` makes anywhere else.
+            ("slice_from_raw_mut", Type::Pointer { pointee }) => {
+                if arguments.len() != 1 {
+                    return Err(self.error(
+                        codes::UNKNOWN_METHOD,
+                        format!(
+                            "`slice_from_raw_mut` takes one length, and {} were given",
+                            arguments.len()
+                        ),
+                        &method.span,
+                        &["write `address.slice_from_raw_mut(length)`"],
+                        None,
+                        &[],
+                    ));
+                }
+                Type::Slice {
+                    element: pointee.clone(),
+                    mutable: true,
+                }
+            }
+            // A `str` over the bytes of a slice, if the bytes are valid UTF-8.
+            //
+            // This is a *checked* conversion and the check is the point. A cast
+            // cannot be it, because a `&[u8]` of arbitrary bytes is not a `str` and
+            // the language has no way to say "I checked": `docs/lazen-types.md`
+            // lists `str` as a *checked* UTF-8 byte string for exactly this reason.
+            // Here the check lives, so every `str` in the language is one that was
+            // verified — whether it came from a literal, which the compiler checks,
+            // or from this, which checks at run time.
+            ("as_str", Type::Slice { element, .. }) => {
+                if !matches!(element.as_ref(), Type::U8) {
+                    return Err(self.error(
+                        codes::UNKNOWN_METHOD,
+                        format!("`as_str` needs a `&[u8]`, not a `&[{}]`", ty_name(element)),
+                        &method.span,
+                        &["only a byte slice is a candidate for text"],
+                        None,
+                        &[],
+                    ));
+                }
+                if arguments.len() != 1 {
+                    return Err(self.error(
+                        codes::UNKNOWN_METHOD,
+                        format!(
+                            "`as_str` takes one status out-parameter, and {} were given",
+                            arguments.len()
+                        ),
+                        &method.span,
+                        &["write `bytes.as_str(&mut ok)`"],
+                        None,
+                        &[],
+                    ));
+                }
+                // The status is written through, so it has to be a writable
+                // `bool` place. Accepting an expression that is not one would let
+                // a program ask whether bytes are text and have nowhere to be told.
+                let status_inferred =
+                    self.check_expression(&arguments[0], scope, Some(Type::Bool))?;
+                match status_inferred.concrete() {
+                    Some(Type::Bool) => {}
+                    Some(other) => {
+                        return Err(self.error(
+                            codes::MISMATCH,
+                            format!("`as_str` writes a `bool` status, not `{}`", ty_name(other)),
+                            &span_of(&arguments[0]),
+                            &["the status says whether the bytes are valid UTF-8"],
+                            Some("pass a `bool` you can write to"),
+                            &[],
+                        ));
+                    }
+                    None => {
+                        return Err(self.error(
+                            codes::MISMATCH,
+                            "this `as_str` status has no type to write to",
+                            &span_of(&arguments[0]),
+                            &["the status is written by the conversion, so it must be a place"],
+                            Some("bind a `bool` first, as in `let mut ok: bool = false;`"),
+                            &[],
+                        ));
+                    }
+                }
+                // The status is written through, so it has to be a place this
+                // function may write. A local needs `mut`; a *parameter* does not,
+                // because a parameter's slot is this function's own frame and
+                // writing there is local. That is the same rule `&mut [T]`
+                // parameters already follow, and for the same reason: the frame is
+                // the callee's, so a write cannot be seen by the caller.
+                match self.check_place(&arguments[0], scope) {
+                    Ok(CheckedPlace::Local { mutable, span, .. })
+                        if !mutable && !self.argument_is_parameter(&arguments[0]) =>
+                    {
+                        return Err(self.error(
+                            codes::BAD_BORROW,
+                            "`as_str` needs a status it can write to",
+                            &span,
+                            &["this binding was not declared `mut`"],
+                            Some("write `let mut ok: bool = false;`"),
+                            &[],
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => return Err(error),
+                }
+                Type::Str
+            }
             _ => {
                 return Err(self.error(
                     codes::UNKNOWN_METHOD,
                     format!("`{}` has no method `{}`", ty_name(&receiver_type), name),
                     &method.span,
-                    &["Lazen v1 has exactly these builtin methods: `len`, `as_bytes`, `as_slice`, `as_mut_slice`, and `as_ptr`"],
+                    &["Lazen v1 has exactly these builtin methods: `len`, `as_bytes`, `as_slice`, `as_mut_slice`, `as_ptr`, `slice_from_raw`, `slice_from_raw_mut`, and `as_str`"],
                     Some(format!(
                         "valid methods for `{}`: `{}`",
                         ty_name(&receiver_type),
@@ -2893,10 +3065,16 @@ impl<'a> Checker<'a> {
                     )
                     .as_str()),
                     &[],
-                ))
+                ));
             }
         };
-        if !arguments.is_empty() {
+        // The three builtins that take an argument: the two view-from-address forms,
+        // which take a length, and `as_str`, which takes the status to write. Every
+        // other builtin answers a question about its receiver alone, which is why
+        // the general rule below is "no arguments" rather than an arity table.
+        if !arguments.is_empty()
+            && !matches!(name, "slice_from_raw" | "slice_from_raw_mut" | "as_str")
+        {
             return Err(self.error(
                 codes::UNKNOWN_METHOD,
                 format!("`{name}` takes no arguments"),
@@ -3428,6 +3606,7 @@ impl<'a> Checker<'a> {
                 CheckedExpr::Builtin {
                     method: method.text.clone(),
                     receiver: Box::new(checked_receiver),
+                    arguments: checked,
                     ty,
                     span: span.clone(),
                 }
@@ -3919,9 +4098,10 @@ pub fn cast_is_allowed(from: &Type, to: &Type) -> bool {
 /// The methods available on a type.
 pub fn methods_for(ty: &Type) -> &'static str {
     match ty {
-        Type::Str => "`len`, `as_bytes`",
+        Type::Str => "`len`, `as_bytes`, `as_ptr`",
         Type::Array { .. } => "`len`, `as_slice`, `as_mut_slice`, `as_ptr`",
         Type::Slice { .. } => "`len`, `as_ptr`",
+        Type::Pointer { .. } => "`slice_from_raw`, `slice_from_raw_mut`",
         _ => "none",
     }
 }

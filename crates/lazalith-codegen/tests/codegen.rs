@@ -1111,3 +1111,118 @@ fn the_entry_point_is_callable_from_outside_the_object() {
         "a private function that is not the entry is not exported"
     );
 }
+
+/// A narrow parameter is stored at its own width, so the next one survives.
+///
+/// A `u32` is four bytes and a frame slot is word-aligned, so `f(a: u32, b: u32)`
+/// puts `b` four bytes after `a`. Storing a whole word for `a` would write over
+/// `b`'s slot — not corrupting it but *replacing* it, which is why the bug shows
+/// up as a missing value rather than a wrong one, and why the smallest failing
+/// case is two narrow parameters and not one.
+#[test]
+fn a_narrow_parameter_does_not_overwrite_the_next_one() {
+    const SOURCE: &str = r#"
+        fn pair(a: u32, b: u32) -> u64 {
+            return a as u64 + b as u64;
+        }
+
+        fn main() -> i32 {
+            // 1 + 2 == 3, and both arguments have to arrive for that to be true.
+            if pair(1u32, 2u32) != 3u64 {
+                return 1;
+            }
+            if pair(0u32, 0u32) != 0u64 {
+                return 2;
+            }
+            // Three narrow parameters, so the third is the one that would be lost.
+            if triple(1u32, 2u32, 3u32) != 6u64 {
+                return 3;
+            }
+            return 0;
+        }
+
+        fn triple(a: u32, b: u32, c: u32) -> u64 {
+            return a as u64 + b as u64 + c as u64;
+        }
+    "#;
+    let (object, _) = generate_object(SOURCE);
+    let harness = harness(
+        "harness",
+        &["fn.main"],
+        "         CALL fn.main\n\
+         MOV r1, r0\n\
+         LI r0, 1\n\
+         LI r7, 0\n\
+         SYSCALL\n",
+    );
+    let (_, code) = run(vec![harness, object], "entry");
+    assert_eq!(
+        code,
+        Some(0),
+        "every narrow parameter reached the function that was passed"
+    );
+}
+
+/// A two-word result comes back in `r0` and `r1` and lands in the caller's slot.
+///
+/// A view is a pointer and a length, and the only way to return one is to return
+/// both words. The caller must then *store* them rather than read them from
+/// registers, or an expression that returns a view could not appear in the middle
+/// of a larger expression: the registers would be gone by the time it was used.
+///
+/// The test writes through the returned view rather than only reading it, because
+/// a view whose *address* word is wrong still has the right length — so a length
+/// check alone would pass on a result that points nowhere.
+#[test]
+fn a_two_word_result_survives_into_the_callers_frame() {
+    const SOURCE: &str = r#"
+        extern "syscall" fn write(handle: i32, buffer: ptr<u8>, length: u64, result: ptr<u8>) -> i64;
+
+        // Returns a view over the bytes of `pair`. A view is two words, so this is
+        // the smallest function that can return one: the address in `r0` and the
+        // length in `r1`.
+        fn make_pair(pair: &[u8]) -> &[u8] {
+            return pair;
+        }
+
+        fn main() -> i32 {
+            let mut pair: [u8; 2] = [104u8, 105u8];
+            let view: &[u8] = make_pair(pair.as_slice());
+            if view.len() != 2usize {
+                return 1;
+            }
+            if view[0] != 104u8 {
+                return 2;
+            }
+            let mut record: [u8; 16] = [0u8; 16];
+            let status: i64 = write(
+                1,
+                view.as_ptr(),
+                view.len() as u64,
+                record.as_mut_slice().as_ptr() as ptr<u8>
+            );
+            if status != 0 {
+                return 3;
+            }
+            return 0;
+        }
+    "#;
+    let (object, _) = generate_object(SOURCE);
+    let harness = harness(
+        "harness",
+        &["fn.main"],
+        "         CALL fn.main\n\
+         MOV r1, r0\n\
+         LI r0, 1\n\
+         LI r7, 0\n\
+         SYSCALL\n",
+    );
+    let (output, code) = run(vec![harness, object], "entry");
+    assert_eq!(code, Some(0), "and it returned 0");
+    assert_eq!(
+        String::from_utf8_lossy(&output),
+        "hi",
+        "a returned view still points at the bytes it was made from, with the \
+         length it was made with"
+    );
+}

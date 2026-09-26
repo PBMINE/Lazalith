@@ -1516,9 +1516,10 @@ impl<'a> FunctionLowering<'a> {
             CheckedExpr::Builtin {
                 method,
                 receiver,
+                arguments,
                 ty,
                 span,
-            } => self.builtin(method, receiver, ty, span.clone()),
+            } => self.builtin(method, receiver, arguments, ty, span.clone()),
             CheckedExpr::If { arms, ty, .. } => {
                 let offset = self.temporary(
                     ty.size_in_bytes(WordWidth::W64),
@@ -1556,6 +1557,25 @@ impl<'a> FunctionLowering<'a> {
         })?;
         let length = self.constant(i64::try_from(length).unwrap_or(i64::MAX), &Type::Usize)?;
         self.build_view(address, length, ty)
+    }
+
+    /// The frame address of a builtin argument that the frontend required to be a
+    /// writable place.
+    ///
+    /// A builtin that writes through an argument cannot use `value`, which *reads*
+    /// the place; it needs to know where the place lives. The frontend has already
+    /// checked that the argument is a place and is writable, so this is a lookup
+    /// rather than a judgement — an argument that is not a place here is a frontend
+    /// bug, and it is reported as an unsupported shape rather than silently writing
+    /// somewhere else.
+    fn place_address_of_argument(&mut self, argument: &CheckedExpr) -> Result<ValueId, LowerError> {
+        match argument {
+            CheckedExpr::Read { place, .. } => self.place_address(place),
+            other => Err(LowerError::UnsupportedShape {
+                detail: String::from("a builtin argument that is written through is not a place"),
+                span: other.span().clone(),
+            }),
+        }
     }
 
     /// A unary operator.
@@ -1807,6 +1827,7 @@ impl<'a> FunctionLowering<'a> {
         &mut self,
         method: &str,
         receiver: &CheckedExpr,
+        arguments: &[CheckedExpr],
         ty: &Type,
         span: SourceSpan,
     ) -> Result<ValueId, LowerError> {
@@ -1859,6 +1880,65 @@ impl<'a> FunctionLowering<'a> {
                     }
                 }
             },
+            // A view over memory named by an address. The receiver *is* the
+            // address, so the view is built from it and the stated length, and
+            // that is the whole operation: no load happens here, and the bounds
+            // check on every later index is what makes the stated length a
+            // promise rather than a licence.
+            "slice_from_raw" | "slice_from_raw_mut" => {
+                let address = self.value(receiver)?;
+                let length_argument =
+                    arguments
+                        .first()
+                        .ok_or_else(|| LowerError::UnknownBuiltin {
+                            method: String::from(method),
+                            span: span.clone(),
+                        })?;
+                let length = self.value(length_argument)?;
+                self.build_view(address, length, ty)
+            }
+            // A `str` over the bytes of a slice, if the bytes are valid UTF-8.
+            //
+            // The check itself is a call, not a cast and not a compiler loop:
+            // `str` is a *checked* UTF-8 byte string, string literals are checked
+            // by the compiler, and this is the only other way one can exist. The
+            // validator lives in the runtime because a Lazen program cannot reach
+            // an address as a `str` — `ptr<T>` is deliberately not
+            // dereferenceable — so a program could not write this check itself.
+            //
+            // The status out-parameter is how the failure is reported. A Lazen
+            // function has exactly one result and no `optional`, so returning
+            // "the text or a failure" needs somewhere to put the failure, and the
+            // ABI's own out-parameter convention is what this language has.
+            "as_str" => {
+                let bytes = self.value(receiver)?;
+                let status_address = self.place_address_of_argument(&arguments[0])?;
+                // The validator's answer. It is a `bool` and the result of this
+                // builtin is a `str`, so the view is built separately and the
+                // answer only decides what is written to the status slot.
+                let valid = self.emit(Instruction::Call {
+                    target: CallTarget::Function(Name::from("rt::utf8::valid")),
+                    args: alloc::vec![CallArg::Value(bytes)],
+                    result: IrType::Bool,
+                })?;
+                // A `bool` is one byte, so the status the caller reads back is
+                // stored at the width the caller will load it at. The store is an
+                // *effect* — it produces no value — so the `str` returned is the
+                // view built below, not the store's.
+                self.effect(Instruction::Store {
+                    address: status_address,
+                    value: valid,
+                    width: StoreWidth::Byte,
+                    space: MemorySpace::Program,
+                })?;
+                // The result is the same bytes the receiver was: a `str` over a
+                // `&[u8]` is the same pointer and length with a different element
+                // type, so the view is rebuilt from the receiver's two words rather
+                // than copied. A caller that got `false` has no valid `str` to use,
+                // which is exactly what the status says.
+                let (address, length) = self.view_parts(bytes)?;
+                self.build_view(address, length, ty)
+            }
             _ => Err(LowerError::UnknownBuiltin {
                 method: String::from(method),
                 span,
