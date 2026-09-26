@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-26 (Steps 1–69 complete and verified)
+Last updated: 2026-09-27 (Steps 1–70 complete and verified)
 
 ## Where the roadmap stands
 
@@ -1052,13 +1052,141 @@ same program under it must see the identical records.
   and no dead-key handling, both of which the design document assigns to the GUI
   library in Step 73.
 
-## Next step
+## Step 70 — The LazOS Display Driver and the Lazen SDK
 
-Step 70 is the **LazOS display driver and the Lazen SDK**: the `display_open` and
-`display_present` syscalls the design has reserved but not numbered, a driver that
-sits on the Step 68 device, and `std::graphics` in Lazen. The architecture is
-enforced by tests — a Lazen application reaches the device only through the SDK,
-and the SDK only through LazOS.
+`DisplayService` in `crates/lazalith-os/src/display.rs`, with 13 tests in
+`crates/lazalith-os/tests/display.rs`; `std::graphics` in
+`crates/lazalith-stdlib/src/lib.rs`, with 8 end-to-end tests in
+`crates/lazalith-stdlib/tests/stdlib.rs`. The ABI additions are
+`Syscall::DisplayOpen = 0x000f`, `Syscall::DisplayPresent = 0x0010`, and the
+24-byte `DisplayRecord`.
+
+### The driver copies nothing, and that is the design
+
+`display_open` takes the address of a framebuffer the **guest already owns** and
+records it; `display_present` records that the frame at that address is the
+visible one. The driver never reads a pixel and never writes one.
+
+This is not a performance choice. A driver that copied would make every present a
+transfer of `width * height * 4` bytes and would let the device's view and the
+guest's memory disagree — which is precisely the failure
+`docs/lazen-graphics.md` exists to rule out. `the_driver_never_touches_a_pixel`
+writes a pixel into guest memory, opens a window over it, presents, and requires
+the pixel to be byte-for-byte unchanged;
+`the_driver_reports_an_address_and_not_pixels` requires the reported frame to be
+four scalars, so there is nowhere for a copy to be hiding.
+
+The consequence for a host is stated rather than hidden: a frontend resolves the
+address against guest memory itself, and the driver hands it an address.
+
+### A Lazen program has nothing to bypass the driver with
+
+There is no syscall that returns a device address, and no way to name the display
+device from Lazen at all. The only path is `std::graphics` → the ABI → the driver
+→ the device. `a_program_that_never_opens_a_window_has_no_frame` states this from
+the outside: a program that never calls the SDK leaves the driver with no window
+and no frame, and the test reads the driver's own state rather than the program's
+claim.
+
+### Two different refusals, because they are two different bugs
+
+A present with **no window open** is `InvalidHandle`; a present of **some other
+address** is `InvalidArgument`. Collapsing them would read as "presented a frame
+that is not on screen", which is the one answer that hides both. The frame count
+is written on refusal too, so a program that gets one can read how far it got.
+
+The **return value** of a present is a success whenever the call reached the
+driver, and the outcome is in the result record's status. `display_present` is a
+valid call *about* a frame that can be refused, so the SDK's `present` reads both:
+`presenting_reports_frames_and_the_driver_sees_them` requires a refused present to
+return `false` while the count stays where it was.
+
+### A refusal names the argument that was wrong
+
+The ABI's convention is a status plus a detail word, and for display calls the
+detail is the offending argument index — 2 for the framebuffer, 3 for the record,
+1 for the result. A caller can therefore say *which* of its four arguments was
+bad, which is the difference between a diagnostic and a shrug. Each refusal test
+asserts both the status and the index.
+
+### Validate before mutate
+
+`display_open` checks the record is writable and that the framebuffer holds the
+whole window **before** the device is touched, and closes the window again if the
+record cannot be written. A window whose record the guest never received is a
+window the guest cannot know about, so it is not left open.
+`an_unwritable_record_is_refused_and_leaves_no_window` covers that, and the
+geometry's pixel count is checked for overflow before it is multiplied
+(`a_geometry_whose_pixel_count_overflows_is_refused`).
+
+### The SDK is pure Lazen, and packs what the ABI cannot carry
+
+`std::graphics` is Lazen source compiled like any other program. Lazen v1 has no
+opaque `Window` or `Canvas` type, so a canvas is a `&mut [u8]` the caller owns
+and the geometry is passed alongside it — the same memory, named directly.
+
+The ABI has six argument words and a view is two, so a call with a canvas, some
+geometry, and a colour is already at the limit. Two shapes are therefore packed,
+and each is documented at the field that says what it is:
+
+- `pack_point(x, y)` and `pack_rect(x, y, w, h)` — two 16-bit fields each.
+- `pack_surface(width, height)` for `draw_text`, and `pack_ink(x, y, color)` —
+  16, 16 and 32 bits, because `draw_text` needs a canvas (two words), a surface,
+  an ink and the text (two more) and that is eight words.
+
+A packer whose fields were narrower than its readers was a real bug here and is
+now covered: `a_packed_rectangle_round_trips_every_field` uses coordinates above
+255 in every field, which a 16/16/8/8 packing silently truncated.
+
+### Clipping is total
+
+Drawing off an edge is not an error. `put_pixel` returns whether it drew,
+`fill_rect` clips the requested rectangle and draws row by row, and `draw_text`
+clips both ends. `drawing_is_clipped_on_every_side` hangs a rectangle off two
+edges, requires its visible part and nothing else, and requires a rectangle
+entirely off the canvas to draw nothing at all.
+
+### The font is an SDK resource, and it is checked
+
+`draw_text` uses a built-in 8×8 font for printable ASCII, held as a string
+constant in the read-only data section — two hexadecimal digits per row byte,
+because Lazen v1 strings have no `\x` escape and a font is exactly the kind of
+data a string literal should not have to encode by hand. It is one line because
+Lazen v1 has no line continuation in a string.
+
+`text_draws_glyphs_from_the_builtin_font` checks the font's bits, that a
+character advances the pen a whole eight-pixel cell, and that text off either
+edge is clipped. The font is therefore identical headless and graphical, which is
+the property the design asks for and the reason no host asset is involved.
+
+### Two compiler bugs this step found
+
+Both were found by the SDK and both are regressions now, because a display driver
+is the first thing that multiplies by `2^32` on purpose.
+
+**A widening cast to a narrow target loaded too wide.** A cast stages its operand
+in a scratch word and loads it back; the load took the *target's* width, so
+`u8 as u32` read three bytes of frame the store never wrote. Whether the answer
+was right depended on what else the function had put in the frame.
+`a_widening_cast_to_a_narrow_target_loads_the_source_width` and
+`a_widened_value_keeps_the_bytes_it_was_widened_from` cover the IR shape and the
+program. The existing `a_cast_is_a_load_at_the_source_width` had used `u8 as i64`,
+an eight-byte target, which took the working path.
+
+**A wide constant was built from its halves in the wrong order.** `LI` is a signed
+32-bit immediate, so a 64-bit constant is two halves — and the code shifted the
+*low* half up and or-ed the high half in unshifted, producing `(low << 32) | high`.
+`4294967296` arrived as `1`. The two early returns were unsound in the same way:
+`LI` alone is the number only when the high half *is* the low half's sign
+extension, which is two cases out of four.
+`a_wide_constant_is_the_number_it_was_written_as` covers all six shapes and was
+**verified to fail with the old code**, which produced `1` for four of them.
+
+### Next step
+
+Step 71 is the **input driver and the host input adapter**: numbering
+`input_poll`, a driver that drains the Step 69 queue through the ABI, and the
+adapter that is the only component that knows what a keyboard is.
 
 ## Steps 1–50 Retrospective Audit and Repair
 

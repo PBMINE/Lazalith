@@ -373,11 +373,11 @@ fn a_bang_is_a_negation_and_not_a_conversion() {
 #[test]
 fn a_view_costs_two_argument_words() {
     let source = r#"
-        extern "syscall" fn display_present(a: &[u8], b: &[u8], c: &[u8], d: &[u8]) -> i64;
+        extern "syscall" fn input_poll(a: &[u8], b: &[u8], c: &[u8], d: &[u8]) -> i64;
         fn main() -> i64 {
             let text = "x";
             let bytes = text.as_bytes();
-            return display_present(bytes, bytes, bytes, bytes);
+            return input_poll(bytes, bytes, bytes, bytes);
         }
     "#;
     match lower_failure(source) {
@@ -392,13 +392,13 @@ fn a_view_costs_two_argument_words() {
 #[test]
 fn an_unnumbered_syscall_cannot_be_called() {
     let source = r#"
-        extern "syscall" fn display_open(width: i32, height: i32) -> i64;
+        extern "syscall" fn input_poll(width: i32, height: i32) -> i64;
         fn main() -> i64 {
-            return display_open(320, 240);
+            return input_poll(320, 240);
         }
     "#;
     match lower_failure(source) {
-        LowerError::UnnumberedSyscall { name, .. } => assert_eq!(name, "display_open"),
+        LowerError::UnnumberedSyscall { name, .. } => assert_eq!(name, "input_poll"),
         other => panic!("expected a refusal for an unnumbered syscall: {other}"),
     }
 }
@@ -629,6 +629,48 @@ fn a_cast_is_a_load_at_the_source_width() {
         lazalith_ir::Type::Int {
             bits: 64,
             signed: true
+        },
+        "and typed as the target, so the extension is the machine's"
+    );
+}
+
+/// A widening cast to a target that still fits in one word loads the source's
+/// bytes, not the target's.
+///
+/// The scratch the cast stages its operand in holds exactly the source's bytes.
+/// A target narrower than a word — `u8` to `u32` — would load the target's width
+/// and so read the bytes above the staged value, which the store never wrote.
+/// Whether those bytes are zero is not the program's business, so the widened
+/// value came out of whatever the frame happened to hold.
+#[test]
+fn a_widening_cast_to_a_narrow_target_loads_the_source_width() {
+    let (module, _) = lower_source(
+        r#"
+        fn main() -> u32 {
+            let small: u8 = 200;
+            return small as u32;
+        }
+        "#,
+    );
+    let all = instructions(&module, "main");
+    let load = all
+        .iter()
+        .rev()
+        .find_map(|instruction| match instruction {
+            Instruction::Load { width, ty, .. } => Some((*width, ty.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a cast is a load: {all:?}"));
+    assert_eq!(
+        load.0,
+        lazalith_ir::LoadWidth::Byte,
+        "loaded at u8's width, because that is all the cast staged"
+    );
+    assert_eq!(
+        load.1,
+        lazalith_ir::Type::Int {
+            bits: 32,
+            signed: false
         },
         "and typed as the target, so the extension is the machine's"
     );

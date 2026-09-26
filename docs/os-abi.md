@@ -106,6 +106,8 @@ transfer after committing the transferred bytes.
 | `0x000c` | `SpawnProcess` | yes | Load and create a child process |
 | `0x000d` | `WaitProcess` | yes | Wait for a child and return its exit status |
 | `0x000e` | `ClearScreen` | yes | Clear the virtual terminal |
+| `0x000f` | `DisplayOpen` | yes | Open a window over the caller's framebuffer |
+| `0x0010` | `DisplayPresent` | yes | Record the caller's frame as the visible one |
 | `0x0100`–`0xffff` | Reserved | rejected | Future ABI extension range |
 
 Unknown and reserved numbers return `SyscallError::UnknownSyscall`. LZ64
@@ -226,6 +228,20 @@ size 8
 `Normal=0`, `Killed=1`, `Faulted=2`, or `Terminated=3`. A child that is merely
 blocked keeps the caller blocked; `Terminated` is used only when process policy
 ends it without one of the preceding reasons.
+
+### `DisplayRecord`
+
+```text
+size 24
+0x00  u32 width
+0x04  u32 height
+0x08  u64 framebuffer
+```
+
+`DisplayOpen` writes this record. The `framebuffer` field is the address the
+driver recorded, and it names the *same* memory the caller passed: the driver
+copies no pixels, so a caller that reads a different address here has been given
+a different framebuffer, which is worth knowing.
 
 ## Service contracts
 
@@ -386,6 +402,29 @@ once. It is invalid for a non-child handle.
 All arguments are zero. It emits a defined virtual-terminal clear operation
 through the terminal service, not an SDL call and not raw framebuffer access.
 
+### `DisplayOpen(width, height, framebuffer, out_display_record)`
+
+The window is over the caller's own memory. `framebuffer` must be writable and
+must hold `width * height * 4` bytes; the product is checked for overflow before
+it is multiplied, so a geometry whose byte count does not fit a word is
+`ResourceExhausted` rather than a wrapped length that would pass a bounds check.
+`out_display_record` must be writable and at least `DISPLAY_RECORD_SIZE` bytes,
+and it is checked **before** the device is touched: a window whose record the
+caller cannot receive is a window the caller cannot know about, so it is not
+opened.
+
+### `DisplayPresent(framebuffer, out_io_result)`
+
+Records the frame at `framebuffer` as the visible one. The result record's
+`transferred` field is the number of frames presented so far, and its `status` is
+what became of this present: `Ok`, or `InvalidHandle` when no window is open and
+`InvalidArgument` when `framebuffer` is not the open window's address. Those are
+two different program bugs, so they are two different answers.
+
+The syscall's own return value says the *call* was valid, which a refused present
+still is: a valid call about a frame that was refused is not a failed call. A
+caller reads both, and `std::graphics::present` does.
+
 ## Errors
 
 The v1 `SyscallError` set is structured and stable:
@@ -415,6 +454,12 @@ Internal
 Payload details are documented per call where useful; the dispatcher never
 returns a raw negative Linux errno. Errors retain a cause chain internally and
 map to the ABI code at the boundary.
+
+For the display calls the detail is the **offending argument index**: `2` for the
+framebuffer, `3` for the `display_open` record, and `1` for the
+`display_present` result. A caller that gets `InvalidPointer` can therefore say
+which of its four arguments was bad, which is the difference between a diagnostic
+and a shrug.
 
 ## Pointer and buffer validation
 

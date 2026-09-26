@@ -590,30 +590,64 @@ impl<'a> FunctionEmitter<'a> {
     /// Materialises a 64-bit bit pattern in `into`, at the value's own width.
     ///
     /// A word's immediate is a signed 32-bit value, so a wide constant is built
-    /// from its halves. `LI` already sign-extends its low half, which is exactly
-    /// right when the high half is all zeros or all ones — a small number, or a
-    /// negative one — and only those two halves are combined when it is not.
-    /// Shifting unconditionally would turn `Pointer(8)` into `0x8_0000_0008`.
+    /// from its halves, and `LI` *sign-extends* the half it is given. That
+    /// extension is the whole difficulty: `LI` of a low half whose bit 31 is set
+    /// fills the whole register with ones, so the only patterns a single `LI`
+    /// gets right are the ones where that is what the number actually is.
+    ///
+    /// The high half goes in first and is shifted up, and the low half is
+    /// truncated back down to 32 bits by a shift left and a *logical* shift
+    /// right, which drops the extension the `LI` added. Building the halves the
+    /// other way round — shifting the low half up and or-ing the high half in
+    /// unshifted — produces `(low << 32) | high`, so `4294967296` came out as
+    /// `1`.
+    ///
+    /// A single `LI` is still preferred where it is correct, because shifting
+    /// unconditionally would turn `Pointer(8)` into `0x8_0000_0008`.
     fn wide_constant(&mut self, bits: u64, size: u32, into: u8) -> Result<(), CodegenError> {
-        let low = bits as u32 as i32;
-        self.li(into, low)?;
+        let low = bits as u32;
         if size <= 4 {
-            return Ok(());
+            // The store that follows truncates to the value's own width, so a
+            // sign-extended register is narrowed back to the value it came from.
+            return self.li(into, low as i32);
         }
         let high = (bits >> 32) as u32;
-        if high == 0 || high == u32::MAX {
-            return Ok(());
+        // `LI` is exactly the number when the high half is a sign extension of
+        // the low half's bit 31: all zeros above a low half below 2^31, or all
+        // ones above a low half at or above it.
+        if (high == 0 && low < 0x8000_0000) || (high == u32::MAX && low >= 0x8000_0000) {
+            return self.li(into, low as i32);
         }
-        self.li(OPERAND_B, 32)?;
+        // `high << 32`. The shift discards the low 32 bits, so the sign
+        // extension `LI` added above them does not reach the result.
+        self.li(into, high as i32)?;
+        self.li(OPERAND_A, 32)?;
         self.emit(
             Opcode::Shl,
             &[
                 Operand::Register(register(into)),
                 Operand::Register(register(into)),
-                Operand::Register(register(OPERAND_B)),
+                Operand::Register(register(OPERAND_A)),
             ],
         )?;
-        self.li(OPERAND_B, high as i32)?;
+        // `low` as 32 unsigned bits, by shifting its extension out of the way.
+        self.li(OPERAND_B, low as i32)?;
+        self.emit(
+            Opcode::Shl,
+            &[
+                Operand::Register(register(OPERAND_B)),
+                Operand::Register(register(OPERAND_B)),
+                Operand::Register(register(OPERAND_A)),
+            ],
+        )?;
+        self.emit(
+            Opcode::Shr,
+            &[
+                Operand::Register(register(OPERAND_B)),
+                Operand::Register(register(OPERAND_B)),
+                Operand::Register(register(OPERAND_A)),
+            ],
+        )?;
         self.emit(
             Opcode::Or,
             &[

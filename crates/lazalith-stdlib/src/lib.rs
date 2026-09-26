@@ -894,9 +894,559 @@ mod std {
             return std::fs::handle_from(status_out) as i32;
         }
 
-        /// Whether a status means the process left because it asked to.
-        pub fn exited_normally(status: i32) -> bool {
-            return status == 0i32;
+    }
+
+    // The graphics SDK.
+    //
+    // This is the whole of `std::graphics`: pure Lazen, sitting on the two display
+    // syscalls, with no host library anywhere in it. A program that uses only what
+    // is here runs identically headless and in a window and cannot tell the
+    // difference — which is the property `docs/lazen-graphics.md` asks for, and the
+    // reason this is a module rather than a binding to something else.
+    //
+    // The drawing calls are total: a coordinate outside the canvas is *clipped*,
+    // not an error. A program whose animation moves one pixel off screen draws its
+    // visible part rather than faulting, which is what a real window system does
+    // and what stops a cosmetic mistake from being a crash.
+    pub mod graphics {
+        // The two display calls. They are the only way this module reaches the
+        // device, and a program has no other way to name a framebuffer.
+        extern "syscall" fn display_open(
+            width: u32,
+            height: u32,
+            framebuffer: ptr<u8>,
+            record: ptr<u8>
+        ) -> i64;
+        extern "syscall" fn display_present(framebuffer: ptr<u8>, result: ptr<u8>) -> i64;
+
+        /// How many bytes one pixel occupies: ARGB8888, four bytes.
+        pub fn pixel_bytes() -> u64 {
+            return 4u64;
+        }
+
+        /// How many bytes one `display_open` record occupies.
+        pub fn record_bytes() -> u64 {
+            return 24u64;
+        }
+
+        /// A colour, packed with A in the high byte and B in the low.
+        ///
+        /// This is the colour *as a number*, which is how a program names one:
+        /// `0xAARRGGBB`, so a colour can be compared and masked as an integer. It
+        /// is deliberately **not** the memory layout — `docs/lazen-graphics.md`
+        /// fixes a pixel's bytes as A, R, G, B from offset 0, which is the
+        /// opposite order from this number read little-endian. `write_pixel` and
+        /// `read_pixel` are the only places that cross between the two, so the
+        /// difference is written down once instead of being something every
+        /// caller has to know.
+        pub fn rgba(red: u8, green: u8, blue: u8, alpha: u8) -> u32 {
+            return (alpha as u32) * 16777216u32
+                + (red as u32) * 65536u32
+                + (green as u32) * 256u32
+                + (blue as u32);
+        }
+
+        /// The red channel of `color`.
+        pub fn red_of(color: u32) -> u8 {
+            return ((color / 65536u32) % 256u32) as u8;
+        }
+
+        /// The green channel of `color`.
+        pub fn green_of(color: u32) -> u8 {
+            return ((color / 256u32) % 256u32) as u8;
+        }
+
+        /// The blue channel of `color`.
+        pub fn blue_of(color: u32) -> u8 {
+            return (color % 256u32) as u8;
+        }
+
+        /// The alpha channel of `color`.
+        pub fn alpha_of(color: u32) -> u8 {
+            return ((color / 16777216u32) % 256u32) as u8;
+        }
+
+        /// Opaque black.
+        pub fn black() -> u32 {
+            return rgba(0u8, 0u8, 0u8, 255u8);
+        }
+
+        /// Opaque white.
+        pub fn white() -> u32 {
+            return rgba(255u8, 255u8, 255u8, 255u8);
+        }
+
+        /// Writes `color` into the four bytes at `out`.
+        ///
+        /// This is the one place the pixel layout is written out.
+        /// `docs/lazen-graphics.md` fixes a pixel's bytes as A, R, G, B from
+        /// offset 0, so the alpha byte is first in memory — the reverse of
+        /// `0xAARRGGBB` read little-endian, which is why the mapping is here and
+        /// not in `rgba`. Everything else in this module moves whole pixels
+        /// around, so a mistake here would be a mistake everywhere at once.
+        pub fn write_pixel(out: &mut [u8], color: u32) {
+            out[0] = alpha_of(color);
+            out[1] = red_of(color);
+            out[2] = green_of(color);
+            out[3] = blue_of(color);
+        }
+
+        /// The colour in the four bytes at `from`, read the way `write_pixel`
+        /// wrote it.
+        ///
+        /// A short input reads the bytes it was given and leaves the rest
+        /// transparent, rather than reading past the end or refusing: a caller
+        /// that handed over fewer than four bytes gets a partially transparent
+        /// colour, which is what those bytes actually say.
+        pub fn read_pixel(from: &[u8]) -> u32 {
+            let mut color: u32 = 0u32;
+            let mut at: u64 = 0u64;
+            while at < 4u64 && at < from.len() as u64 {
+                let byte: u32 = (from[at as usize] as u32) * weight_of(at);
+                color = color + byte;
+                at = at + 1u64;
+            }
+            return color;
+        }
+
+        /// The weight a pixel byte carries in a colour number.
+        ///
+        /// Byte 0 is alpha, so it is the *high* byte of the number; byte 3 is
+        /// blue, the low one. This is the inverse of the layout above, written
+        /// once so `read_pixel` states its own rule.
+        pub fn weight_of(at: u64) -> u32 {
+            if at == 0u64 {
+                return 16777216u32;
+            }
+            if at == 1u64 {
+                return 65536u32;
+            }
+            if at == 2u64 {
+                return 256u32;
+            }
+            return 1u32;
+        }
+
+        /// Opens a window of `width` by `height` over `framebuffer`.
+        ///
+        /// The window is over memory the *caller* owns. The device shares it, so
+        /// nothing is copied and nothing is allocated here — a program that wants
+        /// to draw somewhere draws in a framebuffer it already has.
+        ///
+        /// The two length checks are here rather than only in the kernel because a
+        /// caller can detect a too-small buffer itself, and a refusal the program
+        /// can act on beats a fault it cannot.
+        pub fn open(
+            width: u32,
+            height: u32,
+            framebuffer: &mut [u8],
+            record: &mut [u8]
+        ) -> bool {
+            if framebuffer.len() as u64 < (width as u64) * (height as u64) * pixel_bytes() {
+                return false;
+            }
+            if record.len() as u64 < record_bytes() {
+                return false;
+            }
+            let status: i64 = display_open(
+                width,
+                height,
+                framebuffer.as_mut_slice().as_ptr(),
+                record.as_mut_slice().as_ptr()
+            );
+            return std::core::succeeded(status);
+        }
+
+        /// Presents the frame in `framebuffer`, leaving the frame count in `count`.
+        ///
+        /// The call *reaching* the driver is not the same as the frame being
+        /// shown, and the driver answers both questions: the syscall's own status
+        /// says whether the call was valid, and the result record's status says
+        /// what became of the frame. Presenting an address that is not the open
+        /// window is a valid call about a frame that was refused, so this reads
+        /// the record's status and not only the call's.
+        pub fn present(framebuffer: &mut [u8], count: &mut [u8]) -> bool {
+            if count.len() as u64 < 8u64 {
+                return false;
+            }
+            let mut result: [u8; 16] = [0u8; 16];
+            let status: i64 = display_present(
+                framebuffer.as_mut_slice().as_ptr(),
+                result.as_mut_slice().as_ptr()
+            );
+            if !std::core::succeeded(status) {
+                return false;
+            }
+            std::core::write_u64_to(count, rt::sys::read_u64(result.as_slice(), 0));
+            // Byte eight of an `IoResult` is its status, and zero is `Ok`. The
+            // frame count is left in `count` either way, so a caller that wants
+            // to know how far it got can read it after a refusal.
+            return rt::sys::read_u32(result.as_slice(), 8) == 0u32;
+        }
+
+        /// The window's width, as `display_open` reported it.
+        pub fn record_width(record: &[u8]) -> u32 {
+            return rt::sys::read_u32(record, 0);
+        }
+
+        /// The window's height, as `display_open` reported it.
+        pub fn record_height(record: &[u8]) -> u32 {
+            return rt::sys::read_u32(record, 4);
+        }
+
+        /// The framebuffer address, as `display_open` reported it.
+        ///
+        /// This is the address the driver recorded, and it names the *same* memory
+        /// the caller passed to `open`. A program that reads a different address
+        /// here has been given a different framebuffer, which is worth knowing.
+        pub fn record_framebuffer(record: &[u8]) -> u64 {
+            return rt::sys::read_u64(record, 8);
+        }
+
+        /// Fills the whole canvas with `color`.
+        pub fn clear(canvas: &mut [u8], color: u32) {
+            let mut pixel: [u8; 4] = [0u8; 4];
+            write_pixel(pixel.as_mut_slice(), color);
+            let mut at: u64 = 0u64;
+            while at + 4u64 <= canvas.len() as u64 {
+                canvas[at as usize] = pixel[0];
+                canvas[(at + 1u64) as usize] = pixel[1];
+                canvas[(at + 2u64) as usize] = pixel[2];
+                canvas[(at + 3u64) as usize] = pixel[3];
+                at = at + 4u64;
+            }
+        }
+
+        /// Draws one pixel at (`x`, `y`), clipped to the canvas.
+        ///
+        /// Returns whether a pixel was drawn. A coordinate outside the canvas
+        /// draws nothing, because a program whose animation went off screen has a
+        /// cosmetic bug and not a fatal one.
+        ///
+        /// The coordinate is one *packed* word for the same reason `fill_rect`'s
+        /// rectangle is: with the canvas, the geometry and the colour this call
+        /// would need seven argument words, and the ABI has six.
+        pub fn put_pixel(
+            canvas: &mut [u8],
+            width: u32,
+            height: u32,
+            at: u64,
+            color: u32
+        ) -> bool {
+            let x: u32 = ((at / 65536u64) % 65536u64) as u32;
+            let y: u32 = (at % 65536u64) as u32;
+            if x >= width || y >= height {
+                return false;
+            }
+            let offset: u64 = (y as u64) * (width as u64) * pixel_bytes()
+                + (x as u64) * pixel_bytes();
+            if offset + 4u64 > canvas.len() as u64 {
+                return false;
+            }
+            let mut pixel: [u8; 4] = [0u8; 4];
+            write_pixel(pixel.as_mut_slice(), color);
+            canvas[offset as usize] = pixel[0];
+            canvas[(offset + 1u64) as usize] = pixel[1];
+            canvas[(offset + 2u64) as usize] = pixel[2];
+            canvas[(offset + 3u64) as usize] = pixel[3];
+            return true;
+        }
+
+        /// Packs a point into one word: `x` in the high half, `y` in the low.
+        pub fn pack_point(x: u32, y: u32) -> u64 {
+            return (x as u64) * 65536u64 + (y as u64);
+        }
+
+        /// The `x` of a packed point.
+        pub fn point_x(at: u64) -> u32 {
+            return ((at / 65536u64) % 65536u64) as u32;
+        }
+
+        /// The `y` of a packed point.
+        pub fn point_y(at: u64) -> u32 {
+            return (at % 65536u64) as u32;
+        }
+
+        /// Fills a rectangle, clipped to the canvas on every side.
+        ///
+        /// The clip is computed on the *requested* rectangle and then drawn row by
+        /// row, so a rectangle hanging off two edges draws the part that is visible
+        /// and writes nothing outside. A rectangle entirely off the canvas draws
+        /// nothing at all, which is the same answer as a zero-sized one.
+        ///
+        /// The rectangle is one *packed* word rather than four arguments, because
+        /// with the canvas, the geometry and the colour this call would need nine
+        /// argument words and the ABI has six. That is not a stylistic choice: a
+        /// call that cannot be made is a call a program cannot use. The packing is
+        /// written down at each field below, so it is a documented shape and not a
+        /// surprise.
+        pub fn fill_rect(
+            canvas: &mut [u8],
+            width: u32,
+            height: u32,
+            packed: u64,
+            color: u32
+        ) {
+            let left: u64 = rect_x(packed) as u64;
+            let top: u64 = rect_y(packed) as u64;
+            let mut right: u64 = left + rect_w(packed) as u64;
+            let mut bottom: u64 = top + rect_h(packed) as u64;
+            if right > width as u64 {
+                right = width as u64;
+            }
+            if bottom > height as u64 {
+                bottom = height as u64;
+            }
+            let mut row: u64 = top;
+            while row < bottom {
+                let mut column: u64 = left;
+                while column < right {
+                    put_pixel(
+                        canvas,
+                        width,
+                        height,
+                        pack_point(column as u32, row as u32),
+                        color
+                    );
+                    column = column + 1u64;
+                }
+                row = row + 1u64;
+            }
+        }
+
+        /// Packs a rectangle's origin and size into one word.
+        ///
+        /// Four 16-bit fields, so a rectangle up to 65535 on a side fits. The
+        /// fields are the *same* width, which is the property worth stating: a
+        /// packer that gave one field fewer bits than its reader expected would
+        /// lose the high half of that coordinate and draw the rectangle somewhere
+        /// the caller did not ask for.
+        pub fn pack_rect(x: u32, y: u32, w: u32, h: u32) -> u64 {
+            return (x as u64) * 281474976710656u64
+                + (y as u64) * 4294967296u64
+                + (w as u64) * 65536u64
+                + (h as u64);
+        }
+
+        /// The `x` of a packed rectangle.
+        pub fn rect_x(packed: u64) -> u32 {
+            return ((packed / 281474976710656u64) % 65536u64) as u32;
+        }
+
+        /// The `y` of a packed rectangle.
+        pub fn rect_y(packed: u64) -> u32 {
+            return ((packed / 4294967296u64) % 65536u64) as u32;
+        }
+
+        /// The `w` of a packed rectangle.
+        pub fn rect_w(packed: u64) -> u32 {
+            return ((packed / 65536u64) % 65536u64) as u32;
+        }
+
+        /// The `h` of a packed rectangle.
+        pub fn rect_h(packed: u64) -> u32 {
+            return (packed % 65536u64) as u32;
+        }
+
+        /// The colour of the pixel at (`x`, `y`), or 0 outside the canvas.
+        ///
+        /// Zero is returned for a coordinate outside the canvas because there is no
+        /// pixel there; a caller that drew off the edge and read back zero is
+        /// learning that the draw was clipped, which is the truth.
+        pub fn get_pixel(canvas: &[u8], width: u32, height: u32, x: u32, y: u32) -> u32 {
+            if x >= width || y >= height {
+                return 0u32;
+            }
+            let at: u64 = (y as u64) * (width as u64) * pixel_bytes()
+                + (x as u64) * pixel_bytes();
+            if at + 4u64 > canvas.len() as u64 {
+                return 0u32;
+            }
+            return read_pixel(rt::memory::slice(canvas.as_ptr() as u64 + at, 4u64));
+        }
+        /// The 8x8 font, two hexadecimal digits per row byte.
+        ///
+        /// Ninety-five glyphs for printable ASCII, 32 to 126. Each glyph is eight
+        /// rows and each row is one byte of pixels, written as two hexadecimal
+        /// digits so the table can live in a string literal: Lazen v1 strings have
+        /// no `\x` escape, and a font is exactly the kind of data a string
+        /// literal should not have to encode by hand.
+        ///
+        /// The table is one line because Lazen v1 has no line continuation in a
+        /// string. It is data, not code, and reading it is `draw_text`'s job.
+        const FONT: &str = "000000000000000030303030300030006C6C0000000000006C6CFF6CFF6C6C003C66603C06663C0066660C1830666600183030703C361E0030300000000000001830606060301800180C0606060C180000CC78FE78CC0000003030FC303000000000000000303060000000FC000000000000000000303000060C183060C000003C666C7E6C663C0030703030303078003C66060C3060FC003C66061C06663C001E366666FF060600FC60607C06663C003860607C66663C00FC060C18303030003C66663C66663C003C66663E06061C00003030003030000000303000303060000C18306030180C000000FC00FC00000030180C060C1830003C66060C300030003C666E6E6E603C003C66667E666666007C66667C66667C003C66606060663C007C66666666667C00FC60607C6060FC00FC60607C606060003C66606E66663E006666667E666666003C18181818183C001E0C0C0C0C6C3800666C78E0786C6600606060606060FC00667E6E6E66666600666E7C6E6E6666003C66666666663C007C66667C606060003C6666666E6C36007C66667C786C66003E66603C06667C00FC303030303030006666666666663C0066666666663C18006666666E6E7E660066663C183C66660066663C1818181800FC060C183060FC003C30303030303C006030180C060300003C0C0C0C0C0C3C00183C66000000000000000000000000FC603000000000000000003E067F667C0060607C6666667C0000003C6660663C000C0C3E6666663E0000003E667E603E001C3630783030300000003E66663E0C3C60607C6666666600300070303030780018003818181838606060666C786C660070303030303078000000D8FEDADADA0000007C666666660000003C6666663C0000007C66667C606000003E66663E0C0C00006E766060600000007C603C067C003030783030361C0000006666666E3A0000006666663C18000000666E6E7E3C000000663C183C660000006666663E0C3C00007E0C18307E000E18183018180E0030303030303030007018180C181870000000366600000000";
+
+        /// The first ASCII code the font has a glyph for.
+        pub fn font_first() -> u32 {
+            return 32u32;
+        }
+
+        /// One past the last ASCII code the font has a glyph for.
+        pub fn font_last() -> u32 {
+            return 127u32;
+        }
+
+        /// The font as bytes, for a caller that wants to read a glyph itself.
+        pub fn font_bytes() -> &[u8] {
+            return FONT.as_bytes();
+        }
+
+        /// How many hexadecimal characters one glyph row occupies: two.
+        pub fn glyph_row_chars() -> u64 {
+            return 2u64;
+        }
+
+        /// The value of one hexadecimal digit, or 255 if it is not one.
+        ///
+        /// A digit outside `0`..`9` and `A`..`F` has no value, and returning 255
+        /// rather than zero means a corrupted table lights up every pixel of the
+        /// glyph instead of quietly drawing an empty one.
+        pub fn hex_value(digit: u8) -> u32 {
+            if digit >= 48u8 && digit <= 57u8 {
+                return (digit - 48u8) as u32;
+            }
+            if digit >= 65u8 && digit <= 70u8 {
+                return (digit - 55u8) as u32;
+            }
+            return 255u32;
+        }
+
+        /// The pixel row of one glyph: eight bits, bit 7 leftmost.
+        ///
+        /// A code outside the font draws nothing, which is returned as a row of no
+        /// lit pixels. A program that draws a control character learns that
+        /// nothing appeared, rather than drawing the glyph of whatever character
+        /// happens to sit at that offset in the table.
+        pub fn glyph_row(character: u8, row: u32) -> u8 {
+            if character < font_first() as u8 || character >= font_last() as u8 {
+                return 0u8;
+            }
+            if row >= 8u32 {
+                return 0u8;
+            }
+            let font: &[u8] = FONT.as_bytes();
+            let at: u64 = (character as u64 - font_first() as u64) * 16u64
+                + (row as u64) * glyph_row_chars();
+            if at + 1u64 >= font.len() as u64 {
+                return 0u8;
+            }
+            return ((hex_value(font[at as usize]) * 16u32 + hex_value(font[(at + 1u64) as usize])) % 256u32)
+                as u8;
+        }
+
+        /// Whether one pixel of a glyph row is lit.
+        ///
+        /// `column` counts from the left, so column 0 is the glyph's leftmost
+        /// pixel and is bit 7 of the row byte.
+        ///
+        /// The bit's weight is found by halving from 128 rather than from a shift
+        /// or a table: Lazen v1 has neither a shift operator nor an array-valued
+        /// `const`, and at most seven halvings is not a cost worth a data
+        /// structure. It also cannot go wrong in a way a hand-written constant
+        /// table can — the weight of column 0 is 128 by where the loop starts.
+        pub fn glyph_pixel(row: u8, column: u32) -> bool {
+            if column >= 8u32 {
+                return false;
+            }
+            let mut weight: u32 = 128u32;
+            let mut step: u32 = 0u32;
+            while step < column {
+                weight = weight / 2u32;
+                step = step + 1u32;
+            }
+            let bit: u32 = (row as u32) / weight;
+            return bit % 2u32 == 1u32;
+        }
+
+        /// Packs a canvas's size into one word: width in the high half, height in
+        /// the low.
+        pub fn pack_surface(width: u32, height: u32) -> u64 {
+            return (width as u64) * 4294967296u64 + (height as u64);
+        }
+
+        /// The width of a packed surface.
+        pub fn surface_width(surface: u64) -> u32 {
+            return ((surface / 4294967296u64) % 4294967296u64) as u32;
+        }
+
+        /// The height of a packed surface.
+        pub fn surface_height(surface: u64) -> u32 {
+            return (surface % 4294967296u64) as u32;
+        }
+
+        /// Packs where text starts and what colour it is in, into one word.
+        ///
+        /// `x` and `y` are 16 bits each and the colour is 32, which is the whole
+        /// word. The reason this is packed at all is the argument count: the
+        /// canvas is two words and the text is two more, so the geometry and the
+        /// ink have to share what is left of the ABI's six.
+        pub fn pack_ink(x: u32, y: u32, color: u32) -> u64 {
+            return (x as u64) * 281474976710656u64
+                + (y as u64) * 4294967296u64
+                + (color as u64);
+        }
+
+        /// The `x` of a packed ink.
+        pub fn ink_x(ink: u64) -> u32 {
+            return ((ink / 281474976710656u64) % 65536u64) as u32;
+        }
+
+        /// The `y` of a packed ink.
+        pub fn ink_y(ink: u64) -> u32 {
+            return ((ink / 4294967296u64) % 65536u64) as u32;
+        }
+
+        /// The colour of a packed ink.
+        pub fn ink_color(ink: u64) -> u32 {
+            return (ink % 4294967296u64) as u32;
+        }
+
+        /// Draws `text` with the built-in font, starting at the packed ink's
+        /// position, in the packed ink's colour.
+        ///
+        /// Each character is 8 pixels wide and moves the pen 8 pixels right, so
+        /// characters are single-spaced and the last one hangs a column over the
+        /// string's width. Text is clipped like everything else: a string that
+        /// runs off the right or bottom edge draws the part that is on the canvas,
+        /// and one that starts off the left or top edge draws from the first pixel
+        /// that is visible.
+        ///
+        /// The arguments are packed for the reason `pack_ink` says: this is
+        /// `canvas`, `surface`, `ink` and `text`, which is two words, one, one and
+        /// two.
+        pub fn draw_text(canvas: &mut [u8], surface: u64, ink: u64, text: &str) {
+            let width: u32 = surface_width(surface);
+            let height: u32 = surface_height(surface);
+            let mut start: u64 = ink_x(ink) as u64;
+            let top: u64 = ink_y(ink) as u64;
+            let color: u32 = ink_color(ink);
+            let mut at: u64 = 0u64;
+            let characters: &[u8] = text.as_bytes();
+            while at < characters.len() as u64 {
+                let mut row: u64 = 0u64;
+                while row < 8u64 {
+                    let bits: u8 = glyph_row(characters[at as usize], row as u32);
+                    let mut column: u64 = 0u64;
+                    while column < 8u64 {
+                        if glyph_pixel(bits, column as u32) {
+                            put_pixel(
+                                canvas,
+                                width,
+                                height,
+                                pack_point(
+                                    (start + column) as u32,
+                                    (top + row) as u32
+                                ),
+                                color
+                            );
+                        }
+                        column = column + 1u64;
+                    }
+                    row = row + 1u64;
+                }
+                at = at + 1u64;
+                start = start + 8u64;
+            }
         }
     }
 }

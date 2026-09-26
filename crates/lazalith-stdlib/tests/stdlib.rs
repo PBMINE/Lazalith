@@ -47,6 +47,18 @@ fn supervisor_kernel(architecture: ArchitectureConfig) -> Vec<u8> {
 
 /// Runs `source` under LazOS and returns `(console output, exit code)`.
 fn run(source: &str) -> (String, Option<u32>) {
+    let (output, exit, _) = run_reporting(source);
+    (output, exit)
+}
+
+/// Runs `source` and hands back the kernel too, so a test can read what the
+/// display driver saw rather than only what the program said about it.
+///
+/// A program that presents a frame and a driver that recorded one are two
+/// claims, and only the second one is evidence. The kernel is returned because it
+/// is the only handle on the driver: `LazalithKernel` owns the display service,
+/// and a Lazen program has no other path to it.
+fn run_reporting(source: &str) -> (String, Option<u32>, LazalithKernel) {
     let config = ArchitectureConfig::lz64();
     let program = RuntimeProgram::build(source, &BuildOptions::lz64("stdlib.lz"))
         .unwrap_or_else(|error| panic!("{source} should build: {error}"));
@@ -97,7 +109,7 @@ fn run(source: &str) -> (String, Option<u32>) {
     }
     let exit = exit.expect("the program finished within its budget");
     let output = String::from_utf8_lossy(kernel.terminal().terminal().output()).into_owned();
-    (output, Some(exit))
+    (output, Some(exit), kernel)
 }
 
 /// Runs `source` and requires it to report success.
@@ -556,5 +568,458 @@ fn a_freestanding_program_needs_no_standard_library() {
         String::from_utf8_lossy(kernel.terminal().terminal().output()),
         "bare\n",
         "the runtime alone is enough to print"
+    );
+}
+
+// ------------------------------------------------------------- Step 70: graphics
+
+/// A window opens over the program's own memory and the driver records that
+/// address, byte for byte.
+///
+/// The device shares guest memory rather than copying, so the only way to see a
+/// window is to read the address back. If the driver had allocated its own
+/// framebuffer, the program would be drawing somewhere the device never looks.
+#[test]
+fn a_window_is_the_programs_own_memory() {
+    let (output, exit, kernel) = run_reporting(
+        r#"
+        fn main() -> i32 {
+            let mut framebuffer: [u8; 64] = [0u8; 64];
+            let mut record: [u8; 24] = [0u8; 24];
+            if !std::graphics::open(4, 4, framebuffer.as_mut_slice(), record.as_mut_slice()) {
+                return 1;
+            }
+            if std::graphics::record_width(record.as_slice()) != 4u32 {
+                return 2;
+            }
+            if std::graphics::record_height(record.as_slice()) != 4u32 {
+                return 3;
+            }
+            // The record's address is the framebuffer's, so the two agree and the
+            // program can check that the driver saw what it passed.
+            if std::graphics::record_framebuffer(record.as_slice())
+                != framebuffer.as_ptr() as u64 {
+                return 4;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+    );
+    assert_eq!(exit, Some(0), "the window opened: {output:?}");
+    let device = kernel.display().device();
+    assert!(device.is_open(), "the driver opened a window");
+    assert_eq!(device.width(), 4, "at the geometry the program asked for");
+    assert_eq!(device.height(), 4);
+    // The device names guest memory, so its address is in memory the guest may
+    // write: the program's framebuffer is a local, so it is on the stack rather
+    // than in the data segment. The program separately checked that the address
+    // in its record was the address of its own framebuffer, so between the two
+    // the device and the program are looking at the same bytes.
+    let address = device.framebuffer();
+    let in_data = (lazalith_os::USER_DATA_START
+        ..lazalith_os::USER_DATA_START + lazalith_os::USER_DATA_LENGTH)
+        .contains(&address);
+    let in_stack = (lazalith_os::USER_STACK_START
+        ..lazalith_os::USER_STACK_START + lazalith_os::USER_STACK_LENGTH)
+        .contains(&address);
+    assert!(
+        in_data || in_stack,
+        "the device's framebuffer is guest memory the guest owns, at {address}"
+    );
+    assert!(
+        kernel.display().last_frame().is_none(),
+        "an open window is not a presented frame: nothing has been shown yet"
+    );
+}
+
+/// A framebuffer too small for the window is refused by the SDK before the
+/// driver is asked, so a program that got its arithmetic wrong learns so from a
+/// `false` rather than from a fault it cannot handle.
+#[test]
+fn a_framebuffer_too_small_is_refused_without_trapping() {
+    let (output, exit, kernel) = run_reporting(
+        r#"
+        fn main() -> i32 {
+            let mut small: [u8; 8] = [0u8; 8];
+            let mut record: [u8; 24] = [0u8; 24];
+            // 4 by 4 is 64 bytes; eight is not enough.
+            if std::graphics::open(4, 4, small.as_mut_slice(), record.as_mut_slice()) {
+                return 1;
+            }
+            let mut tiny_record: [u8; 4] = [0u8; 4];
+            let mut framebuffer: [u8; 64] = [0u8; 64];
+            if std::graphics::open(4, 4, framebuffer.as_mut_slice(), tiny_record.as_mut_slice()) {
+                return 2;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+    );
+    assert_eq!(exit, Some(0), "both refusals were reported: {output:?}");
+    assert!(
+        kernel.display().last_frame().is_none(),
+        "and no window was left open"
+    );
+}
+
+/// Drawing puts whole ARGB8888 pixels at the right offsets, and reading one back
+/// gives the same number.
+#[test]
+fn pixels_are_argb8888_at_the_right_offsets() {
+    let (output, exit) = run(r#"
+        fn main() -> i32 {
+            // 0xAARRGGBB: alpha high, blue low, and that is the byte order.
+            let red: u32 = std::graphics::rgba(255u8, 0u8, 0u8, 255u8);
+            if red != 4294901760u32 {
+                return 1;
+            }
+            let green: u32 = std::graphics::rgba(0u8, 255u8, 0u8, 255u8);
+            if green != 4278255360u32 {
+                return 2;
+            }
+            let blue: u32 = std::graphics::rgba(0u8, 0u8, 255u8, 255u8);
+            if blue != 4278190335u32 {
+                return 3;
+            }
+            if std::graphics::alpha_of(red) != 255u8 {
+                return 4;
+            }
+            if std::graphics::red_of(red) != 255u8 {
+                return 5;
+            }
+            if std::graphics::green_of(green) != 255u8 {
+                return 6;
+            }
+            if std::graphics::blue_of(blue) != 255u8 {
+                return 7;
+            }
+            // Opaque white is all four channels, so it is all ones.
+            if std::graphics::white() != 4294967295u32 {
+                return 8;
+            }
+
+            let mut canvas: [u8; 32] = [0u8; 32];
+            std::graphics::put_pixel(
+                canvas.as_mut_slice(),
+                4u32,
+                2u32,
+                std::graphics::pack_point(1u32, 1u32),
+                red
+            );
+            // Pixel (1, 1) of a four-wide canvas is at byte 4 * (1 * 4 + 1).
+            // The four bytes at that offset are A, R, G, B, so a red pixel is
+            // full alpha, then full red, then nothing.
+            if canvas[20] != 255u8 || canvas[21] != 255u8 {
+                return 9;
+            }
+            if canvas[22] != 0u8 || canvas[23] != 0u8 {
+                return 10;
+            }
+            if canvas[0] != 0u8 {
+                return 11;
+            }
+            // And reading it back gives the same number.
+            if std::graphics::get_pixel(canvas.as_slice(), 4u32, 2u32, 1u32, 1u32) != red {
+                return 12;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#);
+    assert_eq!(exit, Some(0), "every pixel check held: {output:?}");
+    assert_eq!(output, "ok");
+}
+
+/// Clipping is total: a rectangle off two edges draws its visible part and
+/// nothing outside, and one entirely off the canvas draws nothing at all.
+#[test]
+fn drawing_is_clipped_on_every_side() {
+    let (output, exit) = run(r#"
+        fn main() -> i32 {
+            let blue: u32 = std::graphics::rgba(0u8, 0u8, 255u8, 255u8);
+            // A four by two canvas, so bytes 0..32.
+            let mut canvas: [u8; 32] = [0u8; 32];
+            // A rectangle hanging off the right and the bottom: the visible
+            // part is the last two columns of the last row, and nothing else.
+            std::graphics::fill_rect(
+                canvas.as_mut_slice(),
+                4u32,
+                2u32,
+                std::graphics::pack_rect(2u32, 1u32, 4u32, 4u32),
+                blue
+            );
+            if std::graphics::get_pixel(canvas.as_slice(), 4u32, 2u32, 0u32, 0u32) != 0u32 {
+                return 1;
+            }
+            if std::graphics::get_pixel(canvas.as_slice(), 4u32, 2u32, 1u32, 0u32) != 0u32 {
+                return 2;
+            }
+            if std::graphics::get_pixel(canvas.as_slice(), 4u32, 2u32, 2u32, 0u32) != 0u32 {
+                return 3;
+            }
+            if std::graphics::get_pixel(canvas.as_slice(), 4u32, 2u32, 3u32, 0u32) != 0u32 {
+                return 4;
+            }
+            if std::graphics::get_pixel(canvas.as_slice(), 4u32, 2u32, 0u32, 1u32) != 0u32 {
+                return 5;
+            }
+            if std::graphics::get_pixel(canvas.as_slice(), 4u32, 2u32, 1u32, 1u32) != 0u32 {
+                return 6;
+            }
+            if std::graphics::get_pixel(canvas.as_slice(), 4u32, 2u32, 2u32, 1u32) != blue {
+                return 7;
+            }
+            if std::graphics::get_pixel(canvas.as_slice(), 4u32, 2u32, 3u32, 1u32) != blue {
+                return 8;
+            }
+            // Nothing was written past the end: byte 32 is out of the canvas
+            // entirely, so reading it is the check that the loop stopped.
+            if canvas[31] != 0xffu8 {
+                return 6;
+            }
+            if std::graphics::get_pixel(canvas.as_slice(), 4u32, 2u32, 0u32, 1u32) != 0u32 {
+                return 7;
+            }
+            // A rectangle entirely off the canvas draws nothing.
+            let mut other: [u8; 32] = [0u8; 32];
+            std::graphics::fill_rect(
+                other.as_mut_slice(),
+                4u32,
+                2u32,
+                std::graphics::pack_rect(9u32, 9u32, 2u32, 2u32),
+                blue
+            );
+            if std::graphics::get_pixel(other.as_slice(), 4u32, 2u32, 0u32, 0u32) != 0u32 {
+                return 8;
+            }
+            // `clear` fills exactly the canvas and no more.
+            let mut third: [u8; 32] = [0u8; 32];
+            std::graphics::clear(third.as_mut_slice(), blue);
+            if std::graphics::get_pixel(third.as_slice(), 4u32, 2u32, 3u32, 1u32) != blue {
+                return 9;
+            }
+            if third[31] != 0xffu8 {
+                return 10;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#);
+    assert_eq!(exit, Some(0), "every clip held: {output:?}");
+    assert_eq!(output, "ok");
+}
+
+/// A packed rectangle round-trips every field at 16 bits.
+///
+/// The packer gave one field fewer bits than its reader expected, so a rectangle
+/// below 256 was fine and one above it was drawn somewhere else. A canvas taller
+/// than 256 rows is unusual, so only a test that uses large fields would see it.
+#[test]
+fn a_packed_rectangle_round_trips_every_field() {
+    let (output, exit) = run(r#"
+        fn main() -> i32 {
+            let packed: u64 = std::graphics::pack_rect(40000u32, 300u32, 5000u32, 60000u32);
+            if std::graphics::rect_x(packed) != 40000u32 { return 1; }
+            if std::graphics::rect_y(packed) != 300u32 { return 2; }
+            if std::graphics::rect_w(packed) != 5000u32 { return 3; }
+            if std::graphics::rect_h(packed) != 60000u32 { return 4; }
+            let zero: u64 = std::graphics::pack_rect(0u32, 0u32, 0u32, 0u32);
+            if std::graphics::rect_x(zero) != 0u32 { return 5; }
+            if std::graphics::rect_h(zero) != 0u32 { return 6; }
+            // A point is two 16-bit halves too.
+            let point: u64 = std::graphics::pack_point(40000u32, 300u32);
+            if std::graphics::point_x(point) != 40000u32 { return 7; }
+            if std::graphics::point_y(point) != 300u32 { return 8; }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#);
+    assert_eq!(exit, Some(0), "every field round-tripped: {output:?}");
+    assert_eq!(output, "ok");
+}
+
+/// Text draws real glyphs from the built-in font, in the colour it was given.
+///
+/// The font is a resource of the SDK and not a host asset, so this is the same
+/// bytes headless and graphical. The checks are on pixels, not on a return value:
+/// a `draw_text` that drew nothing and a `draw_text` that drew the wrong glyphs
+/// both return nothing to test.
+#[test]
+fn text_draws_glyphs_from_the_builtin_font() {
+    let (output, exit) = run(r#"
+        fn main() -> i32 {
+            // 'A' is the thirty-third glyph. Its first row is 0b00111100, so
+            // columns two through five are lit and the rest are not.
+            let first: u8 = std::graphics::glyph_row(65u8, 0u32);
+            if first != 60u8 {
+                return 1;
+            }
+            if !std::graphics::glyph_pixel(first, 2u32) { return 2; }
+            if !std::graphics::glyph_pixel(first, 5u32) { return 3; }
+            if std::graphics::glyph_pixel(first, 0u32) { return 4; }
+            if std::graphics::glyph_pixel(first, 7u32) { return 5; }
+            // A space is blank and a row below the font is blank.
+            if std::graphics::glyph_row(32u8, 0u32) != 0u8 { return 6; }
+            if std::graphics::glyph_row(65u8, 7u32) != 0u8 { return 7; }
+            // A code with no glyph draws nothing rather than a neighbour's.
+            if std::graphics::glyph_row(7u8, 0u32) != 0u8 { return 8; }
+
+            let white: u32 = std::graphics::white();
+            // A canvas wide enough for two glyphs and three rows tall.
+            let mut canvas: [u8; 96] = [0u8; 96];
+            std::graphics::draw_text(
+                canvas.as_mut_slice(),
+                std::graphics::pack_surface(8u32, 3u32),
+                std::graphics::pack_ink(0u32, 0u32, white),
+                "A"
+            );
+            // Row 0, column 2 is lit; row 0, column 0 is not.
+            if std::graphics::get_pixel(canvas.as_slice(), 8u32, 3u32, 2u32, 0u32) != white {
+                return 9;
+            }
+            if std::graphics::get_pixel(canvas.as_slice(), 8u32, 3u32, 0u32, 0u32) != 0u32 {
+                return 10;
+            }
+            // Row 1 of 'A' is `.##..##.`, so columns 1, 2, 5 and 6.
+            if std::graphics::get_pixel(canvas.as_slice(), 8u32, 3u32, 1u32, 1u32) != white {
+                return 11;
+            }
+            if std::graphics::get_pixel(canvas.as_slice(), 8u32, 3u32, 5u32, 1u32) != white {
+                return 12;
+            }
+            if std::graphics::get_pixel(canvas.as_slice(), 8u32, 3u32, 3u32, 1u32) != 0u32 {
+                return 17;
+            }
+            // A second character starts eight columns along, which is the next
+            // glyph cell and not one column further.
+            let mut two: [u8; 96] = [0u8; 96];
+            std::graphics::draw_text(
+                two.as_mut_slice(),
+                std::graphics::pack_surface(16u32, 3u32),
+                std::graphics::pack_ink(0u32, 0u32, white),
+                "AA"
+            );
+            if std::graphics::get_pixel(two.as_slice(), 16u32, 3u32, 10u32, 0u32) != white {
+                return 13;
+            }
+            if std::graphics::get_pixel(two.as_slice(), 16u32, 3u32, 9u32, 0u32) != 0u32 {
+                return 14;
+            }
+            // Text that runs off the right edge is clipped, not a fault.
+            let mut edge: [u8; 96] = [0u8; 96];
+            std::graphics::draw_text(
+                edge.as_mut_slice(),
+                std::graphics::pack_surface(8u32, 3u32),
+                std::graphics::pack_ink(4u32, 0u32, white),
+                "AAA"
+            );
+            if std::graphics::get_pixel(edge.as_slice(), 8u32, 3u32, 6u32, 0u32) != white {
+                return 15;
+            }
+            // And text that starts off the left edge draws from what is visible.
+            let mut left: [u8; 96] = [0u8; 96];
+            std::graphics::draw_text(
+                left.as_mut_slice(),
+                std::graphics::pack_surface(8u32, 3u32),
+                std::graphics::pack_ink(0u32, 0u32, white),
+                "A"
+            );
+            if std::graphics::get_pixel(left.as_slice(), 8u32, 3u32, 2u32, 0u32) != white {
+                return 16;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#);
+    assert_eq!(exit, Some(0), "every glyph check held: {output:?}");
+    assert_eq!(output, "ok");
+}
+
+/// Presenting reports the frame count, and the driver saw the frame at the
+/// address the program passed.
+#[test]
+fn presenting_reports_frames_and_the_driver_sees_them() {
+    let (output, exit, kernel) = run_reporting(
+        r#"
+        fn main() -> i32 {
+            let mut framebuffer: [u8; 64] = [0u8; 64];
+            let mut record: [u8; 24] = [0u8; 24];
+            if !std::graphics::open(4, 4, framebuffer.as_mut_slice(), record.as_mut_slice()) {
+                return 1;
+            }
+            let white: u32 = std::graphics::white();
+            std::graphics::clear(framebuffer.as_mut_slice(), white);
+            let mut count: [u8; 8] = [0u8; 8];
+            let mut at: u64 = 0u64;
+            while at < 3u64 {
+                if !std::graphics::present(framebuffer.as_mut_slice(), count.as_mut_slice()) {
+                    return 2;
+                }
+                let frames: u64 = rt::sys::read_u64(count.as_slice(), 0);
+                if frames != at + 1u64 {
+                    return 3;
+                }
+                at = at + 1u64;
+            }
+            // Presenting some other address is refused: the frame count does not
+            // move, and the program is told so.
+            let mut other: [u8; 64] = [0u8; 64];
+            if std::graphics::present(other.as_mut_slice(), count.as_mut_slice()) {
+                return 4;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+    );
+    assert_eq!(
+        exit,
+        Some(0),
+        "the present loop agreed with the program: {output:?}"
+    );
+    let frame = kernel
+        .display()
+        .last_frame()
+        .expect("the driver recorded a frame");
+    assert_eq!(frame.width, 4, "the driver's window is the one opened");
+    assert_eq!(frame.height, 4);
+    assert_eq!(
+        frame.present_count, 3,
+        "three presents, and the fourth was refused"
+    );
+}
+
+/// A Lazen program reaches the display device only through the SDK.
+///
+/// The driver is the only thing that talks to the device, and the SDK is the only
+/// thing a program can name. This test states that by checking the program that
+/// never calls the SDK leaves the driver with no window at all.
+#[test]
+fn a_program_that_never_opens_a_window_has_no_frame() {
+    let (output, exit, kernel) = run_reporting(
+        r#"
+        fn main() -> i32 {
+            // Arithmetic that a graphical program would do, with no display call
+            // anywhere: a program that cannot name the device has no frame.
+            let mut total: u64 = 0u64;
+            let mut index: u64 = 0u64;
+            while index < 10u64 {
+                total = total + index;
+                index = index + 1u64;
+            }
+            if total != 45u64 {
+                return 1;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+    );
+    assert_eq!(exit, Some(0), "{output:?}");
+    assert!(
+        kernel.display().last_frame().is_none(),
+        "no display call means no window and no frame"
     );
 }

@@ -1,13 +1,16 @@
+use crate::display::DisplayService;
 use crate::{
-    DispatchOutcome, FileSystemService, LzxArchitecture, LzxError, LzxImage, NativeShellImageError,
-    ProcessError, ProcessId, RoundRobinScheduler, SchedulerError, SchedulerStep, TerminalService,
-    ThreadId, VirtualFileSystem, VirtualTerminal, build_init_shell_image,
+    DispatchOutcome, FileSystemService, KernelService, LzxArchitecture, LzxError, LzxImage,
+    NativeShellImageError, ProcessError, ProcessId, RoundRobinScheduler, SchedulerError,
+    SchedulerStep, ServiceOutcome, TerminalService, ThreadId, UserMemoryContext, ValidatedSyscall,
+    ValidatedSyscallKind, VirtualFileSystem, VirtualTerminal, build_init_shell_image,
 };
 use core::{error::Error, fmt};
 use lazalith_cpu::TrapCause;
 use lazalith_devices::Device;
 use lazalith_machine::{LazalithMachine, MachineEvent};
 use lazalith_os_abi::{SyscallError, TaggedOutcome};
+use lazalith_types::ArchitectureConfig;
 
 #[derive(Debug)]
 pub enum KernelError {
@@ -52,9 +55,58 @@ pub struct KernelStep {
     pub outcome: Option<KernelServiceOutcome>,
 }
 
+/// The kernel's services, together.
+///
+/// Dispatch needs *one* service to hand a validated syscall to, but a kernel has
+/// more than one: the terminal owns the console and the filesystem, the display
+/// driver owns the window. Routing them through a composite keeps `dispatch`
+/// unchanged and keeps each owner responsible for its own calls — a syscall
+/// reaching the wrong owner is a routing bug that shows up immediately as an
+/// "unknown syscall" rather than as a subtly wrong answer.
+pub struct KernelServices {
+    terminal: TerminalService,
+    display: DisplayService,
+}
+
+impl KernelServices {
+    /// The terminal service, for a caller that wants the console.
+    pub const fn terminal(&self) -> &TerminalService {
+        &self.terminal
+    }
+
+    /// The terminal service, mutably.
+    pub fn terminal_mut(&mut self) -> &mut TerminalService {
+        &mut self.terminal
+    }
+
+    /// The display driver, for a caller that wants the window.
+    pub const fn display(&self) -> &DisplayService {
+        &self.display
+    }
+
+    /// The display driver, mutably.
+    pub fn display_mut(&mut self) -> &mut DisplayService {
+        &mut self.display
+    }
+}
+
+impl KernelService for KernelServices {
+    fn invoke(
+        &mut self,
+        syscall: &ValidatedSyscall,
+        memory: &mut UserMemoryContext<'_>,
+    ) -> ServiceOutcome {
+        match syscall.kind() {
+            ValidatedSyscallKind::DisplayOpen { .. }
+            | ValidatedSyscallKind::DisplayPresent { .. } => self.display.invoke(syscall, memory),
+            _ => self.terminal.invoke(syscall, memory),
+        }
+    }
+}
+
 pub struct LazalithKernel {
     scheduler: RoundRobinScheduler,
-    terminal: TerminalService,
+    services: KernelServices,
 }
 
 impl LazalithKernel {
@@ -63,11 +115,29 @@ impl LazalithKernel {
         terminal: VirtualTerminal,
         filesystem: VirtualFileSystem,
     ) -> Result<Self, KernelError> {
+        Self::with_architecture(quantum, terminal, filesystem, ArchitectureConfig::lz64())
+    }
+
+    /// A kernel whose services target `architecture`.
+    ///
+    /// The display driver's records are sized and word-width checked against the
+    /// architecture, so a kernel that has to dispatch a display call needs to know
+    /// which one. It defaults to LZ64 because that is the only target the Lazen
+    /// pipeline generates today, and a kernel with no display traffic is
+    /// unaffected either way.
+    pub fn with_architecture(
+        quantum: u64,
+        terminal: VirtualTerminal,
+        filesystem: VirtualFileSystem,
+        architecture: ArchitectureConfig,
+    ) -> Result<Self, KernelError> {
         let scheduler = RoundRobinScheduler::new(quantum).map_err(KernelError::Scheduler)?;
-        let terminal = TerminalService::new(terminal, FileSystemService::new(filesystem));
         Ok(Self {
             scheduler,
-            terminal,
+            services: KernelServices {
+                terminal: TerminalService::new(terminal, FileSystemService::new(filesystem)),
+                display: DisplayService::new(architecture),
+            },
         })
     }
 
@@ -112,7 +182,7 @@ impl LazalithKernel {
             MachineEvent::Trapped { event } if event.cause == TrapCause::Syscall => {
                 let outcome = self
                     .scheduler
-                    .dispatch_syscall(machine, &mut self.terminal)
+                    .dispatch_syscall(machine, &mut self.services)
                     .map_err(KernelError::Scheduler)?;
                 match outcome {
                     DispatchOutcome::Return {
@@ -147,10 +217,20 @@ impl LazalithKernel {
     }
 
     pub const fn terminal(&self) -> &TerminalService {
-        &self.terminal
+        self.services.terminal()
     }
 
     pub fn terminal_mut(&mut self) -> &mut TerminalService {
-        &mut self.terminal
+        self.services.terminal_mut()
+    }
+
+    /// The display driver, for a host frontend that wants the presented frame.
+    pub const fn display(&self) -> &DisplayService {
+        self.services.display()
+    }
+
+    /// The display driver, mutably, for a host that sets a window up directly.
+    pub fn display_mut(&mut self) -> &mut DisplayService {
+        self.services.display_mut()
     }
 }

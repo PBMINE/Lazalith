@@ -4053,6 +4053,8 @@ pub const ABI_SYSCALLS: &[(&str, Syscall)] = &[
     ("spawn_process", Syscall::SpawnProcess),
     ("wait_process", Syscall::WaitProcess),
     ("clear_screen", Syscall::ClearScreen),
+    ("display_open", Syscall::DisplayOpen),
+    ("display_present", Syscall::DisplayPresent),
 ];
 
 /// Syscall names the Lazen design reserves for a later ABI step.
@@ -4060,7 +4062,10 @@ pub const ABI_SYSCALLS: &[(&str, Syscall)] = &[
 /// `docs/lazen-graphics.md` and `docs/lazen-input.md` specify these calls, but
 /// the ABI does not number them yet. The frontend accepts such a declaration
 /// and records that it is unmapped, so it never invents a syscall number.
-pub const RESERVED_DESIGN_SYSCALLS: &[&str] = &["display_open", "display_present", "input_poll"];
+/// `input_poll` is the one the design reserves that the ABI still does not
+/// number: the input driver is Step 71, and numbering a call before its driver
+/// exists would give a program a number that answers with nothing.
+pub const RESERVED_DESIGN_SYSCALLS: &[&str] = &["input_poll"];
 
 /// The syscall a declared name maps to, if the ABI has one.
 pub fn abi_syscall(name: &str) -> Option<Syscall> {

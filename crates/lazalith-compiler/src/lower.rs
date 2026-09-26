@@ -1743,6 +1743,14 @@ impl<'a> FunctionLowering<'a> {
                 detail: format!("a cast to `{}`", ty_name(to)),
                 span: operand.span().clone(),
             })?;
+        // A target wider than a word cannot be produced by a single load, so the
+        // conversion is reported rather than approximated.
+        if target_size > 8 {
+            return Err(LowerError::UnsupportedShape {
+                detail: format!("a cast to `{}`", ty_name(to)),
+                span: operand.span().clone(),
+            });
+        }
         let slot = match self.cast_scratch {
             Some(slot) => slot,
             None => {
@@ -1754,9 +1762,12 @@ impl<'a> FunctionLowering<'a> {
         let value = self.value(operand)?;
         self.store_slot(slot, value, from)?;
         let address = self.frame_address(slot)?;
-        // A load may be narrower than its type, which is an extension, but never
-        // wider, which would read bytes the value does not have.
-        let width = if target_size < 8 {
+        // The load reads back what the store just wrote, so it can never be
+        // wider than the source: the store put `source_width`'s bytes in the
+        // scratch and the bytes above them were never written. A load narrower
+        // than its type is the extension the cast asks for, so the narrower of
+        // the two is what carries the value across without inventing bytes.
+        let width = if target_width.bytes() <= source_width.bytes() {
             target_width
         } else {
             source_width

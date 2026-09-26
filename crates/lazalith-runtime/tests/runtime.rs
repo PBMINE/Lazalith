@@ -500,3 +500,65 @@ fn a_write_through_a_view_reaches_the_data() {
     assert_eq!(exit, Some(0), "every check held");
     assert_eq!(output, "ok");
 }
+
+/// A widened value is the value that was widened, not the frame around it.
+///
+/// A cast stages its operand in a scratch word and loads it back at a width. If
+/// the load is wider than the store, the bytes it adds are the frame's, and the
+/// result depends on what else the function happened to put there. That is
+/// invisible in a program with one cast and visible in one with a view beside it,
+/// so the test has one: a two-word local next to the scratch, which is what
+/// decides the bytes above a one-byte staged value.
+///
+/// The narrowed direction is here too, because the same width chooses both: a
+/// cast must not lose the low bytes of a wider source.
+#[test]
+fn a_widened_value_keeps_the_bytes_it_was_widened_from() {
+    let (output, exit) = build_and_run(
+        r#"
+        fn widen(byte: u8) -> u32 {
+            return byte as u32;
+        }
+        fn view_of(address: u64, length: u64) -> &[u8] {
+            return (address as ptr<u8>).slice_from_raw(length);
+        }
+        fn main() -> i32 {
+            let mut data: [u8; 8] = [0u8; 8];
+            // A two-word local, so the frame has a view in it before the cast
+            // that reads the scratch the cast staged its operand in.
+            let seen: &[u8] = view_of(data.as_ptr() as u64, 8u64);
+            if widen(255u8) != 255u32 {
+                return 1;
+            }
+            if widen(7u8) != 7u32 {
+                return 2;
+            }
+            // Reading a byte out of a view and widening it, which is what the
+            // graphics read-back path does.
+            data[3] = 200u8;
+            if widen(seen[3]) != 200u32 {
+                return 3;
+            }
+            if seen[3] as u32 != 200u32 {
+                return 4;
+            }
+            // A signed source keeps its sign across the same width.
+            let small: i8 = -1;
+            if small as i32 != -1 {
+                return 5;
+            }
+            // And a narrower target keeps the low bytes of a wider source.
+            let wide: u64 = 4294967297;
+            if wide as u32 != 1u32 {
+                return 6;
+            }
+            rt::sys::print("ok");
+            return 0;
+        }
+        "#,
+    );
+    // Each exit code names the check that failed, so the failure says which
+    // direction of the cast went wrong rather than just that one did.
+    assert_eq!(exit, Some(0), "every widening and narrowing held");
+    assert_eq!(output, "ok");
+}

@@ -664,14 +664,28 @@ mod ui {
 }
 "#,
     );
-    // The design reserves these names for a later ABI step, so they are
-    // accepted but carry no syscall number yet.
+    // Step 70 gives these two names their syscall numbers, so a program that
+    // declares them is calling the display driver rather than a reserved name.
     let display = program
         .externs
         .iter()
         .find(|declaration| declaration.name == "display_open")
         .expect("a display_open declaration");
-    assert!(display.syscall.is_none(), "no number is invented");
+    assert_eq!(
+        display.syscall,
+        Some(lazalith_os_abi::Syscall::DisplayOpen),
+        "display_open opens the display through the numbered ABI"
+    );
+    let present = program
+        .externs
+        .iter()
+        .find(|declaration| declaration.name == "display_present")
+        .expect("a display_present declaration");
+    assert_eq!(
+        present.syscall,
+        Some(lazalith_os_abi::Syscall::DisplayPresent),
+        "and display_present presents through the numbered ABI"
+    );
 }
 
 // --------------------------------------------------------------- section 12

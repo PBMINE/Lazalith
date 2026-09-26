@@ -29,6 +29,16 @@ pub enum Syscall {
     SpawnProcess = 0x000c,
     WaitProcess = 0x000d,
     ClearScreen = 0x000e,
+    /// Opens a window and reports the framebuffer the guest owns.
+    ///
+    /// Step 70. The guest is handed an *address*, not a copy: the display device
+    /// shares the guest's memory, so a call that returned pixels would be a
+    /// transfer the design explicitly does not make.
+    DisplayOpen = 0x000f,
+    /// Presents the framebuffer at the address the guest supplied.
+    ///
+    /// Step 70. A present is a synchronisation point, not an upload.
+    DisplayPresent = 0x0010,
 }
 
 impl Syscall {
@@ -47,6 +57,8 @@ impl Syscall {
         Self::SpawnProcess,
         Self::WaitProcess,
         Self::ClearScreen,
+        Self::DisplayOpen,
+        Self::DisplayPresent,
     ];
 
     pub const fn as_u16(self) -> u16 {
@@ -64,6 +76,10 @@ impl Syscall {
             Self::Open | Self::Seek | Self::Stat | Self::AllocateMemory => 4,
             Self::Write | Self::Read | Self::ListDirectory | Self::SpawnProcess => 5,
             Self::ClearScreen => 0,
+            // `display_open` takes the geometry, the framebuffer address and a
+            // record; `display_present` takes only the framebuffer address.
+            Self::DisplayOpen => 4,
+            Self::DisplayPresent => 2,
         }
     }
 
@@ -79,7 +95,9 @@ impl Syscall {
             | Self::ListDirectory
             | Self::Time
             | Self::Sleep
-            | Self::SpawnProcess => 0,
+            | Self::SpawnProcess
+            | Self::DisplayOpen
+            | Self::DisplayPresent => 0,
         }
     }
 
@@ -89,6 +107,11 @@ impl Syscall {
             Self::Write | Self::Read | Self::ListDirectory | Self::SpawnProcess => 0x0020,
             Self::Open | Self::Seek | Self::Stat | Self::AllocateMemory => 0x0030,
             Self::WaitProcess => 0x0038,
+            // `display_open` names four arguments and `display_present` two, and
+            // the registers past the ones each uses must be zero for the kernel
+            // to accept the call.
+            Self::DisplayOpen => 0x0030,
+            Self::DisplayPresent => 0x003c,
             Self::ClearScreen => 0,
         }
     }
@@ -125,6 +148,8 @@ impl TryFrom<u16> for Syscall {
             0x000c => Ok(Self::SpawnProcess),
             0x000d => Ok(Self::WaitProcess),
             0x000e => Ok(Self::ClearScreen),
+            0x000f => Ok(Self::DisplayOpen),
+            0x0010 => Ok(Self::DisplayPresent),
             _ => Err(AbiError::UnknownSyscall(u64::from(input))),
         }
     }

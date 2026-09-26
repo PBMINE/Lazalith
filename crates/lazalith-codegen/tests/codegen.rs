@@ -1226,3 +1226,115 @@ fn a_two_word_result_survives_into_the_callers_frame() {
          length it was made with"
     );
 }
+
+/// A wide constant is the number it was written as.
+///
+/// A word's immediate is signed, so a 64-bit constant is built from two halves.
+/// The halves have to be put back the way they came apart: the high half shifted
+/// up, and the low half in the bottom 32 bits with the sign extension `LI` gave
+/// it taken back off. Combining them the other way round — shift the *low* half
+/// up and or the high half in unshifted — yields `(low << 32) | high`, so
+/// `4294967296` arrived as `1` and every program that multiplied by a word-bound
+/// constant silently multiplied by something else.
+///
+/// The halves can also disagree about the sign in both directions, and both were
+/// wrong: a high half of zeros above a low half with bit 31 set, and a high half
+/// of ones above a low half with bit 31 clear. `LI` alone is right only when the
+/// high half *is* the low half's sign extension.
+#[test]
+fn a_wide_constant_is_the_number_it_was_written_as() {
+    // Each is returned by a function of its own, so the constant is materialised
+    // in a function whose only job is to return it: a constant folded into a
+    // larger expression could be built by a different path than the one tested.
+    let source = r#"
+        extern "syscall" fn write(
+            handle: u32,
+            buffer: ptr<u8>,
+            count: u64,
+            result: ptr<u8>
+        ) -> i64;
+
+        // 0x0000_0001_0000_0000: the constant that came out as 1.
+        fn shifted() -> u64 {
+            return 1u64 * 4294967296u64;
+        }
+        // 0x0000_0001_0000_0001: a high half that is neither zero nor all ones.
+        fn mixed() -> u64 {
+            return 4294967297u64;
+        }
+        // 0xFFFF_FFFF_0000_0001: a high half of ones above a low half with bit
+        // 31 clear, so a sign-extending `LI` of the low half is not the number.
+        fn negative_high() -> u64 {
+            return 18446744069414584321u64;
+        }
+        // 0x0000_0000_8000_0000: a high half of zero above a low half with bit
+        // 31 set, so the same `LI` sign-extends a positive number negative.
+        fn positive_high() -> u64 {
+            return 2147483648u64;
+        }
+        // 0xFFFF_FFFF_8000_0000: the one shape where a single `LI` is right, so
+        // the short path has to still produce it.
+        fn short_path() -> u64 {
+            return 18446744071562067968u64;
+        }
+        // 0x0000_0002_0000_0000: both halves set, with a zero low half.
+        fn both_halves() -> u64 {
+            return 2u64 * 4294967296u64;
+        }
+
+        fn main() -> i32 {
+            let mut bytes: [u8; 48] = [0u8; 48];
+            let mut place: u64 = 0u64;
+            let mut value: u64 = shifted();
+            while place < 48u64 {
+                bytes[place as usize] = (value % 256u64) as u8;
+                value = value / 256u64;
+                place = place + 1u64;
+                if place == 8u64 { value = mixed(); }
+                if place == 16u64 { value = negative_high(); }
+                if place == 24u64 { value = positive_high(); }
+                if place == 32u64 { value = short_path(); }
+                if place == 40u64 { value = both_halves(); }
+            }
+            let status: i64 = write(
+                1,
+                bytes.as_ptr(),
+                48u64,
+                bytes.as_mut_slice().as_ptr() as ptr<u8>
+            );
+            if status != 0 {
+                return 90;
+            }
+            return 0;
+        }
+    "#;
+    let (object, _) = generate_object(source);
+    let harness = harness(
+        "harness",
+        &["fn.main"],
+        "         CALL fn.main\n\
+         MOV r1, r0\n\
+         LI r0, 1\n\
+         LI r7, 0\n\
+         SYSCALL\n",
+    );
+    let (output, code) = run(vec![harness, object], "entry");
+    assert_eq!(code, Some(0), "every constant survived the round trip");
+    // Each value is eight little-endian bytes, so the output is the six
+    // constants back to back.
+    let expected: Vec<u8> = [
+        0x0000_0001_0000_0000u64,
+        0x0000_0001_0000_0001,
+        0xFFFF_FFFF_0000_0001,
+        0x0000_0000_8000_0000,
+        0xFFFF_FFFF_8000_0000,
+        0x0000_0002_0000_0000,
+    ]
+    .into_iter()
+    .flat_map(u64::to_le_bytes)
+    .collect();
+    assert_eq!(
+        output, expected,
+        "each constant is exactly the bit pattern it was written as"
+    );
+}

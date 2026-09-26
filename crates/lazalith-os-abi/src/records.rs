@@ -434,3 +434,86 @@ impl fmt::Display for AbiFileKind {
         }
     }
 }
+
+/// How many bytes one display-open record occupies.
+///
+/// Three fields — a width, a height and a framebuffer address — and nothing else.
+/// A record whose size the ABI fixes is one a program can lay out in its own
+/// frame, which is the only way a v1 program can receive a value at all.
+pub const DISPLAY_RECORD_SIZE: usize = 24;
+
+/// What `display_open` reports back to the guest.
+///
+/// This is the *address* of a framebuffer the guest already owns, not a copy of
+/// its pixels. The display device shares the guest's memory, so a record
+/// carrying pixels would be a transfer the design explicitly does not make.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DisplayRecord {
+    width: u32,
+    height: u32,
+    framebuffer: u64,
+}
+
+impl DisplayRecord {
+    /// A record for a window of `width` by `height` over `framebuffer`.
+    pub fn new(
+        config: ArchitectureConfig,
+        width: u32,
+        height: u32,
+        framebuffer: u64,
+    ) -> Result<Self, AbiError> {
+        validate_range(config, framebuffer, 0, 2)?;
+        Ok(Self {
+            width,
+            height,
+            framebuffer,
+        })
+    }
+
+    /// The window's width in pixels.
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// The window's height in pixels.
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// The framebuffer's address in guest physical memory.
+    pub const fn framebuffer(&self) -> u64 {
+        self.framebuffer
+    }
+
+    /// How many bytes this window's framebuffer occupies.
+    ///
+    /// `width * height * 4`, or `None` when the product would not fit — which a
+    /// caller must be able to detect rather than discover as a short buffer later.
+    pub fn byte_length(&self) -> Option<u64> {
+        u64::from(self.width)
+            .checked_mul(u64::from(self.height))?
+            .checked_mul(4)
+    }
+
+    /// The record's bytes, little-endian, in the ABI's field order.
+    pub fn encode(&self) -> [u8; DISPLAY_RECORD_SIZE] {
+        let mut output = [0u8; DISPLAY_RECORD_SIZE];
+        output[..4].copy_from_slice(&self.width.to_le_bytes());
+        output[4..8].copy_from_slice(&self.height.to_le_bytes());
+        output[8..16].copy_from_slice(&self.framebuffer.to_le_bytes());
+        output
+    }
+
+    /// A record from its bytes.
+    pub fn decode(input: &[u8], config: ArchitectureConfig) -> Result<Self, AbiError> {
+        if input.len() != DISPLAY_RECORD_SIZE {
+            return Err(AbiError::InvalidArgument { index: 0 });
+        }
+        Self::new(
+            config,
+            read_u32(input, 0)?,
+            read_u32(input, 4)?,
+            read_u64(input, 8)?,
+        )
+    }
+}

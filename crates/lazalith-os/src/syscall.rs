@@ -1,6 +1,6 @@
 use crate::abi::{
-    AbiError, DIRECTORY_RECORD_SIZE, EXIT_STATUS_RECORD_SIZE, FILE_STAT_SIZE, FileHandle,
-    IO_RESULT_SIZE, MAX_ARGUMENT_BYTES, MAX_ARGUMENT_COUNT, MAX_ARGUMENT_TOTAL_BYTES,
+    AbiError, DIRECTORY_RECORD_SIZE, DISPLAY_RECORD_SIZE, EXIT_STATUS_RECORD_SIZE, FILE_STAT_SIZE,
+    FileHandle, IO_RESULT_SIZE, MAX_ARGUMENT_BYTES, MAX_ARGUMENT_COUNT, MAX_ARGUMENT_TOTAL_BYTES,
     MAX_PATH_BYTES, MEMORY_ALLOCATION_SIZE, OpenFlags, ProcessHandle, SeekOrigin, Syscall,
     SyscallArguments, SyscallError, TaggedOutcome, validate_range, validate_reserved_register,
 };
@@ -861,6 +861,23 @@ pub enum ValidatedSyscallKind {
         result: VirtualAddress,
     },
     ClearScreen,
+    /// Open a window and report the framebuffer the guest owns.
+    ///
+    /// The record is where the width, the height and the framebuffer's address go
+    /// back to the guest. It is a fixed 24 bytes because the guest cannot allocate
+    /// a struct it does not already have the bytes for, and a record whose size
+    /// the ABI fixes is one a program can lay out in its own frame.
+    DisplayOpen {
+        width: u32,
+        height: u32,
+        framebuffer: VirtualAddress,
+        record: VirtualAddress,
+    },
+    /// Present the frame the guest owns.
+    DisplayPresent {
+        framebuffer: VirtualAddress,
+        result: VirtualAddress,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1277,6 +1294,59 @@ impl SyscallDispatcher {
             Syscall::ClearScreen => Ok(ValidatedSyscall::from_kind(
                 ValidatedSyscallKind::ClearScreen,
             )),
+            Syscall::DisplayOpen => {
+                let width = abi(arguments.u32(0))?;
+                let height = abi(arguments.u32(1))?;
+                let framebuffer = abi(arguments.pointer(config, 2))?;
+                let record = abi(arguments.pointer(config, 3))?;
+                // The record is where the window comes back, so its length is the
+                // ABI's and the guest must have offered that much.
+                validate_memory(
+                    memory,
+                    record,
+                    host_length(DISPLAY_RECORD_SIZE, 3)?,
+                    word_bytes,
+                    UserMemoryAccess::Write,
+                    3,
+                )?;
+                // The framebuffer is the guest's own memory, so it must be writable
+                // and must hold the whole window. Validating the length here is
+                // what stops a program opening a window whose framebuffer is
+                // smaller than the window claims.
+                let bytes = u64::from(width)
+                    .checked_mul(u64::from(height))
+                    .and_then(|pixels| pixels.checked_mul(4))
+                    .ok_or(Abi(AbiError::ResourceExhausted { index: 0 }))?;
+                if bytes != 0 {
+                    validate_memory(memory, framebuffer, bytes, 1, UserMemoryAccess::Write, 2)?;
+                }
+                Ok(ValidatedSyscall::from_kind(
+                    ValidatedSyscallKind::DisplayOpen {
+                        width,
+                        height,
+                        framebuffer,
+                        record,
+                    },
+                ))
+            }
+            Syscall::DisplayPresent => {
+                let framebuffer = abi(arguments.pointer(config, 0))?;
+                let result = abi(arguments.pointer(config, 1))?;
+                validate_memory(
+                    memory,
+                    result,
+                    host_length(IO_RESULT_SIZE, 1)?,
+                    word_bytes,
+                    UserMemoryAccess::Write,
+                    1,
+                )?;
+                Ok(ValidatedSyscall::from_kind(
+                    ValidatedSyscallKind::DisplayPresent {
+                        framebuffer,
+                        result,
+                    },
+                ))
+            }
         }
     }
 }

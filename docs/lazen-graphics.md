@@ -54,6 +54,13 @@ ARGB8888, 4 bytes per pixel, row-major, rows top to bottom
 byte offset 0 = A, 1 = R, 2 = G, 3 = B
 ```
 
+Note that the byte order above is the reverse of `0xAARRGGBB` read
+little-endian. That is deliberate and it is the ABI's decision: a *pixel* is four
+bytes in this order, while a *colour* is a number a program compares and masks, and
+the number is `0xAARRGGBB`. `std::graphics::write_pixel` and
+`std::graphics::read_pixel` are the only two places that cross between the two, so
+a program never has to hold both in its head at once.
+
 A canvas of `width` by `height` pixels is exactly `width * height * 4` bytes.
 The canvas slice handed to the application is exactly that length, so indexing
 is a bounds-checked arithmetic operation with no stride and no padding to get
@@ -82,6 +89,25 @@ one pixel off screen.
 `draw_text` uses a built-in 8x8 font stored in the read-only data section. The
 font is a resource of the SDK, not a host asset, so text rendering is identical
 headless and graphical.
+
+### How this became `std::graphics` in Lazen v1
+
+Step 70 implements the operations above as `std::graphics`, and the language it
+had to fit into is smaller than the signatures above assume. Two adaptations,
+both forced by the language rather than chosen:
+
+**No `Window` or `Canvas` type.** Lazen v1 has no `struct` and no `impl`, so a
+canvas is a `&mut [u8]` the caller owns and the geometry is passed beside it. That
+is the *same* memory the design describes — `Canvas` was a view plus two numbers,
+and the view is now the argument — but it means the address is the caller's to
+name. A Step 73 opaque handle can restore the hiding without changing the
+drawing operations.
+
+**Packed geometry.** The ABI has six argument words and a view costs two, so
+`draw_text` as written above would need eight. `pack_point`, `pack_rect`,
+`pack_surface` and `pack_ink` exist for that reason and are documented at each
+field. They are not a stylistic choice: a call that cannot be made is a call a
+program cannot use.
 
 ## Event and redraw model
 
