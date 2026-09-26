@@ -869,6 +869,7 @@ pub fn check_for(
         target,
         loop_depth: 0,
         current_module: Vec::new(),
+        current_result: Type::Unit,
         strings: Vec::new(),
         string_index: BTreeMap::new(),
         functions: Vec::new(),
@@ -924,6 +925,15 @@ struct Checker<'a> {
     /// A name is resolved from here first, so a function can call a sibling of
     /// its own module without `pub`.
     current_module: Vec<String>,
+    /// The result type of the function being checked.
+    ///
+    /// A `return` is checked against *this* and not against the expected type of
+    /// the block it appears in. A block's expected type is what that block
+    /// evaluates to, which is `()` for a loop body — and `return` does not
+    /// evaluate to anything, it leaves. So `return false;` inside a `while` was
+    /// checked against `()` and rejected, which is why no function in the
+    /// documentation returned from inside a loop.
+    current_result: Type,
     strings: Vec<CheckedString>,
     string_index: BTreeMap<String, u32>,
     functions: Vec<CheckedFunction>,
@@ -1177,6 +1187,10 @@ impl<'a> Checker<'a> {
             Some(annotation) => self.type_of(annotation)?,
             None => Type::Unit,
         };
+        // A `return` anywhere in this body is checked against this, including
+        // from inside a loop or a conditional, where the enclosing block's own
+        // expected type is something else entirely.
+        self.current_result = result.clone();
         let mut scope: Vec<Binding> = Vec::new();
         let mut locals: Vec<LocalSlot> = Vec::new();
         let mut offset = 0u32;
@@ -1221,7 +1235,14 @@ impl<'a> Checker<'a> {
             result.clone(),
             0,
         )?;
-        if body.tail.is_none() && !self.always_produces(&item.body) {
+        // A function that produces a value must produce one on every path that
+        // falls off the end. A function that produces *nothing* has nothing to
+        // produce: control reaching the end of a unit function is an ordinary
+        // return, and the lowering emits exactly that. Requiring a trailing
+        // `return;` from a unit function whose last statement is a loop or a
+        // conditional would reject correct code for the sake of a value that does
+        // not exist.
+        if result != Type::Unit && body.tail.is_none() && !self.always_produces(&item.body) {
             return Err(self.error(
                 codes::MISSING_RESULT,
                 format!(
@@ -1788,24 +1809,30 @@ impl<'a> Checker<'a> {
                 })
             }
             Stmt::Return { value, span } => {
+                // The value is checked against the *function's* result, not
+                // against what the enclosing block evaluates to. A `return` inside
+                // a `while` or a `for` sits in a block whose expected type is
+                // `()`, and checking against that rejected every return from
+                // inside a loop.
+                let returns = self.current_result.clone();
                 let checked = match value {
                     Some(value) => {
                         let inferred =
-                            self.check_expression(value, scope, Some(expected.clone()))?;
+                            self.check_expression(value, scope, Some(returns.clone()))?;
                         Some(Box::new(self.finalize(
                             value,
                             inferred,
-                            Some(expected.clone()),
+                            Some(returns.clone()),
                             scope,
                         )?))
                     }
                     None => {
-                        if *expected != Type::Unit {
+                        if returns != Type::Unit {
                             return Err(self.error(
                                 codes::RETURN_TYPE,
                                 format!(
                                     "a bare `return;` produces no value, but this function returns `{}`",
-                                    ty_name(expected)
+                                    ty_name(&returns)
                                 ),
                                 span,
                                 &["Lazen v1 has exactly one result type per function"],
@@ -2055,21 +2082,18 @@ impl<'a> Checker<'a> {
                 };
                 let base_place = self.check_place(base, scope)?;
                 let base_type = base_place.ty_cloned();
-                let (element, element_size, mutable) = match &base_type {
-                    Type::Array { element, .. } => (
-                        element.as_ref().clone(),
-                        element.size_in_bytes(self.target.word),
-                        base_place.is_mutable(),
-                    ),
+                let (element, mutable) = match &base_type {
+                    Type::Array { element, .. } => {
+                        (element.as_ref().clone(), base_place.is_mutable())
+                    }
                     // A `&mut [T]` parameter may be written through even though the
                     // parameter binding itself is not `mut`: it is the pointed-to
                     // data that the reference makes mutable.
                     Type::Slice { element, mutable } => (
                         element.as_ref().clone(),
-                        element.size_in_bytes(self.target.word),
                         *mutable || base_place.is_mutable(),
                     ),
-                    Type::Str => (Type::U8, 1, false),
+                    Type::Str => (Type::U8, false),
                     other => {
                         return Err(self.error(
                             codes::MISMATCH,
@@ -2103,7 +2127,12 @@ impl<'a> Checker<'a> {
                 Ok(CheckedPlace::Index {
                     base: Box::new(base_place),
                     index: Box::new(index_checked),
-                    element_offset: element_size,
+                    // The base address already points at element zero and the
+                    // index is scaled by the element's size when the address is
+                    // formed, so an element sits at offset zero within the base.
+                    // Adding the element size here instead would push every
+                    // element one stride past where it belongs.
+                    element_offset: 0,
                     ty: element,
                     mutable,
                     span: span.clone(),
@@ -3336,9 +3365,26 @@ impl<'a> Checker<'a> {
                         &[],
                     ));
                 };
-                let is_extern = self
-                    .lookup_path(path)
+                let found = self.lookup_path(path);
+                let is_extern = found
+                    .as_ref()
                     .is_some_and(|found| matches!(found.symbol, Symbol::Extern(_)));
+                // The call target has to be the function's *qualified* name.
+                // Keeping only the last path segment made `rt::sys::print` a call
+                // to a function called `print`, which no module declares — so
+                // every call across a module boundary lowered to a target the IR
+                // verifier rejected, and no single-module test could see it. A
+                // syscall keeps its bare name, because that is the name the ABI
+                // table holds.
+                let callee = match found {
+                    Some(found) => match &found.symbol {
+                        Symbol::Function(function) => {
+                            qualified_name(&found.module.path, &function.name)
+                        }
+                        _ => name_of_path(path),
+                    },
+                    None => name_of_path(path),
+                };
                 let mut checked = Vec::new();
                 for argument in arguments {
                     let parameter = self
@@ -3355,7 +3401,7 @@ impl<'a> Checker<'a> {
                     )?);
                 }
                 CheckedExpr::Call {
-                    callee: name_of_path(path),
+                    callee,
                     is_extern,
                     arguments: checked,
                     ty,

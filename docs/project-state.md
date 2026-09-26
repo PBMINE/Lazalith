@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-26 (Steps 1–63 verified; Steps 64–75 not started)
+Last updated: 2026-09-26 (Steps 1–64 complete and verified)
 
 ## Where the roadmap stands
 
@@ -10,15 +10,18 @@ Steps 51–59   complete: the Lazen design cluster (documentation only)
 Step  60      complete: lazalith-ir, the shared low-level IR (66d29cf)
 Step  61      complete: lazalith-compiler, the Lazen frontend (7a4a5b3)
 Step  62      complete: lowering from the checked tree to lazalith-ir
-Step  63      complete: code generation to a Lazalith object
-Steps 64–75   NOT started. No runtime, driver, GUI, or debug code exists.
+Step  63      complete: code generation to a Lazalith object (bb0439b)
+Step  64      complete: lazalith-runtime, the runtime a program links against
+Steps 65–75   NOT started. No CLI, stdlib, driver, GUI, or debug code exists.
 ```
 
 This milestone added code generation. Steps 1–62 are unchanged except for the
 defects Step 63 found by running the generated code, each of which is listed
-under its own heading below. The 588 workspace tests all pass, including 22 in
+under its own heading below. The 601 workspace tests all pass, including 22 in
 `crates/lazalith-codegen/tests/codegen.rs` that run generated code on the real
-machine and compare what it wrote and what it exited with.
+machine and compare what it wrote and what it exited with, and 10 in
+`crates/lazalith-runtime/tests/runtime.rs` that do the same for a whole program
+built from the prelude.
 
 ### What deliberately did not land
 
@@ -580,14 +583,86 @@ back to the opcode that was meant.
   the ABI instead. That belongs to the frontend and is not fixed here.
 - `aarch64-linux` remains untested.
 
+## Step 64 — Runtime
+
+`crates/lazalith-runtime` is the thing a Lazen program links against, and it is
+two things that are deliberately kept apart.
+
+The **entry sequence** is machine code. It calls the program's `main` through the
+documented convention and turns the result into an exit status. It cannot be
+Lazen: Lazen v1 has no function pointers and a function's name is not a value, so
+nothing written in Lazen can call `main` by name.
+
+The **library** is Lazen, in `source::PRELUDE`: the syscall wrappers, byte moves
+and text helpers. It goes through the same frontend, lowering and code generation
+as a user program, so it cannot disagree with the compiler about what the
+language means.
+
+A program is one compilation unit — the prelude's text in front of the user's —
+and the entry sequence is an object beside the generated one. Nothing in the path
+is special-cased for the runtime.
+
+### Defects running whole programs found
+
+Every one of these produced *wrong answers rather than traps*, which is why the
+runtime tests compare what a program wrote and what it exited with instead of
+inspecting the object.
+
+- **A stack argument arrived as zero.** The caller and the callee disagreed on how
+  many argument words travel in registers. `MAX_ARGUMENT_WORDS` is six for a
+  *syscall* (`r1`–`r6`), but a Lazen call passes four words in `r0`–`r3` and
+  spills the rest below the stack pointer. The caller used the six, so the fifth
+  and sixth words went to registers the callee never read. Both sides now name the
+  count they mean — `ARGUMENT_REGISTERS` for a call with a stack, `r1`–`r6` for a
+  syscall — because the total alone does not say where a word goes.
+- **A frame did not reserve the word its own `CALL` overwrites.** Sixteen bytes
+  were reserved for outgoing argument words, but the return address a call pushes
+  sits one word *below* the stack pointer, in the frame's own reserve. Without
+  `RETURN_ADDRESS_BYTES` a function's first call overwrote the return address its
+  caller had left for it.
+- **Indexing a view wrote over the view.** `place_address` returned the frame
+  address of a view local, where it had to return the pointer the view *holds*, so
+  `view[at] = x` wrote over the two words of the view and left the data untouched.
+  `place_length` already read *through* the view, which is why the bounds check
+  was right and the store was not.
+- **Every index expression was off by one element.** `CheckedPlace::Index` carried
+  `element_offset: element_size`, but the base address already points at element
+  zero and the index is scaled by the element size when the address is formed, so
+  the offset is zero. This was invisible until a view base met a concrete array
+  read: on a concrete array the same expression was written *and* read, and both
+  were wrong by the same amount.
+- **`!` was a conversion, not a negation.** It lowered to `int_to_bool`, which
+  asks "is this nonzero?". The operand is already a `bool`, so `!true` came back
+  `true` and `!false` came back `false` — `!` did nothing at all. The IR gained
+  `UnaryOp::Not`, which asks whether the operand is `false`; `BitNot` would not do,
+  because the complement of `0` is every bit set, which is still true.
+- **An entry in a later object started at the wrong instruction.** The entry
+  offset is measured from the bottom of the code region; it was measured from the
+  entry object's own slice of it, so an image whose entry was not in the first
+  object started wherever the first code happened to be. This is the prelude case:
+  the prelude is the first object and the program's `main` is not.
+
+### Deliberate boundaries
+
+- The runtime returns the ABI's status and does not turn it into a value a program
+  tests; that is the standard library's job, in Step 67.
+- It does not allocate. Lazen v1 has no heap, so a wrapper that needs an
+  `IoResult` takes a caller's buffer.
+- It does not set up the stack. The OS establishes `USER_INITIAL_SP` when it loads
+  the image, and every generated prologue reserves its own frame, so the entry
+  sequence's only stack obligation is to leave SP alone.
+- Lowering still requires a `main`, so the refusal for a program without one comes
+  from lowering rather than from the link. A library-only module would need the
+  entry to become optional; nothing in the roadmap needs one before Step 67.
+
 ## Next step
 
-Step 64 is the runtime: the program image loader and the entry path that calls a
-Lazen program's `main`. Everything it needs now exists — a `.lzx` image, a linker,
-a frame size per function reported by `Program::frame`, and generated code whose
-entry symbol is `fn.<name>`. The one thing it must not do is re-decide anything
-the codegen already decided, including the sixteen bytes every frame reserves for
-outgoing arguments.
+Step 65 is the first Hello program: a real `.lazen` file compiled by the runtime
+and run to completion, which is where the pieces Step 64 assembled separately are
+first used together the way a user would use them. After that Step 66 gives the
+`lazen` command the `new`, `check`, `build`, `run` and `test` subcommands;
+`crates/lazalith-cli` exists as a crate with that binary name and an empty `main`,
+waiting for them.
 
 ## Steps 1–50 Retrospective Audit and Repair
 

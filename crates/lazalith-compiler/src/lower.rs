@@ -75,9 +75,10 @@ use crate::types::{
 /// The most argument words a call may pass.
 ///
 /// The kernel reads a syscall's number from `r0` and its arguments from `r1`
-/// through `r6`, so a call has six argument registers and no more. A view and a
-/// 64-bit integer are two words, which is why this counts words and not
-/// arguments.
+/// through `r6`, so a call has six argument registers and no more. This counts
+/// *words* and not arguments because a view is two words and occupies two
+/// registers. A 64-bit integer is one word and one register — the registers are
+/// 64 bits wide, so nothing narrower than a view costs more than one.
 pub const MAX_ARGUMENT_WORDS: usize = 6;
 
 /// The trap code for falling off the end of a function that owes a value.
@@ -411,12 +412,19 @@ fn is_signed(ty: &Type) -> bool {
 }
 
 /// How many words a value occupies in an argument register.
-fn argument_words(ty: &Type) -> usize {
-    if is_view(ty) || matches!(ty, Type::I64 | Type::U64 | Type::Usize) {
-        2
-    } else {
-        1
-    }
+/// How many machine words an argument of this type occupies in a call.
+///
+/// This is the size of the value rounded up to words, and nothing else: the
+/// argument registers are 64 bits wide, so an `i64`, a `u64` and a `usize` are
+/// one word each and only a two-word view costs two. Counting a 64-bit integer
+/// as two words refused calls the ABI can pass — `list_directory` takes two of
+/// them — and disagreed with the code generator, which sized the same argument
+/// from the value's own size.
+pub fn argument_words(ty: &Type) -> usize {
+    usize::try_from(lazalith_ir::argument_words(
+        &ir_type(ty).unwrap_or(IrType::Void),
+    ))
+    .unwrap_or(usize::MAX)
 }
 
 /// Rounds a size up to a whole word.
@@ -877,6 +885,13 @@ impl<'a> FunctionLowering<'a> {
     /// The address of a place.
     fn place_address(&mut self, place: &CheckedPlace) -> Result<ValueId, LowerError> {
         match place {
+            CheckedPlace::Local { offset, .. } if is_view(place.ty()) => {
+                // A view local holds a pointer and a length, not its referent, so
+                // the address of what it names is the pointer it holds. Indexing
+                // one reaches through it: `view[at]` writes where the view points,
+                // not over the two words of the view itself.
+                self.load_slot(*offset, &Type::U64)
+            }
             CheckedPlace::Local { offset, .. } => self.frame_address(*offset),
             CheckedPlace::Index {
                 base,
@@ -1561,9 +1576,12 @@ impl<'a> FunctionLowering<'a> {
                 })
             }
             "!" => {
+                // Logical negation, not a conversion: the operand is already a
+                // `bool`, and asking whether it is zero would hand back the
+                // operand unchanged.
                 let value = self.value(operand)?;
                 self.emit(Instruction::Unary {
-                    op: UnaryOp::IntToBool,
+                    op: UnaryOp::Not,
                     operand: value,
                     ty: IrType::Bool,
                 })

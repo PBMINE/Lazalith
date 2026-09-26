@@ -474,6 +474,11 @@ struct Generated<'a> {
     data: Vec<u8>,
     /// The alignment the data section needs, from the segments in it.
     data_alignment: u64,
+    /// Whether the module has any data segment at all.
+    ///
+    /// This is not the same as `data` being non-empty: a segment can have no
+    /// bytes, and an image still needs a data section to place it in.
+    has_data: bool,
     /// `(symbol name, text offset)` for a block or function label.
     text_labels: Vec<(Name, u64)>,
     /// `(function name, text offset)` for each function, whose symbol the caller
@@ -493,6 +498,7 @@ impl<'a> Generated<'a> {
             text: Vec::new(),
             data: Vec::new(),
             data_alignment: 1,
+            has_data: false,
             text_labels: Vec::new(),
             function_entries: Vec::new(),
             data_labels: Vec::new(),
@@ -506,6 +512,12 @@ impl<'a> Generated<'a> {
     /// This runs once for the module rather than once per function, because a
     /// segment is one object of bytes however many functions name it, and
     /// `DataAddress` reaches it by symbol.
+    ///
+    /// A segment with no bytes still counts as a segment. An empty string
+    /// literal interns to a zero-length segment, and its address is still an
+    /// address the linker has to place: a program holding `""` and asking for its
+    /// pointer is asking for a real address, and an image with no data section at
+    /// all would have nowhere to put one.
     fn data_segments(&mut self) -> Result<(), CodegenError> {
         let mut alignment = 1u64;
         for segment in self.segments {
@@ -521,6 +533,7 @@ impl<'a> Generated<'a> {
             self.data_labels
                 .push((segment.name.clone(), offset, segment.bytes.len() as u64));
             alignment = alignment.max(required);
+            self.has_data = true;
         }
         self.data_alignment = alignment;
         Ok(())
@@ -587,7 +600,7 @@ impl<'a> Generated<'a> {
         source_length: u32,
     ) -> Result<ObjectFile, CodegenError> {
         let text_section = Section::text("text", *self.architecture, &self.text)?;
-        let data_section = if self.data.is_empty() {
+        let data_section = if !self.has_data {
             None
         } else {
             Some(Section::read_only_data(
@@ -637,6 +650,17 @@ impl<'a> Generated<'a> {
                     SymbolBinding::Global
                 }
                 lazalith_ir::Linkage::Local => SymbolBinding::Local,
+            };
+            // The image's entry point is reached by whoever loads the image, not
+            // by another module, so it has to be callable from outside this object
+            // even when the Lazen declaration is private. `pub` governs Lazen-level
+            // visibility between modules; a private `main` is still the only way in
+            // for the loader, and a local symbol would leave the image with an
+            // entry no startup code could call.
+            let binding = if function.name == lowered.entry {
+                SymbolBinding::Global
+            } else {
+                binding
             };
             order.push((name, binding, text_index, offset, 0));
         }

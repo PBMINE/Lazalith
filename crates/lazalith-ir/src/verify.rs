@@ -581,3 +581,17 @@ fn reverse_postorder(function: &Function) -> Vec<BlockId> {
     order.reverse();
     order
 }
+
+/// How many machine words an argument of this type occupies in a call.
+///
+/// The calling convention's argument registers are one word wide, so this is the
+/// value's size rounded up to whole words: a `bool`, an `i32`, a `u64`, a
+/// `usize` and a pointer are each one word, and only a two-word view costs two.
+///
+/// The compiler decides whether a call fits and the code generator places the
+/// arguments, and both have to agree. One definition, here, is what makes that
+/// structural rather than a coincidence — counting a 64-bit integer as two words
+/// refused calls the convention passes and put a `u64` in two registers.
+pub fn argument_words(ty: &Type) -> u32 {
+    ty.size_in_bytes().unwrap_or(0).div_ceil(8).max(1)
+}

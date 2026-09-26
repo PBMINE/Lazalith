@@ -1059,3 +1059,55 @@ fn the_documented_hello_world_runs() {
         "and it printed what the documentation says it prints"
     );
 }
+
+/// The image's entry point is callable from outside its own object, whatever the
+/// Lazen declaration says.
+///
+/// `pub` governs visibility between *modules*. The loader is not a module: it
+/// starts the image at the entry symbol, so a private `main` — which is what the
+/// language documentation's own hello world declares — still has to be reachable
+/// from startup code in another object. A local symbol would leave the image with
+/// an entry nothing could call, and the failure would be an unresolved symbol at
+/// link time rather than anything a Lazen programmer could see.
+#[test]
+fn the_entry_point_is_callable_from_outside_the_object() {
+    let (object, lowered) = generate_object(
+        r#"
+        fn main() -> i32 {
+            return 7;
+        }
+        "#,
+    );
+    assert_eq!(lowered.entry, "main");
+    let symbol = object
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name() == "fn.main")
+        .expect("the object defines the entry symbol");
+    assert_eq!(
+        symbol.binding(),
+        lazalith_toolchain::SymbolBinding::Global,
+        "a private entry is still the image's only way in"
+    );
+    // A private function that is *not* the entry stays local.
+    let (object, _) = generate_object(
+        r#"
+        fn helper() -> i32 {
+            return 1;
+        }
+        fn main() -> i32 {
+            return helper();
+        }
+        "#,
+    );
+    let helper = object
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name() == "fn.helper")
+        .expect("the object defines the helper");
+    assert_eq!(
+        helper.binding(),
+        lazalith_toolchain::SymbolBinding::Local,
+        "a private function that is not the entry is not exported"
+    );
+}

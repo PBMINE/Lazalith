@@ -31,7 +31,7 @@
 //!
 //! ```text
 //! CMP left, right
-//! BR <predicate>, L_true, L_false
+//! BR <predicate>, L                return Ok(lazalith_ir::argument_words(&ty));true, L_false
 //! L_true:  LI r4, 1 ; ST [slot]
 //! BR L_join
 //! L_false: LI r4, 0 ; ST [slot]
@@ -506,6 +506,31 @@ impl<'a> FunctionEmitter<'a> {
         Ok((width, signed))
     }
 
+    /// `GETSP rA; ADDI rA, rA, offset`, leaving a *stack* address in the scratch.
+    ///
+    /// This is the stack pointer itself, with no frame base added. The two are
+    /// not interchangeable: the first `OUTGOING_ARGUMENT_BYTES` below the stack
+    /// pointer are the words a callee reads its fifth and sixth arguments from,
+    /// and they belong to no local. A frame address would land `OUTGOING` bytes
+    /// higher, which is the caller's *first local* — so a caller with a five-word
+    /// call wrote its last argument over its own variable.
+    fn stack_address(&mut self, offset: u32) -> Result<(), CodegenError> {
+        self.emit(Opcode::Getsp, &[Operand::Register(register(ADDRESS))])?;
+        let step = i32::try_from(i64::from(offset)).map_err(|_| CodegenError::EncodingRange {
+            function: self.name.clone(),
+            detail: format!("the stack offset {offset}"),
+        })?;
+        self.emit(
+            Opcode::Addi,
+            &[
+                Operand::Register(register(ADDRESS)),
+                Operand::Register(register(ADDRESS)),
+                Operand::Immediate(step),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Stores a register into a frame offset at a stated width.
     fn put_frame_width(
         &mut self,
@@ -671,11 +696,18 @@ impl<'a> FunctionEmitter<'a> {
                 })?;
             for part in 0..=usize::from(size > 8) {
                 let target = slot + if part == 0 { 0 } else { 8 };
-                if word < 4 {
+                if word < Self::ARGUMENT_REGISTERS {
                     self.put_frame(target, word as u8)?;
                 } else {
-                    let at = stack_base + (word as u32 - 4) * 8 + 8;
-                    self.load_frame(at, OPERAND_A)?;
+                    // A stack argument is measured from the stack pointer, not
+                    // from the frame base. The callee was entered one word below
+                    // its caller, so the convention's `[SP+8]` — argument five —
+                    // is the caller's own `[SP+0]`, which is `total + 8` from
+                    // here: this function's stack pointer plus the whole frame
+                    // it reserved, plus the eight bytes that separate them.
+                    let at = stack_base + (word as u32 - Self::ARGUMENT_REGISTERS as u32) * 8 + 8;
+                    self.stack_address(at)?;
+                    self.memory_at(ADDRESS, OPERAND_A, DataSize::Double)?;
                     self.put_frame(target, OPERAND_A)?;
                 }
                 word += 1;
@@ -809,6 +841,22 @@ impl<'a> FunctionEmitter<'a> {
                             ],
                         )?;
                         return self.branch_to_value(Condition::Ne, result);
+                    }
+                    UnaryOp::Not => {
+                        // A `bool` is `0` or `1`, so `!b` is `b == 0`. Comparing
+                        // against zero is what makes this a negation: a
+                        // complement of the bit pattern would turn `0` into every
+                        // bit set, which is still a true value.
+                        self.load_value(*operand, OPERAND_A)?;
+                        self.li(OPERAND_B, 0)?;
+                        self.emit(
+                            Opcode::Cmp,
+                            &[
+                                Operand::Register(register(OPERAND_A)),
+                                Operand::Register(register(OPERAND_B)),
+                            ],
+                        )?;
+                        return self.branch_to_value(Condition::Eq, result);
                     }
                 }
                 self.store_value(result, RESULT)
@@ -1169,8 +1217,15 @@ impl<'a> FunctionEmitter<'a> {
 
     /// How many words one argument takes on the stack.
     fn argument_words(&self, argument: &CallArg) -> Result<u32, CodegenError> {
-        let size = match argument {
-            CallArg::Value(value) => value_size(&self.value_type(*value)?).unwrap_or(0),
+        let size: u32 = match argument {
+            // The IR's own rule, so the compiler's decision that a call fits and
+            // this stage's placement of the arguments cannot disagree: a value's
+            // size rounded up to words, which is one for a 64-bit integer and two
+            // for a view.
+            CallArg::Value(value) => {
+                let ty = self.value_type(*value)?;
+                return Ok(lazalith_ir::argument_words(&ty));
+            }
             // An immediate is a word, because the callee reads words and an
             // immediate has no slot of its own to be read from.
             CallArg::Immediate(_) => 8,
@@ -1198,7 +1253,13 @@ impl<'a> FunctionEmitter<'a> {
                         function: self.name.clone(),
                         detail: format!(
                             "{word} argument words, and the convention has {}",
-                            first as usize + MAX_ARGUMENT_WORDS
+                            match stack_base {
+                                // Four registers and the two stack words a frame
+                                // reserves below them.
+                                Some(_) =>
+                                    Self::ARGUMENT_REGISTERS + OUTGOING_ARGUMENT_BYTES as usize / 8,
+                                None => MAX_ARGUMENT_WORDS,
+                            }
                         ),
                     });
                 };
@@ -1225,6 +1286,15 @@ impl<'a> FunctionEmitter<'a> {
         Ok(())
     }
 
+    /// The argument words a *Lazen* call passes in registers.
+    ///
+    /// A Lazen call passes its first four words in `r0`-`r3` and the rest on the
+    /// stack, so its callee reads a fifth and sixth word from the stack the
+    /// caller reserved. A syscall is different: it reads six words from `r1`-`r6`
+    /// and has no stack at all. Both allow six words, so the count alone does not
+    /// say where a word goes — whether the call has a stack does.
+    const ARGUMENT_REGISTERS: usize = 4;
+
     /// Where argument word `word` goes.
     ///
     /// A Lazen function's first four words are registers and the rest are at the
@@ -1237,7 +1307,14 @@ impl<'a> FunctionEmitter<'a> {
         first: u8,
         stack_base: Option<u32>,
     ) -> Option<ArgumentPlace> {
-        if word < MAX_ARGUMENT_WORDS {
+        // A call that has a stack to spill into is a Lazen call, and it has four
+        // argument registers. A syscall has no stack and uses all six.
+        let registers = if stack_base.is_some() {
+            Self::ARGUMENT_REGISTERS
+        } else {
+            MAX_ARGUMENT_WORDS
+        };
+        if word < registers {
             return Some(ArgumentPlace::Register(first + u8::try_from(word).ok()?));
         }
         let base = stack_base?;
@@ -1246,7 +1323,7 @@ impl<'a> FunctionEmitter<'a> {
         // `[SP+8]` and `[SP+16]` are therefore the caller's own `[SP+0]` and
         // `[SP+8]`: argument word five goes at the caller's offset zero and word
         // six at offset eight, which is why a frame reserves them at its base.
-        let offset = u32::try_from(word - 4).ok()?.checked_mul(8)?;
+        let offset = u32::try_from(word - registers).ok()?.checked_mul(8)?;
         Some(ArgumentPlace::Frame(base + offset))
     }
 
@@ -1263,7 +1340,10 @@ impl<'a> FunctionEmitter<'a> {
                 )?;
                 Ok(())
             }
-            ArgumentPlace::Frame(offset) => self.put_frame(offset, from),
+            ArgumentPlace::Frame(offset) => {
+                self.stack_address(offset)?;
+                self.store_at(ADDRESS, from, DataSize::Double)
+            }
         }
     }
 

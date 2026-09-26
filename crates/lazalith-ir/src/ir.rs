@@ -239,6 +239,12 @@ pub enum UnaryOp {
     BoolToInt,
     /// Convert an integer to a `bool`: zero is false.
     IntToBool,
+    /// Logical negation of a `bool`.
+    ///
+    /// Not the same as `BitNot`: a `bool` is `0` or `1`, and the complement of
+    /// `0` is every bit set, which is not `1`. Negation asks whether the operand
+    /// is false, so the result is `true` only for a `false` operand.
+    Not,
 }
 
 /// Comparison operations. A comparison always produces `Bool`.

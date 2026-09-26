@@ -35,4 +35,6 @@ pub use ir::{
     Terminator, Type, UnaryOp, ValueId,
 };
 pub use ir::{Instruction, Intrinsic, LoadWidth};
-pub use verify::{instruction_result_type, produces_value, value_type, verify_module};
+pub use verify::{
+    argument_words, instruction_result_type, produces_value, value_type, verify_module,
+};

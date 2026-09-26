@@ -66,6 +66,53 @@ fn linker_rejects_incompatible_or_undefined_objects() {
 }
 
 #[test]
+fn an_entry_in_a_later_object_gets_its_offset_in_the_whole_code_section() {
+    // The image has one code section built by concatenating every object's text,
+    // so an entry in the second object sits at a non-zero offset inside it. The
+    // offset is measured from the bottom of the code region, not from the entry
+    // object's own slice of it: measured from the object, the offset would be
+    // zero and the image would start at whatever code happened to be first.
+    let library = assemble_named(
+        "library.lzs",
+        ".arch lz64\n.entry _start\n_start:\n NOP\n NOP\n",
+    )
+    .unwrap();
+    let program_object = assemble_named(
+        "program.lzs",
+        ".arch lz64\n.entry main\n.global main\nmain:\n LI r0, 1\n SYSCALL\n",
+    )
+    .unwrap();
+    let options = LinkOptions {
+        entry_symbol: Some(String::from("main")),
+    };
+    let program = link_objects(&[library, program_object], &options).unwrap();
+    assert_eq!(program.entry_symbol(), "main");
+    let entry_offset = program.entry_offset();
+    assert_eq!(
+        entry_offset, 16,
+        "`main` follows the library's two instructions"
+    );
+    // The offset has to name `main` in the linked image, not merely be non-zero,
+    // so the instruction the loader would fetch first is checked.
+    let code = program.image().sections()[0].bytes();
+    let at_entry = code
+        .get(entry_offset as usize..entry_offset as usize + 8)
+        .expect("the entry offset is inside the code section");
+    assert_eq!(
+        decode(ArchitectureConfig::lz64(), at_entry).unwrap(),
+        Instruction::new(
+            ArchitectureConfig::lz64(),
+            Opcode::Li,
+            &[
+                Operand::Register(RegisterIndex::try_from(0).unwrap()),
+                Operand::Immediate(1),
+            ],
+        )
+        .unwrap()
+    );
+}
+
+#[test]
 fn linker_patches_branches_calls_memory_and_data_relocations() {
     let source = ".arch lz64\n.entry _start\n.section .rodata\nro:\n.word target\n.pcrelword target\n.dword target\n.section .text\n_start:\nBR AL, target\nCALL target\nLI r0, target\nLDZ r1, [r2 + target], BYTE\nSYSCALL\ntarget:\nNOP\n";
     let object = assemble_named("all-relocations.lzs", source).unwrap();

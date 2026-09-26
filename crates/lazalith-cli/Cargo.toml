@@ -1,0 +1,17 @@
+[package]
+name = "lazalith-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "The lazen command-line toolchain"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "lazen"
+path = "src/main.rs"
+
+[dependencies]
+lazalith-runtime = { path = "../lazalith-runtime" }
+
+[lints]
+workspace = true

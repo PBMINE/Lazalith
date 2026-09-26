@@ -23,10 +23,20 @@ use crate::{CodegenError, value_alignment, value_size};
 ///
 /// `docs/lz64.md` puts argument words five and six at `[SP+8]` and `[SP+16]` at
 /// callee entry, and a `CALL` pushes the return PC at `oldSP-8`. Those two words
-/// are therefore the *caller's* `[SP+0]` and `[SP+8]`, so a caller must own them,
-/// and a frame that put its first local at offset zero would let a call with five
-/// or more argument words overwrite that local.
+/// are therefore the *caller's* own `[SP+0]` and `[SP+8]`, so a caller must own
+/// them, and a frame that put its first local at offset zero would have a call
+/// with five or more argument words overwrite it.
 pub const OUTGOING_ARGUMENT_BYTES: u32 = 16;
+
+/// The bytes every frame reserves *below* its stack pointer, for the return
+/// address of a call it makes.
+///
+/// A `CALL` pushes the return PC at `oldSP-8` — one word *below* the caller's
+/// stack pointer — so a function that calls anything needs those eight bytes to
+/// be its own. Without the reserve, a function's first call overwrote the return
+/// address its own caller had left for it, and the second `RET` in a call chain
+/// returned to whatever the stack held instead.
+pub const RETURN_ADDRESS_BYTES: u32 = 8;
 
 /// A function's value slots and total frame size.
 #[derive(Debug)]
@@ -87,9 +97,14 @@ impl FunctionLayout {
                 cursor = align_up(start + size, 8);
             }
         }
-        // The whole frame, measured from the stack pointer: the reserve for
-        // outgoing argument words, then the storage the offsets above name.
-        let total = OUTGOING_ARGUMENT_BYTES.saturating_add(align_up(cursor, 8));
+        // The whole frame, measured from the stack pointer: the word below it for
+        // the return address of a call this function makes, then the reserve for
+        // outgoing argument words, then the lowering's own slots and the value
+        // area. The return address comes first because it is the only part of the
+        // frame *below* the stack pointer, and a `CALL` writes there.
+        let total = RETURN_ADDRESS_BYTES
+            .saturating_add(OUTGOING_ARGUMENT_BYTES)
+            .saturating_add(align_up(cursor, 8));
         if u64::from(total) > i32::MAX as u64 {
             return Err(CodegenError::FrameTooLarge {
                 function: String::from("<function>"),

@@ -144,9 +144,9 @@ struct LinkedLayout {
     bss_size: u64,
     data_alignment: u64,
     bss_alignment: u64,
-    placements: Vec<ObjectLayout>,
-    entry: (usize, SymbolIndex),
+    /// The name of the symbol the image starts at.
     entry_name: String,
+    /// Where that symbol ended up.
     entry_address: u64,
 }
 
@@ -184,20 +184,16 @@ pub fn link_objects(
             .map_err(LinkError::Image)?,
         );
     }
-    let entry_object = layout.entry.0;
-    let text_index = objects[entry_object]
-        .sections()
-        .iter()
-        .position(|section| section.kind() == SectionKind::Text)
-        .ok_or(LinkError::MissingEntry)?;
-    let code_base = layout.placements[entry_object]
-        .sections
-        .get(text_index)
-        .map(|section| section.base)
-        .ok_or(LinkError::MissingEntry)?;
+    // The entry offset is relative to the *code section*, not to the entry
+    // object's own copy of it. The image has one code section built by
+    // concatenating every object's text, and it starts at the bottom of the code
+    // region; an object placed later sits at a non-zero offset inside it. Taking
+    // the entry object's section base as the origin made the offset relative to
+    // that object, so an image whose entry was not in the first object started
+    // somewhere else entirely — at whatever code happened to be first.
     let entry_offset = layout
         .entry_address
-        .checked_sub(code_base)
+        .checked_sub(USER_CODE_START)
         .ok_or(LinkError::MissingEntry)?;
     let data_mask = layout.bss_alignment - 1;
     let data_end = u64::try_from(layout.data.len())
@@ -209,7 +205,10 @@ pub fn link_objects(
         .checked_add(layout.bss_size)
         .ok_or(LinkError::DataOverflow)?;
     let image = LzxImage::new(
-        LzxArchitecture::from_config(objects[entry_object].config()),
+        // Every object was checked to agree on the architecture, the ISA and the
+        // ABI before anything was laid out, so the first one speaks for all of
+        // them and the image needs no per-object target of its own.
+        LzxArchitecture::from_config(objects[0].config()),
         0,
         entry_offset,
         required_data,
@@ -396,7 +395,7 @@ fn link_layout(objects: &[ObjectFile], options: &LinkOptions) -> Result<LinkedLa
             return Err(LinkError::UndefinedSymbol { name: name.clone() });
         }
     }
-    let (entry_object, entry_index, entry_name, entry_address) =
+    let (_entry_object, _entry_index, entry_name, entry_address) =
         choose_entry(objects, options, &addresses)?;
     let entry_address = entry_address.ok_or(LinkError::MissingEntry)?;
     for (object_index, object) in objects.iter().enumerate() {
@@ -422,8 +421,6 @@ fn link_layout(objects: &[ObjectFile], options: &LinkOptions) -> Result<LinkedLa
         bss_size,
         data_alignment,
         bss_alignment,
-        placements,
-        entry: (entry_object, entry_index),
         entry_name,
         entry_address,
     })

@@ -312,10 +312,16 @@ fn a_loop_has_a_separate_step_block() {
 /// A call that needs more argument registers than the ABI has is refused.
 #[test]
 fn a_call_too_wide_for_the_abi_is_refused() {
+    // A 64-bit integer is one word, because the argument registers are 64 bits
+    // wide, so seven of them are what it takes to be wider than the ABI's six.
+    // The width is a property of the call, not of the callee being an extern, so
+    // this uses a plain function: no numbered syscall is wide enough to reach it.
     let source = r#"
-        extern "syscall" fn display_present(a: u64, b: u64, c: u64, d: u64) -> i64;
+        fn wide(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64) -> i64 {
+            return a as i64;
+        }
         fn main() -> i64 {
-            return display_present(1u64, 2u64, 3u64, 4u64);
+            return wide(1u64, 2u64, 3u64, 4u64, 5u64, 6u64, 7u64);
         }
     "#;
     match lower_failure(source) {
@@ -323,10 +329,44 @@ fn a_call_too_wide_for_the_abi_is_refused() {
             needed, allowed, ..
         } => {
             assert_eq!(allowed, MAX_ARGUMENT_WORDS);
+            assert_eq!(needed, 7, "each u64 is one argument word");
             assert!(needed > allowed, "the call really is too wide");
         }
         other => panic!("expected a refusal for a call that does not fit: {other}"),
     }
+}
+
+/// `!` is logical negation, not a conversion to `bool`.
+///
+/// The operand is already a `bool`, so an `int_to_bool` would ask "is it
+/// nonzero?" and hand back the operand unchanged: `!true` would be `true`. Only
+/// an op that asks whether the operand is `false` negates it.
+#[test]
+fn a_bang_is_a_negation_and_not_a_conversion() {
+    let source = r#"
+        fn main() -> bool {
+            let value: bool = true;
+            return !value;
+        }
+    "#;
+    let (module, _) = lower_source(source);
+    let unary = instructions(&module, "main")
+        .into_iter()
+        .find_map(|instruction| match instruction {
+            Instruction::Unary { op, .. } => Some(op),
+            _ => None,
+        })
+        .expect("`!` lowers to a unary instruction");
+    assert_eq!(
+        unary,
+        lazalith_ir::UnaryOp::Not,
+        "`!x` is `x == 0`, which is not `x != 0`"
+    );
+    assert_ne!(
+        unary,
+        lazalith_ir::UnaryOp::IntToBool,
+        "converting a bool to a bool would leave it alone"
+    );
 }
 
 /// A view counts as two words, so three views do not fit in six registers.
