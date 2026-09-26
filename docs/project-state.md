@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-26 (Steps 1–65 complete and verified)
+Last updated: 2026-09-26 (Steps 1–66 complete and verified)
 
 ## Where the roadmap stands
 
@@ -12,13 +12,14 @@ Step  61      complete: lazalith-compiler, the Lazen frontend (7a4a5b3)
 Step  62      complete: lowering from the checked tree to lazalith-ir
 Step  63      complete: code generation to a Lazalith object (bb0439b)
 Step  64      complete: lazalith-runtime, the runtime a program links against (7ada7f9)
-Step  65      complete: the first Lazen program, end to end under LazOS
-Steps 66–75   NOT started. No CLI, stdlib, driver, GUI, or debug code exists.
+Step  65      complete: the first Lazen program, end to end under LazOS (0910c76)
+Step  66      complete: the lazen command-line toolchain
+Steps 67–75   NOT started. No stdlib, driver, GUI, or debug code exists.
 ```
 
 This milestone added code generation. Steps 1–62 are unchanged except for the
 defects Step 63 found by running the generated code, each of which is listed
-under its own heading below. The 607 workspace tests all pass, including 22 in
+under its own heading below. The 630 workspace tests all pass, including 22 in
 `crates/lazalith-codegen/tests/codegen.rs` that run generated code on the real
 machine and compare what it wrote and what it exited with, and 10 in
 `crates/lazalith-runtime/tests/runtime.rs` that do the same for a whole program
@@ -710,13 +711,87 @@ middle of its own text whenever anything else is linked first.
   no register-pair lowering, which is a documented Step 62 decision, not a gap
   this step introduced.
 
+## Step 66 — The `lazen` CLI
+
+`crates/lazalith-cli` builds the `lazen` binary. Five of the six commands the
+roadmap names are implemented:
+
+```text
+lazen new <name>       scaffold a project
+lazen check [file]     parse, resolve, type-check; generate nothing
+lazen build [file]     compile and link to a .lzx beside the source
+lazen run [file]       build, then execute under LazOS
+lazen test [file]      run a project's tests
+```
+
+**There is no `lazen fmt`.** The formatter is Step 90, and a `fmt` that exited 0
+having rewritten nothing would tell a user their file had been formatted. The
+usage text and `help` both say it is absent, and a test asserts the file is left
+untouched.
+
+Exit codes are the tool's interface, so they are stated rather than incidental:
+`0` success, `1` the program refused (a diagnostic, or a non-zero status from
+`run`), `2` the command line could not be acted on. A program's own status is
+passed through as the tool's, so `lazen run` on a program returning 7 exits 7.
+
+### The two design decisions that were not obvious
+
+**`check` composes the runtime library before checking.** Checking the user's
+file alone calls every library name undefined, so `lazen check` rejected the
+scaffold its own `lazen new` had just written. `check` now performs the same
+composition `build` does and stops after the type checker — which is what makes
+it a faster `build` rather than a different one.
+
+**The program's text comes first in the composed unit.** A diagnostic reports a
+line number into the unit's text, so a library placed first pushed every one of
+the user's lines up by the library's length: a one-line program reported an error
+at line 410, in a file the user had written four hundred lines of. Putting the
+program first keeps the user's lines where they wrote them. This is only sound
+because Lazen resolves names independently of order — verified before relying on
+it — and `compose` documents that dependency so it cannot be broken silently.
+
+### `lazen test`
+
+A test is a top-level function named `test_*`, taking no arguments and returning
+`0`. There is no framework, no attribute and no discovery file. The names come
+from the *checked* program, so a `test_*` inside a comment is not a test and one
+that does not compile is a compile error rather than a silently missing test.
+
+Each test runs as its own program, built from the project's items minus `main`
+with a generated `main` that returns the test's result. Running separately is what
+makes one test's corrupted frame irrelevant to the next. A test may call helpers
+written beside it, and its console output is shown whether it passed or failed —
+a test that prints is reporting something, and discarding it because the return
+value happened to be 0 would throw that away.
+
+The function text is extracted by brace depth rather than through the parser, and
+that limit is documented at the extractor: it is only sound because the result is
+fed straight back to the compiler, so a wrong extraction produces a real
+diagnostic instead of a guess. The alternative needs the compiler to expose item
+source ranges, which is more coupling than this command justifies.
+
+### Tests
+
+23 tests in `crates/lazalith-cli/tests/cli.rs` run the real binary in a temporary
+directory and judge it by stdout, stderr, exit code and the files left on disk.
+Testing the command functions directly would miss the parts that are actually the
+contract: which stream a message uses, what the exit code is, and whether a file
+appeared.
+
+Notable ones: `new_then_run_prints_and_succeeds` is the roadmap's own final
+experience; `check_sees_the_runtime_library` guards the composition bug above;
+`check_reports_a_bad_program_with_a_usable_diagnostic` asserts the line number is
+inside the user's file and not shifted by the library; `two_files_are_refused`
+guards against silently checking one file of two; `fmt_is_refused_with_a_reason`
+guards against a `fmt` that does nothing and claims success.
+
 ## Next step
 
-Step 66 is the `lazen` command: `new`, `check`, `build`, `run` and `test`, in that
-order, and only those whose underlying functionality exists. `fmt` is deliberately
-absent — the roadmap places the formatter at Step 90, and `lazen fmt` that silently
-did nothing would be worse than no `lazen fmt`. `crates/lazalith-cli` already
-exists as a crate with the `lazen` binary name and an empty `main`.
+Step 67 is the first Lazen standard library — `core`, `io`, `text`, `math`,
+`collections`, `fs`, `time`, `process` — with the rule that only APIs the OS
+actually supports may be added. The numbered syscalls are the boundary: fourteen
+of them exist, so the library is what those fourteen can honestly express, and
+anything else would be a wrapper around a number nothing implements.
 
 ## Steps 1–50 Retrospective Audit and Repair
 

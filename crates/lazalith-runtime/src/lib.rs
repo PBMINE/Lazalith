@@ -193,18 +193,29 @@ impl RuntimeProgram {
 
 /// The compilation unit a program is built from: the runtime, then the program.
 ///
-/// The prelude is a module, so it needs no import in the program's text and
-/// cannot shadow one of the program's own top-level items. A program that
-/// declares its own `mod rt` is a name collision the resolver reports, which is
-/// the right place for it.
+/// Joins the runtime library and a program into one compilation unit.
+///
+/// The *program* comes first, and that ordering is load-bearing rather than
+/// cosmetic. A diagnostic reports a line number into the unit's text, so a
+/// prelude placed first would push every one of the user's own lines up by the
+/// prelude's length — a one-line program reported an error at line 410, which
+/// sends a user looking in a file that has four hundred lines. Putting the
+/// program's text first keeps every line the user wrote at the line they wrote
+/// it on, and the prelude's lines are the ones that shift, which is the correct
+/// way round: the prelude is not a file the user is editing.
+///
+/// This is only sound because Lazen resolves names independent of order, so a
+/// program may call a function the library declares below it. The resolver
+/// already allows that, and `compose` depends on it — so if that ever changes,
+/// this has to become a real line-number mapping rather than an ordering.
 pub fn compose(prelude: &str, program: &str) -> String {
-    let mut unit = String::with_capacity(prelude.len() + program.len() + 2);
-    unit.push_str(prelude);
-    if !prelude.ends_with('\n') {
+    let mut unit = String::with_capacity(program.len() + prelude.len() + 2);
+    unit.push_str(program);
+    if !program.ends_with('\n') {
         unit.push('\n');
     }
     unit.push('\n');
-    unit.push_str(program);
+    unit.push_str(prelude);
     unit
 }
 
