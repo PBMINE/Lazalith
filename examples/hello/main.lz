@@ -1,0 +1,15 @@
+// The first Lazen program.
+//
+// Build and run it with the `lazen` tool (Step 66):
+//
+//     lazen build main.lz
+//     lazen run main.lz
+//
+// It prints one line and exits with the status `main` returns, which the runtime
+// turns into the process's exit code. Nothing here needs the operating system to
+// do anything the console does not already do: one `write` syscall and one
+// `exit`.
+fn main() -> i32 {
+    rt::sys::print("Hello, Lazalith\n");
+    return 0;
+}

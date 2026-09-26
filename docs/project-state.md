@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-26 (Steps 1–64 complete and verified)
+Last updated: 2026-09-26 (Steps 1–65 complete and verified)
 
 ## Where the roadmap stands
 
@@ -11,13 +11,14 @@ Step  60      complete: lazalith-ir, the shared low-level IR (66d29cf)
 Step  61      complete: lazalith-compiler, the Lazen frontend (7a4a5b3)
 Step  62      complete: lowering from the checked tree to lazalith-ir
 Step  63      complete: code generation to a Lazalith object (bb0439b)
-Step  64      complete: lazalith-runtime, the runtime a program links against
-Steps 65–75   NOT started. No CLI, stdlib, driver, GUI, or debug code exists.
+Step  64      complete: lazalith-runtime, the runtime a program links against (7ada7f9)
+Step  65      complete: the first Lazen program, end to end under LazOS
+Steps 66–75   NOT started. No CLI, stdlib, driver, GUI, or debug code exists.
 ```
 
 This milestone added code generation. Steps 1–62 are unchanged except for the
 defects Step 63 found by running the generated code, each of which is listed
-under its own heading below. The 601 workspace tests all pass, including 22 in
+under its own heading below. The 607 workspace tests all pass, including 22 in
 `crates/lazalith-codegen/tests/codegen.rs` that run generated code on the real
 machine and compare what it wrote and what it exited with, and 10 in
 `crates/lazalith-runtime/tests/runtime.rs` that do the same for a whole program
@@ -655,14 +656,67 @@ inspecting the object.
   from lowering rather than from the link. A library-only module would need the
   entry to become optional; nothing in the roadmap needs one before Step 67.
 
+## Step 65 — The First Lazen Program
+
+`examples/hello/main.lz` is a real Lazen source file, and
+`crates/lazalith-runtime/tests/hello.rs` builds *that file* and runs it through
+the whole pipeline in the order a user's program goes through it:
+
+```text
+main.lz → frontend → lazalith-ir → codegen → .lzo → linker → .lzx
+       → LzxImage::from_bytes → load_process → process → console
+```
+
+The test asserts what the console received and what the process exited with, not
+that an object has the right shape. The machine goes through a real boot handoff
+(`BootImage::start`, then the supervisor kernel's `RFE`) and the image goes through
+its serialized bytes, so the two parts of the path with a format of their own are
+under test rather than skipped.
+
+Six tests, each for a different way this pipeline can be wrong:
+
+- `a_lazen_program_runs_under_lazos` — the greeting arrives, `main`'s `0` becomes
+  the process's exit code, and the process reaches `ProcessState::Exited`.
+- `a_computed_value_reaches_the_console` — `6 * 7` is divided down to `042` in a
+  frame and written through the same `write` wrapper. A bug making every frame
+  slot read as zero would pass the first test and fail this one.
+- `the_checked_in_example_builds_and_runs` — the artifact in `examples/` is what
+  is compiled, so the example cannot rot while a test still passes on a copy.
+- `the_program_runs_as_a_user_thread` — the process loads with `Privilege::User`
+  and its entry lies inside the user code region. A program running with
+  supervisor rights would leave every later security property untested.
+- `the_image_survives_a_serialisation_round_trip` — a `.lzx` re-serializes
+  byte for byte, and a truncated or magic-corrupted image is refused rather than
+  loaded with whatever survived.
+- `a_broken_program_never_becomes_an_image` — a compile failure arrives as a
+  diagnostic naming the missing name and the file, not a panic and not an empty
+  image.
+
+### One thing the entry assertion had to get right
+
+The entry is the startup sequence, which the linker places *after* the program's
+own text, so it is not at `USER_CODE_START` — that is the base of the user code
+region, and an image whose only object is the program does start there. The test
+asserts the entry is inside the mapped region rather than at its first byte,
+because a program that starts at the region's base would be starting in the
+middle of its own text whenever anything else is linked first.
+
+### Limits
+
+- The example uses `rt::sys::print` directly. Step 67's standard library is where
+  a program should be reading and writing, and Step 66 is what lets a user build
+  and run this file without naming a path.
+- Only `.lz64` is exercised here. `.lz32` is refused by lowering as a target with
+  no register-pair lowering, which is a documented Step 62 decision, not a gap
+  this step introduced.
+
 ## Next step
 
-Step 65 is the first Hello program: a real `.lazen` file compiled by the runtime
-and run to completion, which is where the pieces Step 64 assembled separately are
-first used together the way a user would use them. After that Step 66 gives the
-`lazen` command the `new`, `check`, `build`, `run` and `test` subcommands;
-`crates/lazalith-cli` exists as a crate with that binary name and an empty `main`,
-waiting for them.
+Step 66 is the `lazen` command: `new`, `check`, `build`, `run` and `test`, in that
+order, and only those whose underlying functionality exists. `fmt` is deliberately
+absent — the roadmap places the formatter at Step 90, and `lazen fmt` that silently
+did nothing would be worse than no `lazen fmt`. `crates/lazalith-cli` already
+exists as a crate with the `lazen` binary name and an empty `main`.
 
 ## Steps 1–50 Retrospective Audit and Repair
 

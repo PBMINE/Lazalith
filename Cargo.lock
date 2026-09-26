@@ -137,6 +137,7 @@ dependencies = [
 name = "lazalith-runtime"
 version = "0.1.0"
 dependencies = [
+ "lazalith-boot",
  "lazalith-codegen",
  "lazalith-compiler",
  "lazalith-cpu",
