@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-27 (Steps 1–71 complete and verified)
+Last updated: 2026-09-27 (Steps 1–72 complete and verified)
 
 ## Where the roadmap stands
 
@@ -17,8 +17,16 @@ Step  66      complete: the lazen command-line toolchain (a699c5d)
 Step  67      complete: the first Lazen standard library (106c48f)
 Step  68      complete: the virtual display device (9188e6a)
 Step  69      complete: the virtual input device
-Steps 70–75   NOT started. No driver, GUI, or debug code exists.
+Step  70      complete: the LazOS display driver and the Lazen SDK (a8da827)
+Step  71      complete: the LazOS input driver and the host adapter (38be9ca)
+Step  72      complete: the first graphical Lazen application
+Steps 73–75   NOT started. No GUI, debug, or snapshot code exists.
 ```
+
+The 757 workspace tests all pass, including the 4 in
+`crates/lazalith-runtime/tests/window.rs` that build
+`examples/window/main.lz` from the repository and run it through the display and
+input drivers.
 
 This milestone added code generation. Steps 1–62 are unchanged except for the
 defects Step 63 found by running the generated code, each of which is listed
@@ -3456,3 +3464,133 @@ core). Dev environment: **Nix Flakes**.
 7. Structured error types and one shared diagnostics system — no string errors.
 8. Do not jump ahead: implement the smallest correct part of a foundation when a
    later step needs it, but do not build future subsystems prematurely.
+
+## Step 72 — The First Graphical Lazen Application
+
+`examples/window/main.lz` is the application, and it is a repository file rather
+than a test fixture: the four tests in `crates/lazalith-runtime/tests/window.rs`
+read it from disk and build it through the whole pipeline, so the test cannot
+pass against a program the repository does not actually ship.
+
+It opens a 48-by-32 window over a framebuffer it owns, clears it, draws a block
+and the word "lazen" in the built-in font, presents the frame, reads the
+keyboard, and updates its state from what the keyboard said — a `text` event's
+character moves the block and changes its colour. It mentions no window handle,
+no event queue, and nothing about SDL3. The whole path is
+
+```text
+examples/window/main.lz → compiler → .lzx → LazOS loader → kernel
+    → display driver → display device
+    → input driver   ← input device
+```
+
+and the assertions are on what the *drivers* saw rather than on `main`'s return
+value, because a program that drew into a framebuffer nobody presented returns
+zero just the same.
+
+### The frame is the program's own memory
+
+`display_open` copies nothing, so the pixels on screen are the bytes the program
+wrote. `the_presented_frame_is_what_the_program_drew` reads the address the
+device reported back out of the process's memory and checks the background, both
+edges of the block, the pixels either side of it, and one lit and one unlit pixel
+of the first glyph. A test that only checked "a white pixel exists somewhere"
+would pass a program that drew its block in the wrong place, at the wrong size, or
+not at all.
+
+Reading the frame needed `RoundRobinScheduler::process_mut`. A memory context is
+a capability rather than a value — it is what the syscall dispatcher is handed —
+so a `&Process` cannot be given one, and a host frontend resolving what a device
+reported would hit the same wall.
+
+### The keyboard is input, not a record nobody read
+
+`the_keyboard_moves_what_the_program_draws` queues a `text` event carrying `d`
+and compares the block's position against the same program with no keyboard. The
+pair of assertions says "it moved" rather than "there is a white square": a
+program that ignored input leaves both pixels identical, so the test fails.
+
+`the_application_leaves_no_event_unread` then asks the device what is still
+queued and what was handed over. A program that stops reading leaves events in
+the queue, and a queue that only grows is how input becomes unbounded memory in a
+program that looks correct.
+
+### The record the window comes back in is 24 bytes, and is word-backed
+
+`open` takes the record from the caller, and the ABI wants it word-aligned. A
+`[u8; 24]` has an alignment of *one*, so whether the call worked would depend on
+where the frame layout happened to put the array — the same defect Step 71 fixed
+inside `poll` and Step 70 inside `present`, and the same reason the application
+backs it with `[u64; 3]`. The size is worth stating separately: the display
+record is **24** bytes, not 16, and the first version of the application used 16
+and was refused at the SDK's own length check before a syscall was ever made.
+
+### The frame base is a register, and that was the expensive part of this step
+
+Before Step 72 a 320-by-200 framebuffer could not be initialised at all within
+the tool's runaway budget, so the step began by finding out why. Forming the
+address of any frame slot was `GETSP r7; ADDI r7, r7, offset` — two
+instructions to reach a slot whose address does not change — and a trivial `while`
+loop that stores one byte cost 31 machine instructions, of which 15 were spent
+recomputing addresses.
+
+The frame base now lives in `r8` for the length of a function's body, which makes
+a slot's address one instruction instead of two. `r8` was chosen because
+`docs/isa.md` makes `r8`–`r15` callee-saved, so the discipline is the one the
+calling convention already requires and no new convention is invented: each
+function saves the caller's `r8` and restores it.
+
+**The save slot's position is load-bearing, and two wrong positions both looked
+plausible.** The obvious spot — the frame's own `[SP+0]` — is where a call writes
+argument words five and six, so a function that made a call with five or more
+argument words overwrote its own saved `r8` and came back with whatever the
+callee had left there. A slot sized from the value area but addressed from the
+*stack pointer* rather than from the frame base lands 16 bytes low, inside the
+value area, and overwrites a local. Neither shows up in a program that calls a
+function with two arguments.
+`a_frame_stays_addressable_across_a_call_with_six_arguments` calls with six
+argument words at two depths and reads and writes locals *after* the call, and it
+was verified to fail with each wrong position put back.
+
+### Two hot loops in the SDK were doing avoidable work
+
+`clear` re-read the four channel bytes out of a temporary array on every pixel —
+four bounds-checked loads per pixel, in the one function every graphical program
+runs over its whole framebuffer every frame. They are read once now, and a
+measured 4096-byte clear went from 720 instructions per pixel to 600.
+
+`put_pixel` built a temporary `[u8; 4]` per pixel, which is a *repeated-array
+initialisation* — a counted loop — on every single pixel, and then copied it into
+the canvas. It now writes through a four-byte view at the offset, so the layout
+is still written in exactly one place (`write_pixel`) and the temporary is gone.
+
+### Limits
+
+- **A 256 KiB window does not fit, and the budget was not raised to make it.**
+  The measured costs are in `docs/lazen-graphics.md`: about 92 instructions per
+  byte to initialise a framebuffer, 600 per pixel to clear one, and 2300 per
+  `put_pixel`. A 320-by-200 window is roughly sixty times the whole runaway
+  budget for a single frame. Raising the limit would hide that rather than remove
+  it, since 5,000,000 instructions already takes about ten seconds to interpret.
+  What removes it is a register allocator in the backend or a bulk memory
+  operation in the ABI, and neither exists yet.
+- The interpreter runs at roughly 145,000 instructions per second in a debug
+  build, so the four tests in this step take about 24 seconds between them. That
+  is the interpreter's speed, not the application's work: a release build is
+  about three times quicker and the instruction count — which is what the budget
+  is about — is unchanged.
+- The application runs a fixed number of frames and returns. An interactive
+  program would loop until it saw the quit request; the bounded loop is what
+  makes this one testable end to end, and it is the only difference.
+- `std::graphics::open` is the one SDK function that still takes a record from
+  the caller, so it is the one place a program can get the word-alignment
+  requirement wrong. Every other record is allocated inside the SDK, where the
+  compiler decides the alignment.
+
+### Next step
+
+Step 73 is the **first-party GUI library** — `Window`, `Panel`, `Button`, `Label`,
+`TextInput`, `Canvas`, `Menu` and `Layout` — built on the Lazen SDK and knowing
+nothing about SDL3. `examples/window/main.lz` is the shape of a program that would
+use it, and the open block of work is a layout and a widget set that a program
+draws with `std::graphics` rather than one that reaches past it.

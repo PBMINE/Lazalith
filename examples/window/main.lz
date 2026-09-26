@@ -1,0 +1,160 @@
+// A graphical Lazen program: a window, a moving block, and the keyboard.
+//
+// Build and run it with the `lazen` tool:
+//
+//     lazen run main.lz
+//
+// Nothing in this file mentions SDL, a window handle, or an event queue. It
+// draws into a framebuffer it owns, asks `std::graphics` to put that framebuffer
+// on screen, and asks `std::input` what the keyboard did. Everything between the
+// program and the hardware is the SDK, so the same source runs headless under a
+// test exactly as it does in front of a person.
+//
+// # Why the window is 48 by 32
+//
+// The size is set by what the machine can afford, not by taste. Every value in a
+// program lives in its frame, so a byte written through a bounds-checked index
+// costs about 150 instructions and clearing a pixel about 600. A 48-by-32
+// window is 1536 pixels, which is about 0.9 million instructions to clear and
+// about 0.6 million to initialise — so a run of a few frames fits the tool's
+// runaway budget while a 320-by-200 one is roughly a hundred times that. The
+// numbers are in `docs/lazen-graphics.md`; growing this window means making bulk
+// memory a primitive, not raising a limit.
+//
+// # Why the loop is bounded
+//
+// The loop runs a fixed number of frames and then returns, so the program
+// terminates. An interactive program would instead keep going until it saw the
+// quit request; a bounded loop is what makes this one testable end to end, and
+// it is the only difference between this and a program a person would sit and
+// watch.
+fn main() -> i32 {
+    let width: u32 = 48u32;
+    let height: u32 = 32u32;
+
+    // The framebuffer is the window. The device shares the program's own memory
+    // rather than copying it, so this array *is* what is on screen, and drawing
+    // is a write into a local.
+    let mut framebuffer: [u8; 6144] = [0u8; 6144];
+
+    // The record the window comes back in is backed by *words*. The ABI wants a
+    // word-aligned record and an array of bytes has an alignment of one, so
+    // `[u8; 24]` would be accepted or refused depending on where the frame
+    // happened to put it — which is not a thing a program should be able to
+    // notice. Three words make the alignment the compiler's decision instead,
+    // and `record_bytes` is 24, so three words are the whole record.
+    let mut record_words: [u64; 3] = [0u64, 0u64, 0u64];
+    let mut record: &mut [u8] = rt::memory::slice_mut(
+        record_words.as_mut_slice().as_ptr() as u64,
+        std::graphics::record_bytes()
+    );
+
+    if !std::graphics::open(
+        width,
+        height,
+        framebuffer.as_mut_slice(),
+        record
+    ) {
+        return 1;
+    }
+
+    // The state the keyboard changes: where the block is, and which colour it is.
+    let mut left: u32 = 4u32;
+    let mut top: u32 = 4u32;
+    let mut step: i32 = 1i32;
+    let mut colour: u32 = std::graphics::white();
+    let mut frame_number: u32 = 0u32;
+
+    // Sixteen bytes is one input record, so this asks for one event at a time.
+    // The queue is drained rather than sampled: a key that arrived and was not
+    // read is still there next frame, which is why a program cannot lose a
+    // keystroke by drawing slowly.
+    let mut events: [u8; 16] = [0u8; 16];
+
+    while frame_number < 2u32 {
+        // A background that lightens as the run goes on, so consecutive frames
+        // differ even before the block moves.
+        std::graphics::clear(
+            framebuffer.as_mut_slice(),
+            std::graphics::rgba(
+                ((frame_number * 96u32) % 256u32) as u8,
+                16u8,
+                32u8,
+                255u8
+            )
+        );
+
+        // The block, eight by eight, clipped to the canvas by `fill_rect`.
+        std::graphics::fill_rect(
+            framebuffer.as_mut_slice(),
+            width,
+            height,
+            std::graphics::pack_rect(left, top, 8u32, 8u32),
+            colour
+        );
+
+        // The program's name, in the built-in font. The font is an SDK resource,
+        // so the glyphs are the same bytes whether or not a host is attached.
+        std::graphics::draw_text(
+            framebuffer.as_mut_slice(),
+            std::graphics::pack_surface(40u32, 8u32),
+            std::graphics::pack_ink(0u32, 0u32, std::graphics::white()),
+            "lazen"
+        );
+
+        // Present the frame. The frame count comes back in `count`, so a program
+        // can tell how far it got even if a later frame is refused.
+        let mut count: [u8; 8] = [0u8; 8];
+        if !std::graphics::present(framebuffer.as_mut_slice(), count.as_mut_slice()) {
+            return 2;
+        }
+
+        // Read the keyboard and let it change the state. A `text` event carries
+        // the character itself, so the program compares against characters and
+        // never has to know how the host names a key.
+        let mut pending: u32 = std::input::poll(events.as_mut_slice(), 1u32);
+        while pending > 0u32 {
+            let character: u32 = std::input::text_of(events.as_slice(), 0u64);
+            if character == 97u32 {
+                // 'a': left.
+                if left > 0u32 { left = left - 4u32; }
+            }
+            if character == 100u32 {
+                // 'd': right.
+                if left + 12u32 < width { left = left + 4u32; }
+            }
+            if character == 119u32 {
+                // 'w': up.
+                if top > 0u32 { top = top - 4u32; }
+            }
+            if character == 115u32 {
+                // 's': down.
+                if top + 12u32 < height { top = top + 4u32; }
+            }
+            if character == 32u32 {
+                // Space: a new colour, so a keypress shows even when the block is
+                // against an edge and cannot move.
+                colour = std::graphics::rgba(
+                    ((((colour / 65536u32) % 256u32) + 40u32) % 256u32) as u8,
+                    ((((colour / 256u32) % 256u32) + 40u32) % 256u32) as u8,
+                    (((colour % 256u32) + 40u32) % 256u32) as u8,
+                    255u8
+                );
+            }
+            pending = std::input::poll(events.as_mut_slice(), 1u32);
+        }
+
+        // Move on its own too, so the program is interesting with no keyboard at
+        // all — which is the case a headless test runs.
+        if left + 12u32 >= width {
+            step = -1i32;
+        }
+        if left == 0u32 {
+            step = 1i32;
+        }
+        left = left + step as u32;
+
+        frame_number = frame_number + 1u32;
+    }
+    return 0;
+}

@@ -1338,3 +1338,84 @@ fn a_wide_constant_is_the_number_it_was_written_as() {
         "each constant is exactly the bit pattern it was written as"
     );
 }
+
+/// A frame that is live across a call keeps its own frame base.
+///
+/// The backend holds every value in the frame and reaches a slot by forming its
+/// address, so it keeps the frame base in the callee-saved `r8` for the length of
+/// the body. That makes `r8` a local, and a local that is live across a call is
+/// only safe because the function saves it — so the save has to be in a word the
+/// call sequence never touches.
+///
+/// Two words in the frame can be mistaken for the right one, and both were:
+///
+/// - `[SP+0]` and `[SP+8]` are where a call writes argument words five and six,
+///   so a save there survives only while every call passes four words or fewer;
+/// - a word sized from the value area but addressed from the *stack pointer*
+///   rather than the frame base lands 16 bytes low, inside the value area, and
+///   overwrites a local instead.
+///
+/// Neither shows up in a program that calls a function with two arguments, so the
+/// test calls with six at two depths, and each function reads and writes its own
+/// locals *after* the call it made. A clobbered frame base sends those accesses
+/// somewhere else in the frame, which is mapped, so the failure is a wrong
+/// answer rather than a fault.
+#[test]
+fn a_frame_stays_addressable_across_a_call_with_six_arguments() {
+    const SOURCE: &str = r#"
+        fn inner(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
+            return a + b + c + d + e + f;
+        }
+
+        // Six argument words, so the call writes `[SP+0]` and `[SP+8]`. Two
+        // locals either side of the call, so a frame base that moved by 16 bytes
+        // in either direction lands on a different word than the one meant.
+        fn middle(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
+            let mut before: i64 = 7i64;
+            let mut sum: i64 = inner(a, b, c, d, e, f);
+            let mut after: i64 = 11i64;
+            // These three only agree if `sum` still names the slot it did before
+            // the call, so they are the read side of the same property.
+            if before != 7i64 { return 900; }
+            if after != 11i64 { return 901; }
+            if sum != a + b + c + d + e + f { return 902; }
+            sum = sum + before;
+            sum = sum + after;
+            return sum;
+        }
+
+        fn main() -> i32 {
+            // 1 + 2 + 3 + 4 + 5 + 6 == 21, and middle adds 7 and 11 to that.
+            if middle(1i64, 2i64, 3i64, 4i64, 5i64, 6i64) != 39i64 {
+                return 1;
+            }
+            // Called again with a different argument pattern, because a save that
+            // survived the first call by luck would not survive being reused.
+            if middle(10i64, 20i64, 30i64, 40i64, 50i64, 60i64) != 228i64 {
+                return 2;
+            }
+            // And directly, so the six-argument call is exercised with no frame
+            // above it at all.
+            if inner(1i64, 1i64, 1i64, 1i64, 1i64, 1i64) != 6i64 {
+                return 3;
+            }
+            return 0;
+        }
+    "#;
+    let (object, _) = generate_object(SOURCE);
+    let harness = harness(
+        "harness",
+        &["fn.main"],
+        "         CALL fn.main\n\
+         MOV r1, r0\n\
+         LI r0, 1\n\
+         LI r7, 0\n\
+         SYSCALL\n",
+    );
+    let (_, code) = run(vec![harness, object], "entry");
+    assert_eq!(
+        code,
+        Some(0),
+        "a frame stayed addressable across calls that use the whole argument area"
+    );
+}

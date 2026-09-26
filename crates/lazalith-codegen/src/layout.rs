@@ -38,6 +38,21 @@ pub const OUTGOING_ARGUMENT_BYTES: u32 = 16;
 /// returned to whatever the stack held instead.
 pub const RETURN_ADDRESS_BYTES: u32 = 8;
 
+/// The bytes a frame reserves to save the callee-saved `r8` across its body.
+///
+/// `r8` holds this function's frame base, so it is live from the prologue to the
+/// epilogue and has to survive every call the body makes. `docs/isa.md` makes
+/// `r8`–`r15` callee-saved, which means *this* function is responsible for
+/// putting the caller's value back.
+///
+/// The slot is the **last** word of the frame, above the value area, and that
+/// placement is load-bearing rather than incidental. The obvious spot — the
+/// frame's own `[SP+0]` — is where a call writes argument words five and six,
+/// so a function that made a call with five or more argument words overwrote its
+/// own saved `r8` and came back with whatever the callee had left there. That is
+/// the Step 64 invariant about the outgoing area, and the slot has to respect it.
+pub const CALLEE_SAVE_BYTES: u32 = 8;
+
 /// A function's value slots and total frame size.
 #[derive(Debug)]
 pub struct FunctionLayout {
@@ -46,6 +61,11 @@ pub struct FunctionLayout {
     pub total: u32,
     /// The frame offset of each parameter, in declaration order.
     parameters: Vec<u32>,
+    /// The frame offset of the word that saves the caller's `r8`.
+    ///
+    /// It is the last word of the frame, above the value area, because the
+    /// frame's own `[SP+0]` belongs to outgoing argument words five and six.
+    callee_save: u32,
     /// `(offset, size)` per value, indexed by the value's identifier. Values are
     /// defined in identifier order, so the index *is* the identifier.
     slots: Vec<(u32, u32)>,
@@ -102,9 +122,13 @@ impl FunctionLayout {
         // outgoing argument words, then the lowering's own slots and the value
         // area. The return address comes first because it is the only part of the
         // frame *below* the stack pointer, and a `CALL` writes there.
+        // The callee-save word sits above the value area, so the frame is the
+        // value area plus one more word.
+        let callee_save = align_up(cursor, 8);
         let total = RETURN_ADDRESS_BYTES
             .saturating_add(OUTGOING_ARGUMENT_BYTES)
-            .saturating_add(align_up(cursor, 8));
+            .saturating_add(callee_save)
+            .saturating_add(CALLEE_SAVE_BYTES);
         if u64::from(total) > i32::MAX as u64 {
             return Err(CodegenError::FrameTooLarge {
                 function: String::from("<function>"),
@@ -114,8 +138,17 @@ impl FunctionLayout {
         Ok(Self {
             total,
             parameters,
+            callee_save,
             slots,
         })
+    }
+
+    /// The frame offset of the word that saves the caller's `r8`.
+    ///
+    /// Measured from the frame base, so the prologue adds the outgoing reserve the
+    /// same way every other frame address does.
+    pub const fn callee_save(&self) -> u32 {
+        self.callee_save
     }
 
     /// The frame offset of the parameter at `index`.

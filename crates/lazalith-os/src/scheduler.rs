@@ -289,6 +289,19 @@ impl RoundRobinScheduler {
         self.processes.iter().find(|process| process.id() == id)
     }
 
+    /// The process with this id, mutably.
+    ///
+    /// Reading a process's memory needs a mutable borrow, because a memory
+    /// context is a capability rather than a value: it is what the syscall
+    /// dispatcher is handed, and handing one out twice would hand out two
+    /// capabilities for the same process. So a caller that wants to look at
+    /// guest memory — a test checking what a program drew, or a host frontend
+    /// resolving what a device reported — comes through here rather than through
+    /// a `&` accessor that could not be given one.
+    pub fn process_mut(&mut self, id: ProcessId) -> Option<&mut Process> {
+        self.processes.iter_mut().find(|process| process.id() == id)
+    }
+
     pub fn remove_process(&mut self, id: ProcessId) -> Result<Process, SchedulerError> {
         if self.poisoned {
             return Err(SchedulerError::Poisoned);

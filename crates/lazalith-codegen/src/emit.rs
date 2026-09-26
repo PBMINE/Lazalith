@@ -68,6 +68,32 @@ const OPERAND_A: u8 = 6;
 const OPERAND_B: u8 = 5;
 /// Where a result is computed.
 const RESULT: u8 = 4;
+/// The register that holds this function's frame base for its whole body.
+///
+/// # Why a dedicated register
+///
+/// This stage has no register allocator and keeps **every** IR value in the
+/// frame, so almost every instruction begins by forming a frame address. Before
+/// this register existed each one was `GETSP r7; ADDI r7, r7, slot` — two
+/// instructions to reach a slot whose address never changes — and a trivial
+/// `while` loop that stores one byte cost 31 machine instructions, of which 15
+/// were spent recomputing addresses. A graphical program clears a framebuffer in
+/// exactly such a loop, so this is not an academic cost: at that instruction
+/// count a 32×32 window fitted inside the run budget and a 64×64 one did not.
+///
+/// `r8` is chosen because `docs/isa.md` makes `r8`–`r15` callee-saved, so the
+/// discipline is the one the calling convention already requires: each function
+/// saves the caller's `r8` in its prologue and restores it in its epilogue, and a
+/// call in between is safe because a callee preserves it. No new convention is
+/// invented, and a hand-written caller is unaffected.
+///
+/// # What this does not change
+///
+/// The frame *layout* is untouched. Every value is still stored in the frame and
+/// reloaded on use; what changed is that forming a slot's address is one
+/// instruction instead of two. Arithmetic, widths, signedness, the bounds check
+/// and the verifier are all exactly as they were.
+const FRAME_BASE: u8 = 8;
 /// The most argument words a call may pass, from the ABI's `r1`–`r6`.
 const MAX_ARGUMENT_WORDS: usize = 6;
 /// The register a one-word return value is in.
@@ -341,27 +367,27 @@ impl<'a> FunctionEmitter<'a> {
         Ok(())
     }
 
-    /// `GETSP rA; ADDI rA, rA, offset`, leaving a frame address in the scratch.
+    /// `ADDI rA, rFrameBase, offset`, leaving a frame address in the scratch.
     ///
     /// The stack pointer is the *bottom* of the frame, and the first words above
     /// it are the outgoing argument words the convention reads at a caller's
     /// `[SP+0]` and `[SP+8]`. The frame's own storage starts above those, so the
-    /// displacement adds the reserve before it adds the offset. Reading
-    /// `base - offset` would land inside the frame for a small offset — mapped,
-    /// and silently wrong — and outside the stack altogether for a large one.
+    /// base is the stack pointer plus the outgoing reserve, and `r8` already
+    /// holds exactly that. A slot's address is therefore the base plus its
+    /// offset and nothing else; the reserve is *not* added a second time, because
+    /// it is part of what the base is. Reading `base - offset` would land inside
+    /// the frame for a small offset — mapped, and silently wrong — and outside the
+    /// stack altogether for a large one.
     fn frame_address(&mut self, offset: u32) -> Result<(), CodegenError> {
-        self.emit(Opcode::Getsp, &[Operand::Register(register(ADDRESS))])?;
-        let step = i32::try_from(i64::from(offset) + i64::from(OUTGOING_ARGUMENT_BYTES)).map_err(
-            |_| CodegenError::EncodingRange {
-                function: self.name.clone(),
-                detail: format!("the frame offset {offset}"),
-            },
-        )?;
+        let step = i32::try_from(i64::from(offset)).map_err(|_| CodegenError::EncodingRange {
+            function: self.name.clone(),
+            detail: format!("the frame offset {offset}"),
+        })?;
         self.emit(
             Opcode::Addi,
             &[
                 Operand::Register(register(ADDRESS)),
-                Operand::Register(register(ADDRESS)),
+                Operand::Register(register(FRAME_BASE)),
                 Operand::Immediate(step),
             ],
         )?;
@@ -700,6 +726,37 @@ impl<'a> FunctionEmitter<'a> {
             ],
         )?;
         self.emit(Opcode::Setsp, &[Operand::Register(register(ADDRESS))])?;
+        // The caller's `r8` is saved in the last word of the frame, above the
+        // value area. It is deliberately *not* at `[SP+0]`: that word belongs
+        // to outgoing argument words five and six, and a call with five or more
+        // argument words would overwrite the save.
+        //
+        // The store reads the scratch rather than being folded into a
+        // displacement because the very next instruction derives the frame base
+        // from the same register, and the scratch must still hold the new stack
+        // pointer when that happens.
+        let callee_save = self.callee_save_displacement()?;
+        self.emit(
+            Opcode::St,
+            &[
+                Operand::Register(register(FRAME_BASE)),
+                Operand::Memory {
+                    base: register(ADDRESS),
+                    displacement: callee_save,
+                },
+                Operand::DataSize(DataSize::Double),
+            ],
+        )?;
+        // The frame base is the new stack pointer plus the outgoing reserve: the
+        // words below it belong to the arguments a call writes, not to a local.
+        self.emit(
+            Opcode::Addi,
+            &[
+                Operand::Register(register(FRAME_BASE)),
+                Operand::Register(register(ADDRESS)),
+                Operand::Immediate(OUTGOING_ARGUMENT_BYTES as i32),
+            ],
+        )?;
         self.store_parameters()
     }
 
@@ -764,10 +821,47 @@ impl<'a> FunctionEmitter<'a> {
         Ok(())
     }
 
+    /// The displacement of the callee-save word from the stack pointer.
+    ///
+    /// The slot's offset is measured from the **frame base**, which is the stack
+    /// pointer plus the outgoing reserve, exactly like every other frame offset.
+    /// The prologue and the epilogue are the only places that start from the
+    /// stack pointer itself, so they are the only places that have to add the
+    /// reserve back — and the only places that could get it wrong, which is why
+    /// the addition lives here rather than in both of them.
+    fn callee_save_displacement(&self) -> Result<i32, CodegenError> {
+        let offset = self
+            .layout
+            .callee_save()
+            .checked_add(OUTGOING_ARGUMENT_BYTES)
+            .ok_or_else(|| CodegenError::EncodingRange {
+                function: self.name.clone(),
+                detail: String::from("the callee-save offset"),
+            })?;
+        i32::try_from(offset).map_err(|_| CodegenError::EncodingRange {
+            function: self.name.clone(),
+            detail: format!("the callee-save offset {offset}"),
+        })
+    }
+
     /// Gives the frame back and returns.
     fn epilogue(&mut self) -> Result<(), CodegenError> {
         let total = self.layout.total;
+        // The caller's `r8` comes back before the stack pointer moves. The
+        // calling convention makes `r8` callee-saved, so leaving our own value
+        // in it would put a bug in every caller's lap.
         self.emit(Opcode::Getsp, &[Operand::Register(register(ADDRESS))])?;
+        self.emit(
+            Opcode::Ldz,
+            &[
+                Operand::Register(register(FRAME_BASE)),
+                Operand::Memory {
+                    base: register(ADDRESS),
+                    displacement: self.callee_save_displacement()?,
+                },
+                Operand::DataSize(DataSize::Double),
+            ],
+        )?;
         self.emit(
             Opcode::Addi,
             &[
@@ -1028,14 +1122,14 @@ impl<'a> FunctionEmitter<'a> {
                         }
                         // The stack pointer is the bottom of the frame; the
                         // frame's own storage starts above the outgoing argument
-                        // words, so this is `SP + reserve`.
-                        self.emit(Opcode::Getsp, &[Operand::Register(register(RESULT))])?;
+                        // words, so the base is `SP + reserve`. The prologue
+                        // already established exactly that in `r8`, so reading it
+                        // is a move rather than a recomputation.
                         self.emit(
-                            Opcode::Addi,
+                            Opcode::Mov,
                             &[
                                 Operand::Register(register(RESULT)),
-                                Operand::Register(register(RESULT)),
-                                Operand::Immediate(OUTGOING_ARGUMENT_BYTES as i32),
+                                Operand::Register(register(FRAME_BASE)),
                             ],
                         )?;
                         self.store_value(value, RESULT)

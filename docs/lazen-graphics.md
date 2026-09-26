@@ -157,3 +157,56 @@ verification is that a program using only these functions runs to completion
 with no host library linked, that the framebuffer contents the program wrote are
 exactly the contents the device presents, and that a drawing operation clipped
 at the canvas edge writes only in-bounds bytes.
+
+## What a frame costs today
+
+Step 72 built the first application and measured it, and the numbers are worth
+writing down because they decide how big a window can be. They are **instruction
+counts**, not timings: `lazen run` refuses a program that retires more than
+5,000,000 instructions, so the budget is a count and a wall-clock measurement
+would not say anything.
+
+| What | Cost | Why |
+| --- | --- | --- |
+| `[0u8; N]` — initialising an `N`-byte array | ~92 per byte | a repeated array is a counted loop, and the loop body forms each element's address through the frame |
+| `clear` — one pixel | ~600 | four byte stores, each one a bounds-checked index |
+| `put_pixel` — one pixel | ~2300 | the same four stores, plus unpacking the point and decoding the colour from the packed `u32` |
+| `display_open`, `present`, `input_poll` | tens | one syscall each |
+
+Those are costs of the *code generator*, not of the API. The backend has no
+register allocator and keeps every value in the frame, so each source-level
+operation is a load, an operation, and a store through memory rather than a
+register. `put_pixel` is nearly four times `clear` because it re-derives the four
+channel bytes from the colour for every pixel, where `clear` reads them once.
+
+The arithmetic that follows from the table: a 48-by-32 window is 1536 pixels,
+which is about 0.9 million instructions to clear and about 0.6 million to
+initialise, so `examples/window/main.lz` costs 3.9 million for two frames. A
+320-by-200 window is 64000 pixels, which is about 38 million to clear and 23
+million to initialise — roughly **sixty times** the whole runaway budget for one
+frame, before anything is drawn.
+
+### Why the budget was not raised
+
+A larger budget would turn a refusal into a slow program rather than a fast one:
+5,000,000 instructions already takes about ten seconds to interpret, so sixty
+times that is about ten minutes for a single frame. Raising the limit hides the
+cost instead of removing it, and the cost is real — a guest writing 256,000 bytes
+through a bounds-checked index is doing 92 instructions per byte, and no budget
+makes that a good design.
+
+The two things that would actually remove it are both real work rather than
+configuration:
+
+- **A register allocator in `lazalith-codegen`.** Every operation would become a
+  register-to-register instruction instead of a frame round trip, which is where
+  most of the 92 and most of the 600 come from.
+- **A bulk memory operation.** Clearing a framebuffer in words rather than bytes
+  is an eightfold reduction on its own, and the ABI has no operation for it: the
+  language has no word-wide store to widen a byte store into, and
+  `RESERVED_DESIGN_SYSCALLS` is empty, so there is nowhere to put one without
+  spending a name the design reserved.
+
+Until one of those exists, the window size in the example is set by measurement
+rather than by taste, and the number is written in the program so the next person
+to change it finds out why.
