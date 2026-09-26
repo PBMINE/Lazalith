@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-26 (Steps 1–67 complete and verified)
+Last updated: 2026-09-26 (Steps 1–68 complete and verified)
 
 ## Where the roadmap stands
 
@@ -14,17 +14,20 @@ Step  63      complete: code generation to a Lazalith object (bb0439b)
 Step  64      complete: lazalith-runtime, the runtime a program links against (7ada7f9)
 Step  65      complete: the first Lazen program, end to end under LazOS (0910c76)
 Step  66      complete: the lazen command-line toolchain (a699c5d)
-Step  67      complete: the first Lazen standard library
-Steps 68–75   NOT started. No driver, GUI, or debug code exists.
+Step  67      complete: the first Lazen standard library (106c48f)
+Step  68      complete: the virtual display device
+Steps 69–75   NOT started. No input device, driver, GUI, or debug code exists.
 ```
 
 This milestone added code generation. Steps 1–62 are unchanged except for the
 defects Step 63 found by running the generated code, each of which is listed
-under its own heading below. The 648 workspace tests all pass, including 24 in
+under its own heading below. The 670 workspace tests all pass, including 24 in
 `crates/lazalith-codegen/tests/codegen.rs` that run generated code on the real
-machine and compare what it wrote and what it exited with, and 10 in
+machine and compare what it wrote and what it exited with, 10 in
 `crates/lazalith-runtime/tests/runtime.rs` that do the same for a whole program
-built from the prelude.
+built from the prelude, 16 in `crates/lazalith-stdlib/tests/stdlib.rs` that do
+the same for the standard library, and 22 in
+`crates/lazalith-devices/tests/display.rs` for the display device.
 
 ### What deliberately did not land
 
@@ -890,12 +893,89 @@ reverted** — the narrow-parameter one and the two-word-result one.
   indices instead is a different function with a different name.
 - `math` has no floating point, and will not until the ISA has it.
 
+## Step 68 — The Virtual Display Device
+
+`DisplayDevice` in `crates/lazalith-devices/src/display.rs`, with 22 tests in
+`crates/lazalith-devices/tests/display.rs`.
+
+### The design, and the one property it exists for
+
+**The guest owns the authoritative framebuffer.** The device keeps *no* pixels: it
+holds the geometry, the framebuffer's address, a present counter, and the address
+of the last frame presented. A present is a synchronisation point, not an upload,
+because the device and the guest are looking at the same memory.
+
+That is the whole design, and it is what makes a headless run and a windowed run
+identical — a device that stored its own copy would make every frame a transfer of
+`width * height * 4` bytes, and would let the guest's memory and the device's view
+disagree, which is the failure this removes.
+
+`the_guest_owns_the_pixels_and_the_device_holds_no_copy` is the test that
+separates the two designs, and it does so by **mutating guest memory after
+presenting**. A test that compared what the device presented against what the
+guest had written *at present time* would pass on a device that kept a copy. The
+mutation is what makes the claim testable.
+
+### The register surface
+
+Eight double-words, fixed offsets, every access bounds checked:
+
+```text
+0  width            read-only    32  present count    read-only
+8  height           read-only    40  last presented   read-only
+16 framebuffer      writable     48  ABI version      read-only
+24 present          writable     56  status           read-only
+```
+
+The geometry registers are **read-only** for a stated reason: a framebuffer is
+sized for a *pair* of dimensions, so accepting one half would leave the device
+describing a region that does not exist. `DisplayDevice::open` is the only way to
+set geometry, and it validates both halves and the `width * height * 4` product
+together — which is also what catches a framebuffer too large to address before a
+window is opened rather than after.
+
+`REGISTER_ABI_VERSION` exists so a program can check the ABI *before* trusting any
+other register; without it, a driver built for a different layout would read
+plausible numbers from registers that mean something else. `REGISTER_STATUS`
+distinguishes "never presented" from "presented a blank frame", which a
+present-counter-only design cannot.
+
+### Two rules the implementation follows
+
+**Validate before mutate.** `validate_write` performs the write on a *copy* and
+throws it away, so a refused write leaves the device byte-for-byte as it was. The
+interesting case is a present with the window closed: without this, validation
+would count a frame that was then refused. `a_refused_write_changes_nothing` and
+`a_present_with_no_window_is_refused` both cover it.
+
+**A refused write is a refusal, not a silent no-op.** A present with no window
+open, a write to a read-only register, and a framebuffer address of zero are each
+refused with a reason. Each would otherwise be a program that believes it drew
+something.
+
+`peek` requires an output buffer of *exactly* the register width. Copying what fits
+would let a caller read the low half of a value and believe it had read the whole
+thing, and a debugger showing half a framebuffer address is worse than one that
+refuses.
+
+### Limits
+
+- The pixel helpers (`frame_bytes`, `pixel_at`, `zeroed_framebuffer`) are free
+  functions, not device methods, because reading pixels needs memory the device
+  does not have. The device's whole claim is that it does not need it.
+- There is no damage tracking, no double buffering and no frame pacing. The
+  design document rules all three out for v1, and a present counter is the whole
+  of what synchronisation a headless run needs.
+- Nothing here knows SDL3 exists, and nothing may: a device that knew about a host
+  window could not run headless, could not be recorded deterministically, and
+  could not be tested without a display server. The host frontend in Step 77 reads
+  the presented framebuffer; the device never finds out.
+
 ## Next step
 
-Step 68 is the **Virtual Display Device**: the guest owns the authoritative
-framebuffer, and the device must not depend on SDL3. That means a new device in
-`lazalith-devices` with a framebuffer the guest reads and writes directly, and
-the MMIO-visible surface a display driver in Step 70 will sit on.
+Step 69 is the **Virtual Input Device**: events with a clean guest-visible shape,
+queued rather than sampled, so a program that polls slower than the host produces
+events still sees every one of them.
 
 ## Steps 1–50 Retrospective Audit and Repair
 

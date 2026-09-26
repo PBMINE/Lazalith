@@ -3,7 +3,14 @@
 extern crate alloc;
 
 mod console;
+mod display;
 pub use console::ConsoleDevice;
+pub use display::{
+    DISPLAY_ABI_VERSION, DisplayDevice, DisplayError, MAX_DIMENSION, PIXEL_BYTES, PresentedFrame,
+    REGISTER_ABI_VERSION, REGISTER_BYTES, REGISTER_FRAMEBUFFER, REGISTER_HEIGHT,
+    REGISTER_LAST_PRESENT, REGISTER_PRESENT, REGISTER_PRESENT_COUNT, REGISTER_STATUS,
+    REGISTER_WIDTH, STATUS_PRESENTED, frame_bytes, pixel_at, zeroed_framebuffer,
+};
 
 use alloc::{collections::TryReserveError, vec::Vec};
 use core::{error::Error, fmt};
