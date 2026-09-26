@@ -11,6 +11,7 @@ mod object;
 pub use assembler::{AssemblyError, assemble, assemble_named};
 pub use disassembler::{
     DisassembledInstruction, DisassemblyError, ObjectDisassembly, disassemble, disassemble_object,
+    disassemble_one,
 };
 pub use linker::{LinkError, LinkOptions, LinkedProgram, link_objects};
 pub use object::{

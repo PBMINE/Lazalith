@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-27 (Steps 1–73 complete and verified)
+Last updated: 2026-09-27 (Steps 1–74 complete and verified)
 
 ## Where the roadmap stands
 
@@ -20,15 +20,18 @@ Step  69      complete: the virtual input device
 Step  70      complete: the LazOS display driver and the Lazen SDK (a8da827)
 Step  71      complete: the LazOS input driver and the host adapter (38be9ca)
 Step  72      complete: the first graphical Lazen application (831c1a7)
-Step  73      complete: the first-party GUI library
-Steps 74–75   NOT started. No debug or snapshot code exists.
+Step  73      complete: the first-party GUI library (ffef9c8)
+Step  74      complete: the Lazalith debug API
+Step  75      NOT started. No snapshot code exists.
 ```
 
-The 764 workspace tests all pass, including the 4 in
+The 777 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 7 in `crates/lazalith-gui/tests/gui.rs` that draw with the
-widget set and read the frame back.
+widget set and read the frame back, and the 13 in
+`crates/lazalith-debug/tests/debug.rs` that drive a real machine through the
+controller.
 
 This milestone added code generation. Steps 1–62 are unchanged except for the
 defects Step 63 found by running the generated code, each of which is listed
@@ -3712,3 +3715,95 @@ internals directly. The kernel already has the pieces a debugger needs
 (`RoundRobinScheduler` validates the active binding on every step, and
 `process_mut` from Step 72 makes guest memory readable), so the shape of the work
 is an API over what exists rather than new machinery.
+
+## Step 74 — The Lazalith Debug API
+
+`lazalith-debug` is a new crate with two types: `DebugController`, which owns a
+machine and a kernel, and `DebugSession`, which holds one process's debugging
+state. Thirteen tests in `crates/lazalith-debug/tests/debug.rs` drive real
+machines over real `.lzx` images. The design is written down in
+`docs/lazen-debug.md`.
+
+### "Do not allow frontends to manipulate CPU internals directly" is the shape of the API
+
+The roadmap says it, and the crate is how it is enforced rather than how it is
+promised. There is no `&mut LazalithMachine` in the public surface and no method
+that hands one out. `registers()` returns an **owned** `RegisterSnapshot`, not a
+`&RegisterFile`; `read_memory` returns an owned `Vec<u8>`; `disassemble` returns
+owned text. There is no write-a-register and no write-memory, because there is no
+way to do either that leaves the machine's own checks in place.
+
+A `&RegisterFile` was the natural signature and would have been the wrong one.
+`RegisterFile` is the CPU's own storage, so a shared reference to it is a view of
+live state that changes under the caller: a frontend reading `r0` twice would get
+two answers with no step in between, and a frontend that decided it needed to
+*write* would find the obvious next step is to ask for a mutable reference. The
+owned copy is a consistent snapshot, and the missing write path is the point.
+
+This is the counterpart to the kernel validating the active binding on every step.
+That check exists so nothing upstream can skip it, and a debug API that leaked the
+machine would undo it from the other direction.
+
+### Two bugs the tests found, both in the controller
+
+**`run` cleared a pending pause before honouring it.** The pause check was in the
+loop but the flag was cleared at the top of `run`, so a pause was always
+discarded before the loop could see it. The moment a frontend asks for a pause is
+the moment it is stopped, changes a breakpoint, and continues — so clearing on
+entry discarded exactly the pause that mattered. The request is now taken *in* the
+loop and consumed there, and `step` consumes it too, because a step is stopping.
+
+**The trap vector was placed past the end of the kernel.** `boot` computed it as
+`KERNEL_LOAD_ADDRESS + kernel_bytes.len()`, which is *after* the supervisor's own
+`RFE`, so the first syscall return found no `RFE` and every program that made a
+syscall died with `InvalidSyscallReturn`. The trap vector is a parameter now:
+where a trap lands is a property of the machine's setup, and a controller that
+guessed at it would be guessing where a kernel keeps its epilogue. The terminal and
+the filesystem are parameters for the same reason.
+
+### Watchpoints are a comparison, and the ISA is why
+
+The machine has no watchpoint register — `lazalith-cpu` has a `DebugState` with a
+single `single_step` flag that nothing reads, which is the whole of the debug
+surface the ISA grew. So a watchpoint here reads the bytes under the address
+before each step and compares them after, which is correct at instruction
+granularity and costs one read and one comparison per watchpoint per step. That is
+stated in the API rather than hidden, because a frontend that watches a hot address
+should know before it does.
+
+Finding a watchpoint's address took two attempts and the second one is the
+interesting part. The first watched the stack pointer's own word, which the
+program never writes after its prologue, so it never fired. The second uses a
+program that *calls in a loop*, because a `CALL` pushes the return address at
+`SP - 8` every time: a word the test can name without reading the frame layout.
+Getting even that right needed a `stack_after_prologue` helper that steps until the
+stack pointer *moves*, because a test cannot know how many instructions a prologue
+is — it depends on the frame's size and on how many values the function has. A
+test that guessed would break the day a register allocator arrives.
+
+### The stack is reported, and it says it is not a call chain
+
+`stack(words)` returns the stack pointer and the words above it, and
+`has_call_chain` is `false`. The calling convention reserves the return address
+below the frame but records no frame pointer, so there is no chain to walk: a walk
+would be a walk of whatever numbers happened to be on the stack. A debugger that
+printed addresses and called them a call stack would be showing a heap of numbers,
+so the field says so. The roadmap's "stack" is delivered as what can honestly be
+delivered, with the gap named.
+
+### Limits
+
+- **A snapshot is the session's debugging state, not the machine's.** Capturing
+  the CPU, the devices and the processes is Step 75's subject with its own types.
+  Folding a partial version of it in here would mean two definitions of "the state
+  of a running program" that disagree, so `DebugSnapshot` holds breakpoints,
+  watchpoints, the stop address and the step count, and `docs/lazen-debug.md` says
+  so in the same place a reader will look.
+- **There is no call chain**, as above, and no source-level information: there is
+  no mapping from an address to a line, which is Step 76.
+- **A watchpoint is O(watchpoints) per step**, and a run over a hot address with
+  several watches is measurably slower than one without. That is the price of a
+  machine with no watchpoint register.
+- **`DebugError` boxes its sources.** Clippy's `result_large_err` was right:
+  `KernelError` alone is 128 bytes, and an error type that size is returned on
+  every path a frontend can take. Boxed, so the common case is a pointer.

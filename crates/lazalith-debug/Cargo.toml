@@ -1,0 +1,25 @@
+[package]
+name = "lazalith-debug"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "The Lazalith debug API: a controller and a session, over a machine it does not expose"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+lazalith-boot = { path = "../lazalith-boot" }
+lazalith-cpu = { path = "../lazalith-cpu" }
+lazalith-devices = { path = "../lazalith-devices" }
+lazalith-isa = { path = "../lazalith-isa" }
+lazalith-machine = { path = "../lazalith-machine" }
+lazalith-memory = { path = "../lazalith-memory" }
+lazalith-os = { path = "../lazalith-os" }
+lazalith-toolchain = { path = "../lazalith-toolchain" }
+lazalith-types = { path = "../lazalith-types" }
+
+[dev-dependencies]
+lazalith-cpu = { path = "../lazalith-cpu" }
+lazalith-runtime = { path = "../lazalith-runtime" }
+
+[lints]
+workspace = true

@@ -68,6 +68,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazalith-debug"
+version = "0.1.0"
+dependencies = [
+ "lazalith-boot",
+ "lazalith-cpu",
+ "lazalith-devices",
+ "lazalith-isa",
+ "lazalith-machine",
+ "lazalith-memory",
+ "lazalith-os",
+ "lazalith-runtime",
+ "lazalith-toolchain",
+ "lazalith-types",
+]
+
+[[package]]
 name = "lazalith-devices"
 version = "0.1.0"
 dependencies = [

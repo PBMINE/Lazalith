@@ -14,19 +14,19 @@ use lazalith_types::ArchitectureConfig;
 #[derive(Debug)]
 pub enum DisassemblyError {
     IncompleteInstruction {
-        offset: usize,
-        remaining: usize,
+        offset: u64,
+        remaining: u64,
     },
     Decode {
-        offset: usize,
+        offset: u64,
         source: DecodeError,
     },
     Encode {
-        offset: usize,
+        offset: u64,
         source: InstructionError,
     },
     NonCanonical {
-        offset: usize,
+        offset: u64,
     },
 }
 
@@ -99,32 +99,59 @@ impl ObjectDisassembly {
     }
 }
 
+/// Disassembles the eight bytes at `bytes` into one instruction.
+///
+/// This is the same work [`disassemble`] does for one chunk, with the same
+/// canonicality check, exposed on its own. A caller that is walking memory it
+/// did not assemble — a debugger stepping through a region that may be data, or
+/// anything checking one word — needs to stop at the first thing that is not an
+/// instruction rather than refuse the whole range, and that is only possible if
+/// one instruction can be decoded on its own.
+///
+/// `offset` is the address the instruction is at, which is reported in the
+/// error rather than in the result: a caller walking a range needs to say
+/// *where* the bytes stopped being code.
+pub fn disassemble_one(
+    config: ArchitectureConfig,
+    bytes: &[u8],
+    offset: u64,
+) -> Result<DisassembledInstruction, DisassemblyError> {
+    if bytes.len() < 8 {
+        return Err(DisassemblyError::IncompleteInstruction {
+            offset,
+            remaining: bytes.len() as u64,
+        });
+    }
+    let chunk = &bytes[..8];
+    let instruction =
+        decode(config, chunk).map_err(|source| DisassemblyError::Decode { offset, source })?;
+    let canonical = encode(config, &instruction)
+        .map_err(|source| DisassemblyError::Encode { offset, source })?;
+    if canonical != chunk {
+        return Err(DisassemblyError::NonCanonical { offset });
+    }
+    let text = format_instruction(&instruction);
+    Ok(DisassembledInstruction {
+        offset,
+        instruction,
+        text,
+    })
+}
+
 pub fn disassemble(
     config: ArchitectureConfig,
     bytes: &[u8],
 ) -> Result<Vec<DisassembledInstruction>, DisassemblyError> {
     if !bytes.len().is_multiple_of(8) {
+        let length = bytes.len() as u64;
         return Err(DisassemblyError::IncompleteInstruction {
-            offset: bytes.len() / 8 * 8,
-            remaining: bytes.len() % 8,
+            offset: length / 8 * 8,
+            remaining: length % 8,
         });
     }
     let mut instructions = Vec::new();
     for (index, chunk) in bytes.chunks(8).enumerate() {
-        let offset = index * 8;
-        let instruction =
-            decode(config, chunk).map_err(|source| DisassemblyError::Decode { offset, source })?;
-        let canonical = encode(config, &instruction)
-            .map_err(|source| DisassemblyError::Encode { offset, source })?;
-        if canonical != chunk {
-            return Err(DisassemblyError::NonCanonical { offset });
-        }
-        let text = format_instruction(&instruction);
-        instructions.push(DisassembledInstruction {
-            offset: offset as u64,
-            instruction,
-            text,
-        });
+        instructions.push(disassemble_one(config, chunk, index as u64 * 8)?);
     }
     Ok(instructions)
 }
