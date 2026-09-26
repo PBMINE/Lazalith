@@ -520,6 +520,26 @@ pub enum CheckedExpr {
         /// Where it was written.
         span: SourceSpan,
     },
+    /// An array literal, whose elements are initialised in order.
+    Array {
+        /// The elements, already checked against the array's element type.
+        elements: Vec<CheckedExpr>,
+        /// The array type, which fixes the element count.
+        ty: Type,
+        /// Where it was written.
+        span: SourceSpan,
+    },
+    /// An array filled by writing one value to every element.
+    ArrayRepeat {
+        /// The value written to each element.
+        value: Box<CheckedExpr>,
+        /// How many elements to write, which must be a literal.
+        count: u64,
+        /// The array type, which agrees with `count`.
+        ty: Type,
+        /// Where it was written.
+        span: SourceSpan,
+    },
     /// A value of unit type, produced by a bare `return;`.
     Unit {
         /// Where it was written.
@@ -537,7 +557,9 @@ impl CheckedExpr {
             | CheckedExpr::Builtin { ty, .. }
             | CheckedExpr::Unary { ty, .. }
             | CheckedExpr::Binary { ty, .. }
-            | CheckedExpr::If { ty, .. } => ty.clone(),
+            | CheckedExpr::If { ty, .. }
+            | CheckedExpr::Array { ty, .. }
+            | CheckedExpr::ArrayRepeat { ty, .. } => ty.clone(),
             CheckedExpr::Bool { .. } => Type::Bool,
             CheckedExpr::Read { ty, .. } => ty.clone(),
             CheckedExpr::Cast { to, .. } => to.clone(),
@@ -562,6 +584,8 @@ impl CheckedExpr {
             | CheckedExpr::If { span, .. }
             | CheckedExpr::Block { span, .. }
             | CheckedExpr::AddressOf { span, .. }
+            | CheckedExpr::Array { span, .. }
+            | CheckedExpr::ArrayRepeat { span, .. }
             | CheckedExpr::Unit { span } => span,
         }
     }
@@ -2400,7 +2424,24 @@ impl<'a> Checker<'a> {
                 }
                 let mut arm_types = Vec::new();
                 for arm in arms {
-                    let block_expected = result.clone().unwrap_or(Type::Unit);
+                    // The type a conditional used as a value produces is the type
+                    // of its arms' tails. When the context has not said what it
+                    // is, the first arm's tail decides it, and the other arms are
+                    // checked against that. Checking the first arm as a unit
+                    // block instead would reject every value conditional, because
+                    // its tail is a value and not nothing.
+                    let mut block_expected = result.clone().unwrap_or(Type::Unit);
+                    if result.is_none()
+                        && let Some(tail) = &arm.body.tail
+                    {
+                        let inferred = self.check_expression(tail, scope, None)?;
+                        block_expected = self.resolve_inferred(
+                            inferred,
+                            None,
+                            &span_of(tail),
+                            "this conditional's value",
+                        )?;
+                    }
                     // A value conditional has no frame of its own in Step 61, so
                     // an arm may not bind a name: there would be no slot for it.
                     if let Some(binding) = arm
@@ -3350,9 +3391,17 @@ impl<'a> Checker<'a> {
                 Inferred::Concrete(ty),
             ) => {
                 if matches!(operator, UnaryOp::Address | UnaryOp::AddressMut) {
-                    // A str borrow is a str, so it has no place to take.
+                    // A str borrow is a str, so it takes no address: it is a
+                    // read of the borrowed str's place, which keeps the value
+                    // rather than discarding it.
                     if ty == Type::Str {
-                        return Ok(CheckedExpr::Unit { span: span.clone() });
+                        let place = self.check_place(operand, scope)?;
+                        let span = span.clone();
+                        return Ok(CheckedExpr::Read {
+                            place: Box::new(place),
+                            ty,
+                            span,
+                        });
                     }
                     let place = self.check_place(operand, scope)?;
                     return Ok(CheckedExpr::AddressOf {
@@ -3457,28 +3506,45 @@ impl<'a> Checker<'a> {
                         scope,
                     )?);
                 }
-                let mut statements = Vec::new();
-                for (slot, value) in checked.into_iter().enumerate() {
-                    let span = span.clone();
-                    statements.push(CheckedStmt::Let {
-                        local: None,
-                        value: Box::new(value),
-                        span,
-                    });
-                    let _ = slot;
-                }
-                CheckedExpr::Block {
-                    statements,
-                    tail: Box::new(CheckedExpr::Unit { span: span.clone() }),
+                // The elements are kept, not folded into a block of discarded
+                // statements: the array's contents are what a later stage writes
+                // to the frame, so dropping them here would lose the program.
+                CheckedExpr::Array {
+                    elements: checked,
+                    ty,
                     span: span.clone(),
                 }
             }
             (Expr::ArrayRepeat { span, .. }, Inferred::Concrete(ty)) => {
-                // A repeated array is a run of stores into a local array, which
-                // Step 61 records as a value of array type; the stores are the
-                // next stage's business.
-                let _ = ty;
-                CheckedExpr::Unit { span: span.clone() }
+                // The value and the count are kept, for the same reason as an
+                // array literal's elements: they are the stores themselves.
+                // `check_expression` only accepts a literal count, so the count
+                // is a number here and not an expression.
+                let (value, count) = match expression {
+                    Expr::ArrayRepeat { value, count, .. } => {
+                        let element = ty.element().cloned().unwrap_or(Type::I32);
+                        let value_inferred =
+                            self.check_expression(value, scope, Some(element.clone()))?;
+                        let checked_value =
+                            self.finalize(value, value_inferred, Some(element), scope)?;
+                        let count_inferred =
+                            self.check_expression(count, scope, Some(Type::Usize))?;
+                        let count = match count_inferred {
+                            Inferred::IntegerLiteral(value) => {
+                                u64::try_from(value).unwrap_or(u64::MAX)
+                            }
+                            _ => 0,
+                        };
+                        (checked_value, count)
+                    }
+                    _ => return Ok(CheckedExpr::Unit { span: span.clone() }),
+                };
+                CheckedExpr::ArrayRepeat {
+                    value: Box::new(value),
+                    count,
+                    ty,
+                    span: span.clone(),
+                }
             }
             (Expr::If { arms, span }, Inferred::Concrete(ty)) => {
                 // Each arm's condition is checked once, here, and kept: Step 62

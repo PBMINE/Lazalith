@@ -249,6 +249,8 @@ impl FunctionBuilder {
 #[derive(Debug)]
 pub struct ModuleBuilder {
     module: Module,
+    /// The span to give the next function started, if one was recorded.
+    pending_span: Option<SourceSpan>,
 }
 
 impl ModuleBuilder {
@@ -260,6 +262,7 @@ impl ModuleBuilder {
                 functions: Vec::new(),
                 data: Vec::new(),
             },
+            pending_span: None,
         }
     }
 
@@ -282,12 +285,19 @@ impl ModuleBuilder {
                 name: String::from(name),
             }));
         }
-        FunctionBuilder::new(String::from(name), linkage, params, result, None)
+        // A span recorded before `function` applies to the next function started and
+        // to no other: a span that leaked from one function to the next would put
+        // a diagnostic in the wrong place, which is worse than none.
+        let span = self.pending_span.take();
+        FunctionBuilder::new(String::from(name), linkage, params, result, span)
     }
 
-    /// Records a source span for the function under construction.
+    /// Records the source span for the next function started.
+    ///
+    /// This used to do nothing at all, so every function in a module reported no
+    /// span and a diagnostic could not say where a function came from.
     pub fn set_function_span(&mut self, span: SourceSpan) {
-        let _ = span;
+        self.pending_span = Some(span);
     }
 
     /// Adds a completed function.

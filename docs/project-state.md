@@ -1,42 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-26 (Steps 1–61 verified; Steps 62–75 not started)
-
-## Where the roadmap stands
-
-```text
-Steps 1–50    complete, audited, repaired, verified, committed (31dbf86)
-Steps 51–59   complete: the Lazen design cluster (documentation only)
-Step  60      complete: lazalith-ir, the shared low-level IR
-Steps 61–75   NOT started. No compiler, runtime, driver, GUI, or debug code exists.
-```
-
-This milestone committed the design cluster and the IR. The remaining steps are
-listed below with their exact entry point so the next session starts from a
-verified baseline rather than from a partial implementation.
-
-### What deliberately did not land
-
-An attempt was made to carry Steps 61–63 in this milestone. The frontend
-reached a working lexer, a recursive-descent parser, and a name resolver, but
-the type checker and lowering pass were drafted against a larger language than
-the milestone could finish and verify, and the drafted lowering was itself
-unsound (it treated a function-address intrinsic as a frame pointer and dropped
-slice lengths). Rather than commit code that compiles-but-is-wrong, or leave a
-non-compiling crate in the tree, the compiler crate was removed and the milestone
-was closed at Step 60, which is fully verified.
-
-The consequence for the design documents is that they now describe the language
-that will actually be built, not a larger one: `docs/lazen-syntax.md` and
-`docs/lazen-types.md` record that Lazen v1 has no `optional`, no enums, no
-records, and no `match`, with the reason for each exclusion. That decision was
-made *because* of the failed attempt, and it is the right one: every remaining
-step depends on a type system and a lowering pass that can be audited, and a
-closed v1 type set is what makes that possible.
-
-# Lazalith — Project State
-
-Last updated: 2026-09-26 (Steps 1–61 verified; Steps 62–75 not started)
+Last updated: 2026-09-26 (Steps 1–62 verified; Steps 63–75 not started)
 
 ## Where the roadmap stands
 
@@ -44,14 +8,16 @@ Last updated: 2026-09-26 (Steps 1–61 verified; Steps 62–75 not started)
 Steps 1–50    complete, audited, repaired, verified, committed (31dbf86)
 Steps 51–59   complete: the Lazen design cluster (documentation only)
 Step  60      complete: lazalith-ir, the shared low-level IR (66d29cf)
-Step  61      complete: lazalith-compiler, the Lazen frontend
-Steps 62–75   NOT started. No lowering, code generation, runtime, driver, GUI,
-              or debug code exists.
+Step  61      complete: lazalith-compiler, the Lazen frontend (7a4a5b3)
+Step  62      complete: lowering from the checked tree to lazalith-ir
+Steps 63–75   NOT started. No code generation, runtime, driver, GUI, or debug
+              code exists.
 ```
 
-This milestone added the Lazen frontend. Steps 1–60 are unchanged and still
-pass; the 181 new tests in `crates/lazalith-compiler` and the 533 workspace tests
-all pass, and the frontend compiles every program in `docs/lazen-syntax.md`.
+This milestone added lowering. Steps 1–61 are unchanged and still pass; the 558
+workspace tests all pass, including 20 in `crates/lazalith-compiler/tests/lowering.rs`
+that state what the IR must contain for each rule, and 4 in `lazalith-ir` for the
+instructions this step had to add.
 
 ### What deliberately did not land
 
@@ -380,15 +346,129 @@ truth and a specification that cannot compile is not a specification:
   function whose body is a `loop` with no `break` satisfies its result type.
 - `aarch64-linux` remains untested.
 
+## Step 62 — Lowering to IR
+
+`crates/lazalith-compiler/src/lower.rs` turns a `CheckedProgram` into a verified
+`lazalith_ir::Module` plus one `FrameLayout` per function. Nothing below is
+invented: every frame offset comes from the frontend's `LocalSlot`, and the
+temporaries this stage needs are reported in the layout rather than hidden.
+
+### Representation decisions
+
+- **The frame base is the machine's stack pointer.** A local's address is
+  `Intrinsic::FrameBase + offset`. The ISA has `GETSP` and `SETSP`, so a backend
+  materialises this with real instructions: the prologue moves SP down by the
+  reported frame size, and the base is whatever SP then holds. It is never
+  `FunctionAddress`, which is a function's identity and differs per call site.
+- **Parameters arrive in registers and the prologue stores them into their
+  slots.** The body then reads every local the same way, parameter or not, so
+  there is one rule instead of two.
+- **A view is two words and is never half-copied.** A `str` and a slice are built
+  with `Insert` at offsets 0 and 8, taken apart with `Extract` and
+  `Intrinsic::SliceLength`, and stored in the frame as their two words. The
+  deleted prototype dropped lengths here, which is the whole reason the
+  `Instruction::Copy` fix below exists.
+- **A string's address is a symbol.** `Instruction::DataAddress` names a data
+  segment the linker places; a frontend cannot know an address, and a made-up one
+  reads the wrong bytes silently.
+- **There are no phi nodes, so a value leaves an `if` through the frame.** Each
+  arm stores its value into a `JoinValue` temporary and the join block reads it.
+- **`&&` and `||` short-circuit through branches.** `Instruction::LogicalAnd` is
+  eager, and the right side of `&&` can trap, so the right side gets its own
+  block and the result comes out of a one-byte `ShortCircuit` temporary.
+- **`break` and `continue` are jumps to real blocks.** Every loop has four: a
+  test, a body, a step, and an exit. The step block exists so `continue` does not
+  have to jump to the test and skip the body's last effect.
+- **An index is checked before its address is formed.**
+  `Instruction::BoundsCheck` compares the index against the place's own length,
+  as unsigned values of the same width, and traps with `TRAP_BOUNDS`.
+- **A cast is one load.** Widening reads the source's width and lets the load
+  extend it, which is what `LDZ`/`LDS` do; narrowing reads the target's width.
+  The extension follows the *source* type, so a `u8` of 200 stays 200.
+- **Block identifiers are the layout.** The IR builder numbers blocks in creation
+  order and allows only one new block per terminated block, so the lowering lays
+  its blocks out first and a slot's number *is* its identifier. A branch can then
+  name a block that is opened later, and an assertion checks that no block is
+  ever opened out of order.
+
+### Bugs this step found and fixed
+
+- **`Instruction::Copy` was typed `Void`.** A copied aggregate therefore read as
+  nothing at all, which is precisely how a slice length could be lost. It now
+  carries its type.
+- **A one-operand bounds check could not check anything.** `Intrinsic::BoundsCheck`
+  took only an index, leaving a backend to invent the bound. It is now
+  `Instruction::BoundsCheck { index, length, code }`, and the verifier checks that
+  both are unsigned integers of the same width.
+- **An array literal and an array repeat lost their contents.** Step 61 recorded
+  them as a `CheckedExpr::Unit`, discarding the elements, the value and the count,
+  so lowering had nothing to store. Both are now `CheckedExpr::Array` and
+  `CheckedExpr::ArrayRepeat` with their contents intact.
+- **`&text` for a `str` produced a unit value.** A `str` borrow is a `str`, so
+  Step 61 returned `Unit` and threw the value away. It is now a read of the
+  borrowed place.
+- **A value-producing `if` never compiled.** With no type known for the
+  conditional, the first arm was checked as a unit block, so every value
+  conditional was rejected with "expected `()`, found `i32`". The first arm's
+  tail now decides the type and the other arms are checked against it.
+- **A nested block's tail was treated as the function's return value.** A loop
+  body ending in `break` with a unit tail emitted an instruction after a
+  terminator. Only a function body's tail is a return.
+- **`ModuleBuilder::set_function_span` did nothing.** Every function in a module
+  reported no span. It now records the span for the next function started, and
+  takes it, so a span cannot leak from one function to the next.
+- **The verifier did not check a load's width.** A load may be narrower than its
+  type, which is how a conversion is spelled, but never wider, which would read
+  bytes the value does not have.
+
+### Decisions
+
+- **A 32-bit target is refused.** `i64`, `u64` and `usize` are wider than a
+  32-bit machine's registers; lowering them honestly means register pairs and
+  arithmetic the ISA does not have. Step 62 reports that instead of miscompiling,
+  and LZ64 is the default target.
+- **A call is limited to six argument words.** The kernel reads a syscall number
+  from `r0` and arguments from `r1`–`r6`, and a view or a 64-bit integer is two
+  words, so three views already fill the registers. A wider call is refused by
+  name with its word count.
+- **A syscall the ABI has not numbered cannot be called.** `display_open`,
+  `display_present` and `input_poll` are accepted as declarations because the
+  designs name them, but a call to one is refused rather than given an invented
+  number. This is what the graphics and input steps will have to add.
+- **An array is its own storage, never a value.** `[T; N]` is a `Record` of `N`
+  fields in the IR, initialised element by element. `as_slice` and `as_ptr` take
+  its address, which is the one place array data is named rather than copied.
+- **A place through a view reference is refused.** `*r` where `r: &mut [T]` has no
+  single address to compute, because the reference *is* the view. The error names
+  the shape rather than guessing at an address.
+
+### Limitations
+
+- There is no constant folding, no copy propagation, and no dead-store removal:
+  every `let` is a store and every read is a load, even for a literal. Step 63 may
+  do this in registers, and a later step may do it here.
+- Frame addresses are recomputed per access (`FrameBase`, a constant, an add)
+  rather than kept in a register, and the frame base is re-materialised for each
+  one. A register-allocating backend will hoist these; correctness does not
+  depend on it.
+- The cast scratch slot and the short-circuit temporary are one slot per function,
+  reused because each use is a store immediately followed by its own load or by
+  the join. That reuse is sound only because nothing else can write them in
+  between, which is why they are not shared across nesting.
+- A loop's induction variable is the frontend's slot for the loop, re-read at each
+  step, so a body that assigns to it is respected. Rejecting that assignment is
+  the frontend's business, not this stage's.
+- `aarch64-linux` remains untested.
+
 ## Next step
 
-Step 62 lowers the checked program into `lazalith-ir`. The lowering consumes
-`CheckedProgram` and produces an `IrModule` for the Step 60 verifier, keeping the
-boundary honest: the frontend's frame offsets are data, the IR's blocks and
-terminators are control flow, and no stage may invent a value the previous one did
-not produce. In particular, a `&[T]` must lower as a pointer *and* a length, a
-`str` as a pointer and a length, a `ptr<T>` as one word, and a frame as slots
-addressed from the machine's stack pointer.
+Step 63 generates code from the IR. The lowering now produces a verified module
+plus a frame layout per function, so code generation has everything it needs and
+nothing it has to invent: an `Intrinsic::FrameBase` becomes the machine's stack
+pointer after the prologue subtracts the reported frame size, an
+`Instruction::DataAddress` becomes a linker symbol rather than a number, an
+`Instruction::BoundsCheck` becomes a compare and a trap, and a view is two words
+that the ABI passes in two registers.
 
 ## Steps 1–50 Retrospective Audit and Repair
 
@@ -575,6 +655,8 @@ holds 352 tests and 41,839 lines after Steps 51-60, whose build output was
 `/nix/store/b5wqs8lpgjh0sv24vvc23jlvzlr81l38-lazalith-foundations-0.1.0`.
 After Step 61 the workspace holds 533 tests and 53,060 lines, with build output
 `/nix/store/69dg0yxw0a7gxab0a282azgpnaafg2rg-lazalith-foundations-0.1.0`.
+After Step 62 the workspace holds 558 tests and 56,309 lines, with build output
+`/nix/store/k8a4zdffwyl9fnra59qw5kyhry01mlf2-lazalith-foundations-0.1.0`.
 The Nix build at the end of the Steps 26-50 repair pass was
 `/nix/store/mkvdplx6wsyb28878jlpbakjk7nvdsfa-lazalith-foundations-0.1.0`.
 aarch64-linux remains untested. The Steps 26–50 audit repaired linker BSS

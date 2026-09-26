@@ -110,6 +110,48 @@ fn verify_function(module: &Module, function: &Function) -> Result<(), IrError> 
         }
     }
     check_calls(module, function)?;
+    check_data_addresses(module, function)?;
+    check_bounds_checks(function)?;
+    Ok(())
+}
+
+/// A bounds check compares an index against a length, so both must be unsigned
+/// integers of the same width.
+///
+/// A signed index would let a negative value pass as a small one, and widths that
+/// disagree would make the comparison mean something the machine cannot do in one
+/// instruction, which is where a wrong answer would come from.
+fn check_bounds_checks(function: &Function) -> Result<(), IrError> {
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            let Instruction::BoundsCheck { index, length, .. } = instruction else {
+                continue;
+            };
+            let index_ty = value_type(function, *index);
+            let length_ty = value_type(function, *length);
+            let unsigned_width = |ty: Option<Type>| match ty {
+                Some(Type::Int {
+                    bits,
+                    signed: false,
+                }) => Some(bits),
+                _ => None,
+            };
+            let pair = (
+                unsigned_width(index_ty.clone()),
+                unsigned_width(length_ty.clone()),
+            );
+            if pair.0.is_none() || pair.0 != pair.1 {
+                return Err(IrError::new(IrErrorKind::InvalidType {
+                    detail: alloc::format!(
+                        "a bounds check needs an unsigned index and an unsigned length of the \
+                         same width, not {index_ty:?} and {length_ty:?}"
+                    ),
+                })
+                .in_function(&function.name)
+                .with_block(block.id));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -135,6 +177,36 @@ fn check_calls(module: &Module, function: &Function) -> Result<(), IrError> {
                             .in_function(&function.name),
                     );
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every data address names a segment this module actually has.
+///
+/// A missing segment is a compile-time failure, not a link-time surprise: a
+/// program that reads a string whose bytes were never emitted would read
+/// whatever is at some address instead, silently.
+fn check_data_addresses(module: &Module, function: &Function) -> Result<(), IrError> {
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            let Instruction::DataAddress { name, ty } = instruction else {
+                continue;
+            };
+            if module.data(name).is_none() {
+                return Err(
+                    IrError::new(IrErrorKind::UnknownData { name: name.clone() })
+                        .in_function(&function.name)
+                        .with_block(block.id),
+                );
+            }
+            if *ty != Type::Pointer {
+                return Err(IrError::new(IrErrorKind::InvalidType {
+                    detail: alloc::format!("a data address has type {ty}, not a pointer"),
+                })
+                .in_function(&function.name)
+                .with_block(block.id));
             }
         }
     }
@@ -196,6 +268,20 @@ fn check_operands(
         && let Some(size) = ty.size_in_bytes()
         && size != width.bytes()
         && !(matches!(ty, Type::Slice { .. }) && width.bytes() == 8)
+    {
+        return Err(IrError::new(IrErrorKind::WidthMismatch {
+            bytes: width.bytes(),
+            size,
+        })
+        .in_function(&function.name)
+        .with_block(block));
+    }
+    // A load may be narrower than its type, which is how a conversion is spelled:
+    // a byte loaded as a 64-bit integer is a widening load. A load that is
+    // *wider* than its type would read bytes the value does not have.
+    if let Instruction::Load { width, ty, .. } = instruction
+        && let Some(size) = ty.size_in_bytes()
+        && width.bytes() > size
     {
         return Err(IrError::new(IrErrorKind::WidthMismatch {
             bytes: width.bytes(),
@@ -279,7 +365,7 @@ fn check_terminator(
 pub(crate) fn produces_value(instruction: &Instruction) -> bool {
     !matches!(
         instruction,
-        Instruction::Store { .. } | Instruction::Trap { .. }
+        Instruction::Store { .. } | Instruction::Trap { .. } | Instruction::BoundsCheck { .. }
     )
 }
 
@@ -287,7 +373,7 @@ pub(crate) fn produces_value(instruction: &Instruction) -> bool {
 pub(crate) fn operands(instruction: &Instruction) -> Vec<ValueId> {
     let mut used = Vec::new();
     match instruction {
-        Instruction::Const { .. } | Instruction::Trap { .. } => {}
+        Instruction::Const { .. } | Instruction::Trap { .. } | Instruction::DataAddress { .. } => {}
         Instruction::Binary { left, right, .. } | Instruction::Compare { left, right, .. } => {
             used.push(*left);
             used.push(*right);
@@ -296,7 +382,7 @@ pub(crate) fn operands(instruction: &Instruction) -> Vec<ValueId> {
             used.push(*left);
             used.push(*right);
         }
-        Instruction::Unary { operand, .. } | Instruction::Copy { value: operand } => {
+        Instruction::Unary { operand, .. } | Instruction::Copy { value: operand, .. } => {
             used.push(*operand);
         }
         Instruction::Load { address, .. } => used.push(*address),
@@ -317,6 +403,10 @@ pub(crate) fn operands(instruction: &Instruction) -> Vec<ValueId> {
             }
         }
         Instruction::Extract { aggregate, .. } => used.push(*aggregate),
+        Instruction::BoundsCheck { index, length, .. } => {
+            used.push(*index);
+            used.push(*length);
+        }
         Instruction::Insert {
             aggregate, value, ..
         } => {
@@ -351,15 +441,21 @@ fn instruction_result_type(instruction: &Instruction) -> Type {
         Instruction::Const { ty, .. }
         | Instruction::Binary { ty, .. }
         | Instruction::Unary { ty, .. }
-        | Instruction::Load { ty, .. } => ty.clone(),
+        | Instruction::Load { ty, .. }
+        | Instruction::DataAddress { ty, .. } => ty.clone(),
         Instruction::Compare { .. }
         | Instruction::LogicalAnd { .. }
         | Instruction::LogicalOr { .. } => Type::Bool,
         Instruction::Call { result, .. } => result.clone(),
         Instruction::Intrinsic { result, .. } => result.clone(),
-        Instruction::Copy { .. } => Type::Void,
+        // A copy produces a value of its operand's type. It was typed `Void`, which
+        // made every use of a copied aggregate mistyped: a copied slice read as
+        // nothing at all, which is how a length could have been lost.
+        Instruction::Copy { ty, .. } => ty.clone(),
         Instruction::Extract { ty, .. } | Instruction::Insert { result: ty, .. } => ty.clone(),
-        Instruction::Store { .. } | Instruction::Trap { .. } => Type::Void,
+        Instruction::Store { .. } | Instruction::Trap { .. } | Instruction::BoundsCheck { .. } => {
+            Type::Void
+        }
     }
 }
 

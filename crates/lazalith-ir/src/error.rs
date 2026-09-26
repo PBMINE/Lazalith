@@ -96,6 +96,11 @@ pub enum IrErrorKind {
         /// A human-readable description of the disagreement.
         detail: String,
     },
+    /// A data segment's name was used that the module does not have.
+    UnknownData {
+        /// The missing segment name.
+        name: String,
+    },
     /// The builder was used in a way its invariants forbid.
     InvalidBuilderState {
         /// What went wrong.
@@ -180,6 +185,7 @@ impl fmt::Display for IrErrorKind {
             }
             Self::UnknownCallee { name } => write!(f, "call target {name} does not exist"),
             Self::UnresolvedImport { name } => write!(f, "import {name} is not resolved"),
+            Self::UnknownData { name } => write!(f, "data segment {name} is not in this module"),
             Self::UndominatedUse { value, block } => {
                 write!(
                     f,

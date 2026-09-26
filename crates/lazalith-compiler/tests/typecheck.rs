@@ -8,8 +8,12 @@
 use lazalith_compiler::frontend::compile;
 use lazalith_compiler::resolve::codes as resolve_codes;
 use lazalith_compiler::types::ABI_SYSCALLS;
+use lazalith_compiler::types::CheckedExpr;
+use lazalith_compiler::types::CheckedStmt;
+use lazalith_compiler::types::Type;
 use lazalith_compiler::types::codes;
 use lazalith_types::SourceManager;
+use lazalith_types::WordWidth;
 
 fn accepts(source: &str) {
     let mut sources = SourceManager::new();
@@ -709,4 +713,76 @@ fn a_reserved_design_syscall_is_accepted_without_a_number() {
             "a reserved call must carry no number"
         );
     }
+}
+
+/// These two tests pin the contents the checked tree must keep.
+///
+/// Lowering turns an array's elements and a repeat's value and count into
+/// stores, and a `&str` into a read. If the checked tree dropped any of them,
+/// the program would still type-check and then lower to something that writes
+/// less than it read.
+#[test]
+fn an_array_literal_keeps_its_elements_for_later_stages() {
+    let source = "fn main() { let values = [1i32, 2i32, 3i32]; return; }";
+    let mut sources = SourceManager::new();
+    let (_, program) = compile(&mut sources, "t.lazen", source)
+        .unwrap_or_else(|error| panic!("{source} should compile:\n{}", error.render()));
+    let function = &program.functions[0];
+    let CheckedStmt::Let { value, .. } = &function.body.statements[0] else {
+        panic!("expected a let, found {:?}", function.body.statements[0]);
+    };
+    let CheckedExpr::Array { elements, ty, .. } = value.as_ref() else {
+        panic!("expected an array literal, found {value:?}");
+    };
+    assert_eq!(
+        ty.size_in_bytes(WordWidth::W64),
+        12,
+        "the type fixes the element count"
+    );
+    for element in elements {
+        assert_eq!(element.ty(), Type::I32, "each element is checked");
+    }
+}
+
+#[test]
+fn a_repeated_array_keeps_its_value_and_count() {
+    let source = "fn main() { let zeros = [0u8; 4]; return; }";
+    let mut sources = SourceManager::new();
+    let (_, program) = compile(&mut sources, "t.lazen", source)
+        .unwrap_or_else(|error| panic!("{source} should compile:\n{}", error.render()));
+    let function = &program.functions[0];
+    let CheckedStmt::Let { value, .. } = &function.body.statements[0] else {
+        panic!("expected a let, found {:?}", function.body.statements[0]);
+    };
+    let CheckedExpr::ArrayRepeat { value, count, .. } = value.as_ref() else {
+        panic!("expected a repeat, found {value:?}");
+    };
+    assert_eq!(*count, 4, "the count is the number of stores to make");
+    assert_eq!(
+        value.ty(),
+        Type::U8,
+        "the value is checked against the element"
+    );
+}
+
+#[test]
+fn a_str_borrow_reads_its_place_instead_of_discarding_it() {
+    let source = r#"
+        fn main() {
+            let text = "hi";
+            let same = &text;
+            return;
+        }
+    "#;
+    let mut sources = SourceManager::new();
+    let (_, program) = compile(&mut sources, "t.lazen", source)
+        .unwrap_or_else(|error| panic!("{source} should compile:\n{}", error.render()));
+    let function = &program.functions[0];
+    let CheckedStmt::Let { value, .. } = &function.body.statements[1] else {
+        panic!("expected a let, found {:?}", function.body.statements[1]);
+    };
+    assert!(
+        matches!(value.as_ref(), CheckedExpr::Read { .. }),
+        "a str borrow is a read of the str, not a unit value: {value:?}"
+    );
 }

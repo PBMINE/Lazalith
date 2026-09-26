@@ -168,6 +168,30 @@ close to the ISA so that branch, call, load, store, and immediate relocations
 can be emitted without guessing. The assembler and linker remain reusable for
 hand-written Lazalith assembly.
 
+Four things in the IR exist because the language needs them and the ISA alone
+cannot say them, and each is spelled so a backend cannot substitute a guess:
+
+- **`FrameBase`** is the current function's frame base, which is the machine's
+  stack pointer: the prologue moves SP down by the frame size and the base is
+  whatever SP then holds. It is not a function's address, which is a different
+  value that changes per call site.
+- **`DataAddress`** names a data segment, because a string's address is decided
+  by the linker and no front end can know it. A backend resolves the segment; it
+  may not invent an address, and the verifier rejects a name the module does not
+  have.
+- **`BoundsCheck`** takes both the index and the length, compared as unsigned
+  values of the same width. A check with only an index compares nothing, and a
+  backend asked to invent the bound would be guessing where reading memory that
+  belongs to something else would be the alternative.
+- **`SliceLength`** reads a view's length from the view itself, so a length
+  cannot be recomputed from an address that may no longer describe the same
+  bytes.
+
+A cast between integer widths is a load rather than a conversion instruction: a
+load may be narrower than its type, which is exactly what the machine's extending
+loads do, so `u8 as i64` is an eight-bit load typed as a 64-bit integer. A load
+may never be *wider* than its type, and the verifier rejects one that is.
+
 ## Non-goals for v1
 
 - copying C, Rust, Pascal, or Go wholesale;

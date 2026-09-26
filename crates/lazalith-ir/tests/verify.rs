@@ -6,8 +6,8 @@
 
 use lazalith_ir::{
     BinaryOp, Block, BlockId, CallArg, CallTarget, ConstValue, DataSegment, Function,
-    FunctionBuilder, Instruction, IrErrorKind, Linkage, Module, ModuleBuilder, Parameter,
-    RecordField, ReturnValue, StoreWidth, Terminator, Type, ValueId, verify_module,
+    FunctionBuilder, Instruction, IrErrorKind, Linkage, MemorySpace, Module, ModuleBuilder,
+    Parameter, RecordField, ReturnValue, StoreWidth, Terminator, Type, ValueId, verify_module,
 };
 use std::{string::String, vec, vec::Vec};
 
@@ -692,5 +692,185 @@ fn traps_and_stores_produce_no_value_while_other_instructions_do() {
         after_trap.get(),
         4,
         "store and trap must not consume value identifiers"
+    );
+}
+
+#[test]
+fn a_copy_of_an_aggregate_keeps_the_aggregate_type() {
+    // A copy used to be typed `Void`, so a copied slice's uses read as nothing
+    // at all and its length could have been dropped. The verifier must see the
+    // copy's own type, which is what makes a use of the result checkable.
+    verify_module(&copying_slice_function()).expect("a copy of a slice verifies");
+}
+
+#[test]
+fn a_copy_of_a_slice_can_be_stored() {
+    // The store-width check reads the value's type, so a copy must report the
+    // slice's size rather than nothing at all.
+    let mut module = ModuleBuilder::new("store_copy");
+    let mut function = module
+        .function(
+            "main",
+            Linkage::External,
+            vec![Parameter {
+                name: String::from("s"),
+                ty: slice_type(),
+            }],
+            Type::Void,
+        )
+        .expect("function builder");
+    function.switch_to_block("entry").expect("block");
+    let value = function.param_value(0).expect("parameter value");
+    let address = function
+        .emit(Instruction::Const {
+            value: ConstValue::Pointer(0x1000),
+            ty: Type::Pointer,
+        })
+        .expect("a constant");
+    let copied = function
+        .emit(Instruction::Copy {
+            value,
+            ty: slice_type(),
+        })
+        .expect("a copy produces a value");
+    function
+        .emit_effect(Instruction::Store {
+            address,
+            value: copied,
+            // A view is stored as its pointer word, which is the one width the
+            // verifier allows for a slice; the length word is stored separately.
+            width: StoreWidth::Double,
+            space: MemorySpace::Program,
+        })
+        .expect("a store");
+    function
+        .terminate(Terminator::Return(ReturnValue::Void))
+        .expect("terminator");
+    let function = function.finish().expect("function");
+    module.add_function(function).expect("add function");
+    let module = module.finish().expect("module");
+    verify_module(&module).expect("a copied slice stores cleanly");
+}
+
+/// A slice type used by the copy tests.
+fn slice_type() -> Type {
+    Type::Slice {
+        element: Box::new(Type::Int {
+            bits: 8,
+            signed: false,
+        }),
+        mutable: false,
+    }
+}
+
+/// A module with one function that takes a slice and returns it copied.
+fn copying_slice_function() -> Module {
+    let mut module = ModuleBuilder::new("copy");
+    let mut function = module
+        .function(
+            "main",
+            Linkage::External,
+            vec![Parameter {
+                name: String::from("s"),
+                ty: slice_type(),
+            }],
+            slice_type(),
+        )
+        .expect("function builder");
+    function.switch_to_block("entry").expect("block");
+    let value = function.param_value(0).expect("parameter value");
+    let copied = function
+        .emit(Instruction::Copy {
+            value,
+            ty: slice_type(),
+        })
+        .expect("a copy produces a value");
+    function
+        .terminate(Terminator::Return(ReturnValue::Value(copied)))
+        .expect("terminator");
+    let function = function.finish().expect("function");
+    module.add_function(function).expect("add function");
+    module.finish().expect("module")
+}
+
+/// A string's address is a symbol, and a symbol the module does not have is a
+/// compile-time failure. Without this check a program that reads a string whose
+/// bytes were never emitted would read whatever is at some address instead.
+#[test]
+fn a_data_address_must_name_a_segment_the_module_has() {
+    let function = {
+        let mut module = ModuleBuilder::new("test");
+        let mut function = function_builder(&mut module, Type::Void);
+        function.switch_to_block("entry").expect("block");
+        function
+            .emit(Instruction::DataAddress {
+                name: String::from("text"),
+                ty: Type::Pointer,
+            })
+            .expect("data address");
+        function
+            .terminate(Terminator::Return(ReturnValue::Void))
+            .expect("terminator");
+        function.finish().expect("function")
+    };
+
+    let mut with_segment = ModuleBuilder::new("test");
+    with_segment.add_function(function.clone()).expect("add");
+    with_segment
+        .add_data(DataSegment {
+            name: String::from("text"),
+            bytes: vec![b'h', b'i'],
+            alignment: 1,
+            span: None,
+        })
+        .expect("segment");
+    with_segment
+        .finish()
+        .expect("a segment that exists must verify");
+
+    let mut without = ModuleBuilder::new("test");
+    without.add_function(function).expect("add");
+    let error = without
+        .finish()
+        .expect_err("a missing segment must be rejected");
+    assert_eq!(
+        error.kind,
+        IrErrorKind::UnknownData {
+            name: String::from("text")
+        }
+    );
+}
+
+#[test]
+fn a_data_address_is_a_pointer() {
+    let mut module = ModuleBuilder::new("test");
+    let mut function = function_builder(&mut module, Type::Void);
+    function.switch_to_block("entry").expect("block");
+    function
+        .emit(Instruction::DataAddress {
+            name: String::from("text"),
+            ty: int_type(),
+        })
+        .expect("data address");
+    function
+        .terminate(Terminator::Return(ReturnValue::Void))
+        .expect("terminator");
+    module
+        .add_function(function.finish().expect("function"))
+        .expect("add");
+    module
+        .add_data(DataSegment {
+            name: String::from("text"),
+            bytes: vec![b'h'],
+            alignment: 1,
+            span: None,
+        })
+        .expect("segment");
+    let error = module
+        .finish()
+        .expect_err("a data address that is not a pointer must be rejected");
+    assert!(
+        matches!(error.kind, IrErrorKind::InvalidType { .. }),
+        "{error}"
     );
 }

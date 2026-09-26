@@ -367,11 +367,24 @@ pub enum CallTarget {
 pub enum Intrinsic {
     /// The address of a function, for taking a function's identity.
     FunctionAddress,
+    /// The base address of the current function's frame.
+    ///
+    /// A frame is the storage a function's locals live in, and it is addressed
+    /// from this value at a constant offset. This is the *current frame's* base,
+    /// not a function's address and not a function's identity: `FunctionAddress`
+    /// is that, and the two must never be confused, because a frame base varies
+    /// per call while a function's address does not.
+    ///
+    /// The machine owns the stack pointer and moves it on `CALL` and `RET`, and
+    /// `GETSP`/`SETSP` move it between the architectural register and a general
+    /// one, so a backend materialises this with real instructions: the
+    /// prologue moves the stack pointer down by the frame size it computed, and
+    /// the base is whatever the stack pointer then holds. A backend that cannot
+    /// provide a frame base must reject the IR rather than substitute something
+    /// else, because every load and store of a local depends on it.
+    FrameBase,
     /// The number of elements in a slice.
     SliceLength,
-    /// A bounds check that traps instead of branching. A backend that cannot
-    /// emit a trap must reject the IR rather than drop the check.
-    BoundsCheck,
 }
 
 /// One instruction. Every instruction except `Store` produces a value; the
@@ -473,6 +486,8 @@ pub enum Instruction {
     Copy {
         /// The value copied.
         value: ValueId,
+        /// The type of the copy, which is the copied value's type.
+        ty: Type,
     },
     /// Extract a field or variant payload from an aggregate at a constant byte
     /// offset. Frontends lower field access and enum payload access here so the
@@ -503,6 +518,41 @@ pub enum Instruction {
     Trap {
         /// Stable trap code.
         code: u32,
+    },
+    /// A bounds check that traps instead of branching.
+    ///
+    /// The check has both the index and the length, because a check with only an
+    /// index compares nothing: a backend that had to invent the bound would be
+    /// guessing, and guessing here reads memory that belongs to something else
+    /// instead of trapping. The index is compared against the length as
+    /// unsigned values, so a negative index cannot slip through as a small one.
+    ///
+    /// A backend that cannot emit a trap must reject the IR rather than drop the
+    /// check, and a backend may not replace a trapping check with a branch: the
+    /// program below is written for the trap.
+    BoundsCheck {
+        /// The index being checked, an unsigned integer.
+        index: ValueId,
+        /// How many elements there are, an unsigned integer of the index's width.
+        length: ValueId,
+        /// The stable trap code to raise.
+        code: u32,
+    },
+    /// The address of a data segment, for reading static data such as a string.
+    ///
+    /// Static data's address is not a number a front end can know: the linker
+    /// lays segments out, so the address is a *symbol* and this instruction is
+    /// how a program names it. The result is a bare pointer to the segment's
+    /// first byte, so a string is this address and a length. A backend must
+    /// resolve the segment's placement rather than invent an address, because a
+    /// wrong address reads the wrong bytes silently, and a verifier must check
+    /// that the name exists, because a missing segment is not a link error the
+    /// program can survive.
+    DataAddress {
+        /// The data segment's name, which must exist in the same module.
+        name: Name,
+        /// The pointer type, which is `Pointer`.
+        ty: Type,
     },
 }
 
@@ -617,6 +667,11 @@ impl Module {
     /// Looks up a function by name.
     pub fn function(&self, name: &str) -> Option<&Function> {
         self.functions.iter().find(|function| function.name == name)
+    }
+
+    /// Looks up a data segment by name.
+    pub fn data(&self, name: &str) -> Option<&DataSegment> {
+        self.data.iter().find(|segment| segment.name == name)
     }
 }
 
