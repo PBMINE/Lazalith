@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-26 (Steps 1–68 complete and verified)
+Last updated: 2026-09-26 (Steps 1–69 complete and verified)
 
 ## Where the roadmap stands
 
@@ -15,19 +15,21 @@ Step  64      complete: lazalith-runtime, the runtime a program links against (7
 Step  65      complete: the first Lazen program, end to end under LazOS (0910c76)
 Step  66      complete: the lazen command-line toolchain (a699c5d)
 Step  67      complete: the first Lazen standard library (106c48f)
-Step  68      complete: the virtual display device
-Steps 69–75   NOT started. No input device, driver, GUI, or debug code exists.
+Step  68      complete: the virtual display device (9188e6a)
+Step  69      complete: the virtual input device
+Steps 70–75   NOT started. No driver, GUI, or debug code exists.
 ```
 
 This milestone added code generation. Steps 1–62 are unchanged except for the
 defects Step 63 found by running the generated code, each of which is listed
-under its own heading below. The 670 workspace tests all pass, including 24 in
+under its own heading below. The 691 workspace tests all pass, including 24 in
 `crates/lazalith-codegen/tests/codegen.rs` that run generated code on the real
 machine and compare what it wrote and what it exited with, 10 in
 `crates/lazalith-runtime/tests/runtime.rs` that do the same for a whole program
 built from the prelude, 16 in `crates/lazalith-stdlib/tests/stdlib.rs` that do
 the same for the standard library, and 22 in
-`crates/lazalith-devices/tests/display.rs` for the display device.
+`crates/lazalith-devices/tests/display.rs` for the display device and 21 in
+`crates/lazalith-devices/tests/input.rs` for the input device.
 
 ### What deliberately did not land
 
@@ -971,11 +973,92 @@ refuses.
   could not be tested without a display server. The host frontend in Step 77 reads
   the presented framebuffer; the device never finds out.
 
+## Step 69 — The Virtual Input Device
+
+`InputDevice` in `crates/lazalith-devices/src/input.rs`, with 21 tests in
+`crates/lazalith-devices/tests/input.rs`.
+
+### A queue, not a sample
+
+The device owns a queue of guest-visible events and the guest **drains** it. That
+is the whole design decision, and it exists to prevent a specific, common loss: a
+device that reported only the *current* key state would lose every press and
+release between two polls, so a program polling once per frame at thirty frames a
+second would lose any key tapped faster than that. Losing input is not a detail —
+it is the difference between a program that works and one that intermittently does
+not, with nothing to say which.
+
+So `poll` takes up to `capacity` and **the remainder stays queued**.
+`a_poll_that_cannot_take_everything_keeps_the_rest` is the test, and it was
+**verified to fail when the drain is changed to discard the remainder**.
+
+### Events are records, not host structures
+
+Sixteen bytes, every field defined for every kind, an unused field zero — so a
+reader never has to ask which fields are meaningful, which is what lets a program
+match on the kind and read the rest without branching.
+
+**An unknown kind is held, not refused.** `Event::kind` is a `u32` wrapper rather
+than the enum, because a program running against a newer device must be able to
+*hold* an event it does not understand and skip it. Refusing the record would make
+that impossible, and would turn a forward-compatible device into one that crashes
+old programs. `an_unknown_kind_is_held_rather_than_refused` covers it.
+
+### Three rules the implementation follows
+
+**A full queue refuses, it does not drop.** The queue is host-fed and
+guest-drained, so a host producing faster than a program polls would otherwise
+grow it without limit. Refusing at the bound is honest — a program that is not
+polling has said it is not ready — where dropping the oldest would lose input
+silently.
+
+**`inject_all` stops at the first refusal rather than skipping.** A host adapter
+that skipped the event that did not fit would deliver a *reordered* stream, and a
+program that got its keys in the wrong order would have no way to tell.
+`injecting_several_stops_at_the_first_refusal` checks that neither event got in.
+
+**A guest cannot inject its own events.** `inject` is deliberately not reachable
+from a register: an input device a program can lie to is not an input device.
+
+### No blocking, no timeouts
+
+There is no "wait for an event". A blocking read would make a program's behaviour
+depend on when it was scheduled, and two runs with the same injected events would
+not necessarily agree. A poll that finds nothing returns zero, which means
+"nothing pending" and not "something went wrong".
+
+`the_same_script_produces_the_same_stream` is the determinism property the design
+document asks for, stated as a test.
+
+### The device holds nothing that belongs to a host
+
+There is no host key code, no scancode, and no modifier convention here. The
+device knows that something pressed a key with a *stable Lazen code*; the host
+adapter in Step 71 is the only component that knows what a keyboard is, and the
+same program under it must see the identical records.
+
+### Limits
+
+- `REGISTER_POLL` is writable and drains **nothing**: a device has nowhere to put
+  the bytes. The events themselves travel through the ABI in Step 71, and the
+  register exists so a driver can acknowledge a poll. This is the one part of the
+  surface that is not yet the finished shape, and it is finished in Step 71 rather
+  than half-built here.
+- The queue limit is 4096 events. A program that polls less often than the host
+  produces will be refused injection, which is a loud failure rather than a silent
+  one — but it is a failure, and a program that legitimately polls rarely would
+  need a larger limit.
+- `Text` carries a Unicode scalar value and nothing is composed: there is no IME
+  and no dead-key handling, both of which the design document assigns to the GUI
+  library in Step 73.
+
 ## Next step
 
-Step 69 is the **Virtual Input Device**: events with a clean guest-visible shape,
-queued rather than sampled, so a program that polls slower than the host produces
-events still sees every one of them.
+Step 70 is the **LazOS display driver and the Lazen SDK**: the `display_open` and
+`display_present` syscalls the design has reserved but not numbered, a driver that
+sits on the Step 68 device, and `std::graphics` in Lazen. The architecture is
+enforced by tests — a Lazen application reaches the device only through the SDK,
+and the SDK only through LazOS.
 
 ## Steps 1–50 Retrospective Audit and Repair
 

@@ -4,12 +4,21 @@ extern crate alloc;
 
 mod console;
 mod display;
+pub mod input;
 pub use console::ConsoleDevice;
 pub use display::{
     DISPLAY_ABI_VERSION, DisplayDevice, DisplayError, MAX_DIMENSION, PIXEL_BYTES, PresentedFrame,
     REGISTER_ABI_VERSION, REGISTER_BYTES, REGISTER_FRAMEBUFFER, REGISTER_HEIGHT,
     REGISTER_LAST_PRESENT, REGISTER_PRESENT, REGISTER_PRESENT_COUNT, REGISTER_STATUS,
     REGISTER_WIDTH, STATUS_PRESENTED, frame_bytes, pixel_at, zeroed_framebuffer,
+};
+pub use input::{
+    EVENT_BYTES, Event, EventKind, EventKindValue, INPUT_ABI_VERSION, InputDevice, InputError,
+    MAX_POLL_CAPACITY, REGISTER_ABI_VERSION as INPUT_REGISTER_ABI_VERSION,
+    REGISTER_BYTES as INPUT_REGISTER_BYTES, REGISTER_DELIVERED, REGISTER_INJECTED,
+    REGISTER_LAST_CAPACITY, REGISTER_LAST_COUNT, REGISTER_PENDING,
+    REGISTER_POLL as INPUT_REGISTER_POLL, REGISTER_STATUS as INPUT_REGISTER_STATUS,
+    STATUS_INJECTED,
 };
 
 use alloc::{collections::TryReserveError, vec::Vec};
