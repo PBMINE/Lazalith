@@ -1618,6 +1618,13 @@ impl<'a> Checker<'a> {
                     Type::Unit,
                     loop_depth + 1,
                 )?;
+                // A `let` inside a `while` body is a local of the *function*: the
+                // block is a scope, not a frame. Writing the body's locals and
+                // offset back is what puts them in the frame layout — without it
+                // they are allocated in a list that is then thrown away, so the
+                // slot is not reported and the frame is too small for it.
+                *locals = inner_locals;
+                *offset = inner_offset;
                 Ok(CheckedStmt::While {
                     condition: Box::new(condition),
                     body: Box::new(block),
@@ -1694,6 +1701,12 @@ impl<'a> Checker<'a> {
                     is_parameter: false,
                     span: name.span.clone(),
                 };
+                // The induction variable is a local of the function and is live
+                // for the whole loop, so its storage is reserved *before* the body
+                // is checked. Leaving it out would let the body allocate over it,
+                // and would leave `frame_size` too small to hold it.
+                inner_offset =
+                    inner_offset.saturating_add(start_type.size_in_bytes(self.target.word));
                 inner_locals.push(local.clone());
                 inner_scope.push(Binding {
                     name: name.text.clone(),

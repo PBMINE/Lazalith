@@ -54,7 +54,6 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::vec;
 use alloc::vec::Vec;
 use core::error::Error;
 use core::fmt;
@@ -226,6 +225,11 @@ pub struct FrameSlot {
     pub ty: Type,
     /// Why the slot exists.
     pub purpose: SlotPurpose,
+    /// Whether this slot receives one of the function's parameters.
+    ///
+    /// A backend needs this to know which slots a prologue must fill from the
+    /// argument registers, and a parameter is otherwise just a local.
+    pub is_parameter: bool,
     /// The local's name, when it has one.
     pub name: Option<String>,
 }
@@ -382,6 +386,10 @@ fn int_type(bits: u16, signed: bool) -> IrType {
 }
 
 /// A scalar's size in bytes and its load and store widths.
+///
+/// A pointer and a reference are one word each, exactly as
+/// `Type::size_in_bytes` says, so they load and store like a `usize`. Leaving
+/// them out made a `ptr<T>` local impossible to lower at all.
 fn scalar_width(ty: &Type) -> Option<(u32, LoadWidth, StoreWidth)> {
     Some(match ty {
         Type::Bool => (1, LoadWidth::Byte, StoreWidth::Byte),
@@ -392,6 +400,7 @@ fn scalar_width(ty: &Type) -> Option<(u32, LoadWidth, StoreWidth)> {
         Type::I32 => (4, LoadWidth::WordSigned, StoreWidth::Word),
         Type::U32 => (4, LoadWidth::Word, StoreWidth::Word),
         Type::I64 | Type::U64 | Type::Usize => (8, LoadWidth::Double, StoreWidth::Double),
+        Type::Pointer { .. } | Type::Reference { .. } => (8, LoadWidth::Double, StoreWidth::Double),
         _ => return None,
     })
 }
@@ -422,19 +431,29 @@ struct LoopTargets {
     break_block: BlockId,
 }
 
+/// A block this stage has reserved but not filled in yet.
+///
+/// The identifier is the IR builder's own, not a prediction. A loop or a
+/// conditional has to name a block it has not built yet, and the number that
+/// block *would* get is not knowable in advance: a body containing another `if`,
+/// or a short-circuiting `&&`, creates blocks of its own and shifts every later
+/// number. Reserving the block makes the identifier real, so a `break` inside a
+/// nested `if` names the loop's exit rather than whatever block happens to sit
+/// where the exit was predicted to be.
+#[derive(Clone, Debug)]
+struct Reserved {
+    /// The block's label, which is also how it is found again to fill it in.
+    name: String,
+    /// The block's real identifier.
+    id: BlockId,
+}
+
 /// One function's lowering.
 struct FunctionLowering<'a> {
     program: &'a CheckedProgram,
     function: &'a CheckedFunction,
     builder: FunctionBuilder,
     result: Type,
-    /// Blocks created so far, which is also the next block's number: the IR
-    /// builder numbers blocks in creation order, so a target that does not exist
-    /// yet can be named by counting.
-    blocks_created: u32,
-    /// Each block's label, indexed by block identifier, so a block can be
-    /// re-entered after the builder has moved on to another one.
-    names: Vec<String>,
     /// Whether the current block already has its terminator.
     ///
     /// A body that ends in `return`, `break` or `continue` leaves its block
@@ -473,13 +492,17 @@ impl<'a> FunctionLowering<'a> {
         } else {
             Linkage::Local
         };
+        // The span is recorded *before* the function is started, because a span
+        // belongs to the function that follows it. Recording it afterwards left
+        // every lowered function with no span at all, which is where a backend's
+        // debug information comes from.
+        module.set_function_span(function.span.clone());
         let mut builder = module.function(
             &function.qualified_name,
             linkage,
             params,
             ir_type(&function.result)?,
         )?;
-        module.set_function_span(function.span.clone());
         builder.switch_to_block("entry")?;
         let locals = function
             .locals
@@ -491,8 +514,6 @@ impl<'a> FunctionLowering<'a> {
             function,
             builder,
             result: function.result.clone(),
-            blocks_created: 1,
-            names: vec![String::from("entry")],
             terminated: false,
             next_label: 0,
             next_temporary: round_up_word(function.frame_size),
@@ -532,7 +553,6 @@ impl<'a> FunctionLowering<'a> {
                 self.close(Terminator::Unreachable)?;
             }
         }
-        let predicted = self.blocks_created as usize;
         let builder = mem::replace(
             &mut self.builder,
             ModuleBuilder::new("discard")
@@ -540,14 +560,6 @@ impl<'a> FunctionLowering<'a> {
                 .map_err(LowerError::from)?,
         );
         let lowered = builder.finish()?;
-        // Every block this stage predicted must exist, or a forward branch named
-        // a block that is not there.
-        assert_eq!(
-            predicted,
-            lowered.blocks.len(),
-            "block bookkeeping disagrees with the IR in {}",
-            self.function.qualified_name
-        );
         let mut slots: Vec<FrameSlot> = self
             .function
             .locals
@@ -557,6 +569,7 @@ impl<'a> FunctionLowering<'a> {
                 size: local.ty.size_in_bytes(WordWidth::W64),
                 ty: local.ty.clone(),
                 purpose: SlotPurpose::Local,
+                is_parameter: local.is_parameter,
                 name: Some(local.name.clone()),
             })
             .collect();
@@ -597,61 +610,36 @@ impl<'a> FunctionLowering<'a> {
         name
     }
 
-    /// The identifier the next block opened will have.
+    /// Reserves a block, so a branch can name it before it is filled in.
     ///
-    /// The IR builder numbers blocks in creation order, starting at zero, so a
-    /// block's identifier *is* its position in the order this stage opens them.
-    /// That is what lets a branch name a block that has not been opened yet: the
-    /// lowering lays its blocks out in a fixed order first, and a slot's number
-    /// is its identifier.
-    fn predict(&self) -> BlockId {
-        BlockId::new(self.blocks_created).expect("block identifier in range")
-    }
-
-    /// The identifier of a slot in this function's block order.
-    fn slot(&self, index: u32) -> BlockId {
-        BlockId::new(index).expect("block identifier in range")
-    }
-
-    /// Enters a block by name, creating it if it is new.
-    fn enter(&mut self, name: &str) -> Result<BlockId, LowerError> {
-        let id = self.builder.switch_to_block(name)?;
-        if id.get() >= self.blocks_created {
-            self.names.push(String::from(name));
-            self.blocks_created = id.get() + 1;
-        }
-        self.terminated = false;
-        Ok(id)
-    }
-
-    /// Opens the next block in the layout and makes it current.
-    ///
-    /// The builder allows only one new block per terminated block, so blocks are
-    /// opened one at a time as the emission reaches them. The assertion is what
-    /// keeps a branch's target honest: if a block were ever opened out of order,
-    /// every identifier after it would be wrong, and this is where that shows.
-    fn open(&mut self, stem: &str) -> Result<BlockId, LowerError> {
-        let expected = self.predict();
+    /// The identifier comes back from the IR builder, so it is the identifier the
+    /// block will really have. That is the whole point: a loop body may create
+    /// blocks of its own, and a number worked out in advance would then name the
+    /// wrong block.
+    fn reserve(&mut self, stem: &str) -> Result<Reserved, LowerError> {
         let name = self.label(stem);
-        let id = self.enter(&name)?;
-        debug_assert_eq!(
-            id, expected,
-            "a block was opened out of order, so every later branch would be wrong"
-        );
-        Ok(id)
+        let id = self.builder.reserve_block(&name)?;
+        Ok(Reserved { name, id })
     }
 
-    /// Re-enters an existing block by identifier.
-    #[allow(dead_code)]
-    fn reenter(&mut self, id: BlockId) -> Result<(), LowerError> {
-        let name = self
-            .names
-            .get(id.get() as usize)
-            .cloned()
-            .ok_or(LowerError::Allocation)?;
-        self.builder.switch_to_block(&name)?;
+    /// Reserves a run of blocks, in order.
+    fn reserve_run(&mut self, stems: &[&str]) -> Result<Vec<Reserved>, LowerError> {
+        let mut reserved = Vec::new();
+        for stem in stems {
+            reserved.push(self.reserve(stem)?);
+        }
+        Ok(reserved)
+    }
+
+    /// Enters a reserved block to fill it in.
+    fn fill(&mut self, block: &Reserved) -> Result<BlockId, LowerError> {
+        let id = self.builder.switch_to_block(&block.name)?;
+        debug_assert_eq!(
+            id, block.id,
+            "a reserved block was given a different identifier"
+        );
         self.terminated = false;
-        Ok(())
+        Ok(id)
     }
 
     /// Terminates the current block, unless something already did.
@@ -669,24 +657,6 @@ impl<'a> FunctionLowering<'a> {
         self.close(Terminator::Jump(target))
     }
 
-    /// Creates a run of blocks in order and returns their identifiers.
-    ///
-    /// The caller predicted these identifiers before terminating the block it
-    /// was in, because a branch needs its targets' identifiers before they
-    /// exist. Creating them here, in the predicted order, is what makes the
-    /// prediction true.
-    #[allow(dead_code)]
-    fn create_run(&mut self, names: &[String]) -> Result<Vec<BlockId>, LowerError> {
-        let mut ids = Vec::new();
-        for name in names {
-            let predicted = self.predict();
-            let id = self.enter(name)?;
-            debug_assert_eq!(id, predicted, "block creation outran its prediction");
-            ids.push(id);
-        }
-        Ok(ids)
-    }
-
     /// Allocates a temporary slot and returns its offset.
     fn temporary(&mut self, size: u32, ty: Type, purpose: SlotPurpose) -> Result<u32, LowerError> {
         let offset = self.next_temporary;
@@ -699,6 +669,7 @@ impl<'a> FunctionLowering<'a> {
             size,
             ty,
             purpose,
+            is_parameter: false,
             name: None,
         });
         Ok(offset)
@@ -1206,8 +1177,7 @@ impl<'a> FunctionLowering<'a> {
         arms: &[CheckedArm],
         join: Option<(u32, &Type)>,
     ) -> Result<Option<ValueId>, LowerError> {
-        let base = self.blocks_created;
-        // What each slot of the layout is: an arm's body, or a test for an arm
+        // What each block of the layout is: an arm's body, or a test for an arm
         // that is not the first.
         enum Slot {
             Test(usize),
@@ -1221,48 +1191,51 @@ impl<'a> FunctionLowering<'a> {
             }
             layout.push(Slot::Body(index));
         }
-        let join_slot = base + u32::try_from(layout.len()).unwrap_or(u32::MAX);
-        let join_block = self.slot(join_slot);
         layout.push(Slot::Join);
 
-        // Where each arm's body sits, and which slot follows each test.
-        let body_slot = |index: usize| -> u32 {
-            base + u32::try_from(
-                layout
-                    .iter()
-                    .position(|slot| matches!(slot, Slot::Body(i) if *i == index))
-                    .unwrap_or(0),
-            )
-            .unwrap_or(u32::MAX)
-        };
+        // Every block is reserved before any of them is filled, so each
+        // identifier is the one the builder really gave it. An arm's condition
+        // may create blocks of its own — a short-circuiting `&&` makes three — so
+        // a number worked out in advance would name the wrong block.
+        let mut blocks: Vec<Reserved> = Vec::new();
+        for slot in &layout {
+            let stem = match slot {
+                Slot::Test(_) => "if.test",
+                Slot::Body(_) => "if.arm",
+                Slot::Join => "if.join",
+            };
+            blocks.push(self.reserve(stem)?);
+        }
+        let join_block = blocks[blocks.len() - 1].id;
 
         // The first arm's condition is tested in the block before the
-        // conditional, and its false branch goes to the next slot.
+        // conditional, and its false branch goes to the block after its body.
         if let Some(condition) = &arms[0].condition {
             let test = self.value(condition)?;
             self.close(Terminator::Branch {
                 condition: test,
-                then_block: self.slot(base),
-                otherwise: self.slot(base + 1),
+                then_block: blocks[0].id,
+                otherwise: blocks[1].id,
             })?;
         }
 
         for (offset, slot) in layout.iter().enumerate() {
-            let index = u32::try_from(offset).unwrap_or(u32::MAX) + base;
             match slot {
                 Slot::Test(arm) => {
-                    self.open("test")?;
+                    self.fill(&blocks[offset])?;
                     let condition = arms[*arm].condition.as_ref().expect("a test slot");
                     let test = self.value(condition)?;
-                    // The body is the next slot, and the false branch skips it.
+                    // The body is the next block, and the false branch skips it.
+                    let next = blocks.get(offset + 1).map_or(join_block, |block| block.id);
+                    let after = blocks.get(offset + 2).map_or(join_block, |block| block.id);
                     self.close(Terminator::Branch {
                         condition: test,
-                        then_block: self.slot(index + 1),
-                        otherwise: self.slot(index + 2),
+                        then_block: next,
+                        otherwise: after,
                     })?;
                 }
                 Slot::Body(arm) => {
-                    self.open("arm")?;
+                    self.fill(&blocks[offset])?;
                     let checked = &arms[*arm];
                     for statement in &checked.statements {
                         self.statement(statement)?;
@@ -1281,11 +1254,10 @@ impl<'a> FunctionLowering<'a> {
                     self.jump(join_block)?;
                 }
                 Slot::Join => {
-                    self.open("join")?;
+                    self.fill(&blocks[offset])?;
                 }
             }
         }
-        let _ = body_slot;
 
         match join {
             Some((offset, ty)) => Ok(Some(self.load_slot(offset, ty)?)),
@@ -1295,20 +1267,27 @@ impl<'a> FunctionLowering<'a> {
 
     // -- loops --
 
-    /// The four blocks a loop is made of, named by their slots.
+    /// The four blocks a loop is made of.
     ///
     /// `test` decides whether the body runs, `body` is the body, `step` is where
-    /// `continue` goes, and `exit` is where `break` goes. The slots are fixed
-    /// before the body is lowered, so a `break` or `continue` inside the body can
-    /// name the step and exit blocks even though they are opened later.
-    fn loop_layout(&self) -> LoopBlocks {
-        let base = self.blocks_created;
-        LoopBlocks {
-            test: self.slot(base),
-            body: self.slot(base + 1),
-            step: self.slot(base + 2),
-            exit: self.slot(base + 3),
-        }
+    /// `continue` goes, and `exit` is where `break` goes. All four are reserved
+    /// before the body is lowered, so a `break` or `continue` inside a body that
+    /// creates blocks of its own still names the loop's own step and exit.
+    fn loop_layout(
+        &mut self,
+        test: &str,
+        body: &str,
+        step: &str,
+        exit: &str,
+    ) -> Result<LoopBlocks, LowerError> {
+        let blocks = self.reserve_run(&[test, body, step, exit])?;
+        let mut blocks = blocks.into_iter();
+        Ok(LoopBlocks {
+            test: blocks.next().ok_or(LowerError::Allocation)?,
+            body: blocks.next().ok_or(LowerError::Allocation)?,
+            step: blocks.next().ok_or(LowerError::Allocation)?,
+            exit: blocks.next().ok_or(LowerError::Allocation)?,
+        })
     }
 
     /// `while condition { body }`.
@@ -1317,29 +1296,29 @@ impl<'a> FunctionLowering<'a> {
         condition: &CheckedExpr,
         body: &CheckedBlock,
     ) -> Result<(), LowerError> {
-        let blocks = self.loop_layout();
-        self.jump(blocks.test)?;
-        self.open("while.test")?;
+        let blocks = self.loop_layout("while.test", "while.body", "while.step", "while.exit")?;
+        self.jump(blocks.test.id)?;
+        self.fill(&blocks.test)?;
         let test = self.value(condition)?;
         self.close(Terminator::Branch {
             condition: test,
-            then_block: blocks.body,
-            otherwise: blocks.exit,
+            then_block: blocks.body.id,
+            otherwise: blocks.exit.id,
         })?;
 
-        self.open("while.body")?;
+        self.fill(&blocks.body)?;
         self.loops.push(LoopTargets {
-            continue_block: blocks.step,
-            break_block: blocks.exit,
+            continue_block: blocks.step.id,
+            break_block: blocks.exit.id,
         });
         self.block(body)?;
         self.loops.pop();
-        self.jump(blocks.step)?;
+        self.jump(blocks.step.id)?;
 
-        self.open("while.step")?;
-        self.jump(blocks.test)?;
+        self.fill(&blocks.step)?;
+        self.jump(blocks.test.id)?;
 
-        self.open("while.exit")?;
+        self.fill(&blocks.exit)?;
         Ok(())
     }
 
@@ -1378,9 +1357,9 @@ impl<'a> FunctionLowering<'a> {
         )?;
         self.store_slot(bound, end_value, ty)?;
 
-        let blocks = self.loop_layout();
-        self.jump(blocks.test)?;
-        self.open("for.test")?;
+        let blocks = self.loop_layout("for.test", "for.body", "for.step", "for.exit")?;
+        self.jump(blocks.test.id)?;
+        self.fill(&blocks.test)?;
         let counter = self.load_slot(offset, ty)?;
         let limit = self.load_slot(bound, ty)?;
         let op = if is_signed(ty) {
@@ -1393,22 +1372,27 @@ impl<'a> FunctionLowering<'a> {
             left: counter,
             right: limit,
         })?;
+        // The comparison asks whether the counter has *reached* the bound, so the
+        // body is what happens when it has **not**: the true branch leaves the
+        // loop. Getting this backwards runs the body zero times for a non-empty
+        // range and never stops for an empty one, and both look like a correct
+        // loop in a test that only inspects the shape.
         self.close(Terminator::Branch {
             condition: test,
-            then_block: blocks.body,
-            otherwise: blocks.exit,
+            then_block: blocks.exit.id,
+            otherwise: blocks.body.id,
         })?;
 
-        self.open("for.body")?;
+        self.fill(&blocks.body)?;
         self.loops.push(LoopTargets {
-            continue_block: blocks.step,
-            break_block: blocks.exit,
+            continue_block: blocks.step.id,
+            break_block: blocks.exit.id,
         });
         self.block(body)?;
         self.loops.pop();
-        self.jump(blocks.step)?;
+        self.jump(blocks.step.id)?;
 
-        self.open("for.step")?;
+        self.fill(&blocks.step)?;
         // The counter is re-read rather than carried, so a body that changed it
         // is respected, and adding one wraps like every other arithmetic.
         let counter = self.load_slot(offset, ty)?;
@@ -1420,32 +1404,35 @@ impl<'a> FunctionLowering<'a> {
             ty: ir_type(ty)?,
         })?;
         self.store_slot(offset, next, ty)?;
-        self.jump(blocks.test)?;
+        self.jump(blocks.test.id)?;
 
-        self.open("for.exit")?;
+        self.fill(&blocks.exit)?;
         Ok(())
     }
 
     /// `loop { body }`.
     fn loop_loop(&mut self, body: &CheckedBlock) -> Result<(), LowerError> {
-        let blocks = self.loop_layout();
-        self.jump(blocks.test)?;
-        self.open("loop.test")?;
-        self.jump(blocks.body)?;
+        let blocks = self.loop_layout("loop.test", "loop.body", "loop.step", "loop.exit")?;
+        self.jump(blocks.test.id)?;
+        self.fill(&blocks.test)?;
+        self.jump(blocks.body.id)?;
 
-        self.open("loop.body")?;
+        self.fill(&blocks.body)?;
         self.loops.push(LoopTargets {
-            continue_block: blocks.body,
-            break_block: blocks.exit,
+            continue_block: blocks.body.id,
+            break_block: blocks.exit.id,
         });
         self.block(body)?;
         self.loops.pop();
-        self.jump(blocks.body)?;
+        self.jump(blocks.body.id)?;
 
-        self.open("loop.step")?;
-        self.jump(blocks.body)?;
+        // `loop` has no test, so its step block is the body's own back edge. It
+        // is still reserved and still filled, so every loop has the same shape and
+        // a `continue` has somewhere real to go.
+        self.fill(&blocks.step)?;
+        self.jump(blocks.body.id)?;
 
-        self.open("loop.exit")?;
+        self.fill(&blocks.exit)?;
         Ok(())
     }
 
@@ -1657,19 +1644,19 @@ impl<'a> FunctionLowering<'a> {
             }
         };
         let left_value = self.value(left)?;
-        // Three slots: the right side, the left side's own answer, and the join
-        // that reads the result out of the frame.
-        let base = self.blocks_created;
-        let right_block = self.slot(base);
-        let other = self.slot(base + 1);
-        let join = self.slot(base + 2);
+        // Three blocks: the right side, the left side's own answer, and the join
+        // that reads the result out of the frame. They are reserved before the
+        // first branch, so the branch names the blocks themselves.
+        let right_block = self.reserve("sc.right")?;
+        let other = self.reserve("sc.other")?;
+        let join = self.reserve("sc.join")?;
         self.close(Terminator::Branch {
             condition: left_value,
-            then_block: right_block,
-            otherwise: other,
+            then_block: right_block.id,
+            otherwise: other.id,
         })?;
 
-        self.open("sc.right")?;
+        self.fill(&right_block)?;
         // Reaching the right side means the left did not decide the answer, so
         // the answer is the right side's value: its own for `&&`, and true for
         // `||`, because the right side of `||` only runs when the left was false.
@@ -1679,13 +1666,13 @@ impl<'a> FunctionLowering<'a> {
             self.constant(1, &Type::Bool)?
         };
         self.store_slot(slot, value, &Type::Bool)?;
-        self.jump(join)?;
+        self.jump(join.id)?;
 
-        self.open("sc.other")?;
+        self.fill(&other)?;
         self.store_slot(slot, left_value, &Type::Bool)?;
-        self.jump(join)?;
+        self.jump(join.id)?;
 
-        self.open("sc.join")?;
+        self.fill(&join)?;
         self.load_slot(slot, &Type::Bool)
     }
 
@@ -1916,10 +1903,10 @@ fn array_place(expr: &CheckedExpr) -> Option<CheckedPlace> {
 /// `continue` goes, and `exit` is where `break` goes. All four exist before the
 /// body is lowered, because the body can jump to the step and exit blocks and
 /// they do not exist yet when the body's first block is opened.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct LoopBlocks {
-    test: BlockId,
-    body: BlockId,
-    step: BlockId,
-    exit: BlockId,
+    test: Reserved,
+    body: Reserved,
+    step: Reserved,
+    exit: Reserved,
 }

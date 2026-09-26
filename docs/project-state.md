@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-26 (Steps 1–62 verified; Steps 63–75 not started)
+Last updated: 2026-09-26 (Steps 1–63 verified; Steps 64–75 not started)
 
 ## Where the roadmap stands
 
@@ -10,14 +10,15 @@ Steps 51–59   complete: the Lazen design cluster (documentation only)
 Step  60      complete: lazalith-ir, the shared low-level IR (66d29cf)
 Step  61      complete: lazalith-compiler, the Lazen frontend (7a4a5b3)
 Step  62      complete: lowering from the checked tree to lazalith-ir
-Steps 63–75   NOT started. No code generation, runtime, driver, GUI, or debug
-              code exists.
+Step  63      complete: code generation to a Lazalith object
+Steps 64–75   NOT started. No runtime, driver, GUI, or debug code exists.
 ```
 
-This milestone added lowering. Steps 1–61 are unchanged and still pass; the 558
-workspace tests all pass, including 20 in `crates/lazalith-compiler/tests/lowering.rs`
-that state what the IR must contain for each rule, and 4 in `lazalith-ir` for the
-instructions this step had to add.
+This milestone added code generation. Steps 1–62 are unchanged except for the
+defects Step 63 found by running the generated code, each of which is listed
+under its own heading below. The 588 workspace tests all pass, including 22 in
+`crates/lazalith-codegen/tests/codegen.rs` that run generated code on the real
+machine and compare what it wrote and what it exited with.
 
 ### What deliberately did not land
 
@@ -385,11 +386,11 @@ temporaries this stage needs are reported in the layout rather than hidden.
 - **A cast is one load.** Widening reads the source's width and lets the load
   extend it, which is what `LDZ`/`LDS` do; narrowing reads the target's width.
   The extension follows the *source* type, so a `u8` of 200 stays 200.
-- **Block identifiers are the layout.** The IR builder numbers blocks in creation
-  order and allows only one new block per terminated block, so the lowering lays
-  its blocks out first and a slot's number *is* its identifier. A branch can then
-  name a block that is opened later, and an assertion checks that no block is
-  ever opened out of order.
+- **Block identifiers come from the builder, not from arithmetic.** A loop or a
+  conditional has to name a block it has not built yet. Step 62 worked that out
+  by counting, and the count was wrong as soon as a body created a block of its
+  own; the fix is in Step 63's section below. The lowering now reserves each
+  block and uses the identifier the IR builder hands back.
 
 ### Bugs this step found and fixed
 
@@ -460,15 +461,133 @@ temporaries this stage needs are reported in the layout rather than hidden.
   the frontend's business, not this stage's.
 - `aarch64-linux` remains untested.
 
+## Step 63 — Code Generation
+
+`crates/lazalith-codegen` turns a verified `lazalith_ir::Module` plus its frame
+layouts into a `.lzo` object through the existing object model: `ObjectBuilder`,
+`Section`, `Symbol`, `Relocation`, `DebugSource` and `CodeMapping`. Instructions
+are encoded with `lazalith_isa::encode` — the assembler encoder — and syscalls
+are resolved through `lazalith_os_abi::Syscall`, the same table the kernel uses.
+Neither the encoding nor the ABI is restated in the new crate.
+
+### Representation decisions
+
+- **No register allocator.** Every IR value lives in a frame slot and each
+  instruction loads its operands and stores its result. This is not a
+  simplification for its own sake: it is what makes a 32-bit value's arithmetic
+  32-bit arithmetic with no masking instruction, because a value is re-loaded at
+  its declared width before every use and the store truncates to it.
+- **Three caller-saved scratch registers and nothing else.** `r7` holds a frame
+  address, `r6` and `r5` hold operand words, `r4` takes a result. No callee-saved
+  register is touched, so nothing has to be spilled around a call and the prologue
+  and epilogue are three instructions each.
+- **A branch names a label, never a block number.** A branch carries a
+  displacement and the linker fills it in from a relocation against a symbol, so
+  no branch needs its target's address. A loop's `continue` and `break` are
+  therefore label names, which is what lets a loop whose body contains an `if`
+  work at all.
+- **A comparison is a branch over a constant.** The ISA has no instruction that
+  writes a condition into a register — `CMP` sets NZCV and `BR` reads it — so a
+  `bool` result is materialised by storing `1` on the taken side and `0` on the
+  other, with the value stored rather than left in the flags.
+- **A data address is a `LI` with a relocation.** The segment's address is the
+  linker's to decide, so the immediate is a hole for it to fill.
+- **The first bytes of every frame are the outgoing argument words.** A `CALL`
+  pushes the return PC at `oldSP-8`, so the convention's `[SP+8]` and `[SP+16]`
+  at callee entry are the caller's own `[SP+0]` and `[SP+8]`. The caller owns
+  them, so every frame reserves sixteen bytes below its first local.
+- **A declared extern is one `TRAP 0`.** It has no body and its symbol is defined
+  elsewhere, so anything that reached it would fail loudly rather than run
+  whatever the linker placed next.
+
+### Bugs this step found by running the code
+
+Every one of these passed Step 62's tests, because each was invisible in the shape
+of the IR and only appeared when the generated code ran on the machine.
+
+- **Block identifiers were predicted, and the prediction was wrong.** The lowering
+  counted the blocks a loop or a conditional would need and used those numbers as
+  branch targets. A body that creates blocks of its own — a nested `if`, or a
+  short-circuiting `&&` — shifts every later number, so a `continue` inside a
+  nested `if` jumped to a block that was not the loop's step. The worst case was
+  silent: `for index in 0..limit { if index == 2 { continue; } }` lowered to a
+  block that jumped to itself, an infinite loop the verifier accepted. The IR
+  builder now has `reserve_block`, which creates a block, hands back its real
+  identifier, and leaves it out of the finished function's block list until the
+  front end fills it in — so identifiers are real and the blocks are still in
+  emission order, which is what numbers a function's values.
+- **A `for` loop never ran its body.** The loop's test asks whether the counter
+  has reached the bound, and the lowering branched *into* the body when it had.
+  A non-empty range ran zero times and an empty one never stopped. Both directions
+  produce a well-formed `Branch`, so no test that inspected the shape could tell.
+- **A `for` loop's induction variable had no frame space.** It was allocated and
+  then never counted, leaving `frame_size` a whole word short — so the loop's
+  first temporary, which holds the end value, landed on top of the loop variable.
+  The counter and the bound were the same four bytes.
+- **A `let` inside a `while` body was not a local of the function.** The body was
+  checked into a throwaway list of locals that was then discarded, so no slot was
+  reported for it and the frame was too small to hold it. `while` now writes the
+  body's locals and offset back, as `for`, `loop` and a nested block already did.
+- **A `ptr<T>` local had no width.** The lowering's width table covered the
+  integer types only, so every program that named a pointer local failed to
+  lower — which is how the documented `write` example, whose buffer is a
+  `ptr<u8>`, could not be lowered at all.
+- **The documented `write` example corrupted its own message.** `result` is
+  where the call leaves its 16-byte `IoResult`, and the hello-world example passed
+  the message's own address as that pointer, so the kernel wrote the byte count
+  over the message. The example now uses a 16-byte array of its own, and the
+  reason is stated where the example is.
+- **A function's `frame_size` did not include the outgoing argument words,** so a
+  call with five or more argument words would have overwritten the caller's first
+  local. Step 63 fixes this in the backend rather than in the frontend: the
+  reserve belongs to the calling convention, and the frontend does not know it.
+
+### Tests
+
+22 tests in `crates/lazalith-codegen/tests/codegen.rs`. Most run the generated
+code: a hand-written assembly harness calls a generated function, the object is
+linked with the real linker, and the image is loaded and stepped by the real
+machine and kernel, so a return value is observed as a process exit code and a
+write is observed as console output. The harness is hand-written assembly because
+the runtime that would call a program's `main` is Step 64's work; the tests say so
+rather than depending on it.
+
+The properties under test are the ones Step 62 established and a backend could
+plausibly break: a local is reached through the stack pointer; a view keeps its
+address *and* its length; a comparison becomes a real comparison and a real
+`0`/`1` value; `&&` does not evaluate its right side when the left decides;
+`break` and `continue` reach real code; an out-of-range index traps; a string's
+address is a relocation; a 32-bit value wraps at 32 bits; a call passes and
+returns through the documented convention; and every emitted instruction decodes
+back to the opcode that was meant.
+
+### Limitations
+
+- The code is large and slow. Every frame access is `GETSP`, an add and a load,
+  every `let` is a store and every read is a load, and a loop iteration is over a
+  hundred instructions. Correctness does not depend on any of that, and a later
+  step can hoist it.
+- `Intrinsic::FunctionAddress` is refused: the instruction carries no function to
+  name, so there is nothing to resolve, and answering with the current function's
+  address would answer a different question. Nothing in Lazen v1 produces it yet.
+- A syscall argument the ABI has not numbered, a store of a whole view, a load
+  from the platform space, a 32-bit target, and a return value of more than one
+  word are each refused with a typed error rather than approximated.
+- More than one source file in one module is refused: the object model carries one
+  debug source, and describing two would mean picking one.
+- The frontend checks a syscall's name and arity but not its argument *kinds*, so
+  a declaration with the right arity and the wrong types is accepted and fails in
+  the ABI instead. That belongs to the frontend and is not fixed here.
+- `aarch64-linux` remains untested.
+
 ## Next step
 
-Step 63 generates code from the IR. The lowering now produces a verified module
-plus a frame layout per function, so code generation has everything it needs and
-nothing it has to invent: an `Intrinsic::FrameBase` becomes the machine's stack
-pointer after the prologue subtracts the reported frame size, an
-`Instruction::DataAddress` becomes a linker symbol rather than a number, an
-`Instruction::BoundsCheck` becomes a compare and a trap, and a view is two words
-that the ABI passes in two registers.
+Step 64 is the runtime: the program image loader and the entry path that calls a
+Lazen program's `main`. Everything it needs now exists — a `.lzx` image, a linker,
+a frame size per function reported by `Program::frame`, and generated code whose
+entry symbol is `fn.<name>`. The one thing it must not do is re-decide anything
+the codegen already decided, including the sixteen bytes every frame reserves for
+outgoing arguments.
 
 ## Steps 1–50 Retrospective Audit and Repair
 
@@ -657,6 +776,8 @@ After Step 61 the workspace holds 533 tests and 53,060 lines, with build output
 `/nix/store/69dg0yxw0a7gxab0a282azgpnaafg2rg-lazalith-foundations-0.1.0`.
 After Step 62 the workspace holds 558 tests and 56,309 lines, with build output
 `/nix/store/k8a4zdffwyl9fnra59qw5kyhry01mlf2-lazalith-foundations-0.1.0`.
+After Step 63 the workspace holds 588 tests and 60,077 lines, with build output
+`/nix/store/y1s0r23gic6wjk7lpb2v7v27b5247ycx-lazalith-foundations-0.1.0`.
 The Nix build at the end of the Steps 26-50 repair pass was
 `/nix/store/mkvdplx6wsyb28878jlpbakjk7nvdsfa-lazalith-foundations-0.1.0`.
 aarch64-linux remains untested. The Steps 26–50 audit repaired linker BSS

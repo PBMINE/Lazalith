@@ -24,7 +24,7 @@ use std::vec::Vec;
 use lazalith_compiler::frontend::compile;
 use lazalith_compiler::lower::{self, FrameLayout, LowerError, MAX_ARGUMENT_WORDS, SlotPurpose};
 use lazalith_compiler::types::Type;
-use lazalith_ir::{Instruction, Intrinsic, Module, Terminator};
+use lazalith_ir::{ComparisonOp, Instruction, Intrinsic, Module, Terminator};
 use lazalith_types::SourceManager;
 
 /// Compiles and lowers a program, panicking with the diagnostic if it cannot.
@@ -645,5 +645,230 @@ fn every_block_of_a_lowered_function_ends_somewhere() {
             .iter()
             .any(|instruction| matches!(instruction, Instruction::Trap { code } if *code == lower::TRAP_FELL_OFF_THE_END)),
         "the frontend requires a tail value, so the fall-off-the-end trap is unreachable"
+    );
+}
+
+#[test]
+fn probe_returns() {
+    for source in [
+        "fn pick(flag: bool) -> &[u8] { if flag { return \"hi\"; } return \"ho\"; }\nfn main() -> i32 { let b = pick(true); return b.len() as i32; }",
+        "fn main() -> i32 { let s = \"hi\"; return s; }",
+    ] {
+        let mut sources = SourceManager::new();
+        match compile(&mut sources, "t.lazen", source) {
+            Ok((_, _)) => println!("OK   {}", source.lines().next().unwrap_or("")),
+            Err(e) => println!(
+                "FAIL {} -> {}",
+                source.lines().next().unwrap_or(""),
+                e.code().as_str()
+            ),
+        }
+    }
+}
+
+/// A lowered function keeps its source span.
+///
+/// The IR builder records a span for the *next* function started, so recording it
+/// after asking for the function leaves every function in the module with no span
+/// at all. Nothing in the IR depends on a span, so this fails silently and a
+/// backend's debug information is simply empty.
+#[test]
+fn a_lowered_function_keeps_its_span() {
+    let (module, _) = lower_source("fn main() -> i32 {\n    return 0;\n}\n");
+    let function = module.function("main").expect("main is in the module");
+    let span = function
+        .span
+        .clone()
+        .expect("a lowered function has a span");
+    assert_eq!(span.start().as_u32(), 0, "the span starts at the function");
+    assert!(
+        span.end().as_u32() > span.start().as_u32(),
+        "and ends after it, not at the same place"
+    );
+}
+
+/// A `ptr<T>` local is one word and lowers like a `usize`.
+///
+/// The width table covered only the integer types, so a pointer local had no
+/// width at all and every program that named one failed to lower — which is how
+/// the documented `write` example, that takes a `ptr<u8>`, could not be lowered.
+#[test]
+fn a_pointer_local_is_one_word() {
+    let (_module, frames) = lower_source(
+        r#"
+        fn main() {
+            let text = "hi";
+            let pointer = text.as_ptr();
+            return;
+        }
+        "#,
+    );
+
+    let frame = frames
+        .iter()
+        .find(|frame| frame.function == "main")
+        .expect("main has a frame");
+    let slot = frame
+        .slots
+        .iter()
+        .find(|slot| matches!(slot.ty, Type::Pointer { .. }))
+        .expect("the pointer has a slot");
+    assert_eq!(slot.size, 8, "a pointer is one word");
+}
+
+/// A loop's induction variable gets frame space of its own.
+///
+/// The `for` lowering keeps the end value in a temporary above the frontend's
+/// frame, so the induction variable has to be *inside* that frame. It was
+/// allocated and then never counted, which left `frame_size` a whole word short:
+/// the first temporary landed on top of the loop variable, so the bound and the
+/// counter were the same bytes and the loop read its own bound as its counter.
+#[test]
+fn a_for_loop_variable_is_inside_the_frame() {
+    let (module, frames) = lower_source(
+        r#"
+        fn main() -> i32 {
+            let mut total: i32 = 0;
+            for index in 0..4 {
+                total = total + index;
+            }
+            return total;
+        }
+        "#,
+    );
+
+    let frame = frames
+        .iter()
+        .find(|frame| frame.function == "main")
+        .expect("main has a frame");
+    let variable = frame
+        .slots
+        .iter()
+        .find(|slot| slot.name.as_deref() == Some("index"))
+        .expect("the loop variable has a slot");
+    assert!(
+        u64::from(variable.offset) + u64::from(variable.size) <= u64::from(frame.size),
+        "the loop variable at {}..{} is inside the {}-byte frame: {frame:?}",
+        variable.offset,
+        variable.offset + variable.size,
+        frame.size,
+    );
+    // And the loop's bound is a temporary that does not sit on the variable.
+    let bound = frame
+        .slots
+        .iter()
+        .find(|slot| matches!(slot.purpose, SlotPurpose::LoopBound))
+        .expect("the loop bound has a slot");
+    assert!(
+        bound.offset >= variable.offset + variable.size,
+        "the bound at {}..{} starts above the loop variable at {}..{}: {frame:?}",
+        bound.offset,
+        bound.offset + bound.size,
+        variable.offset,
+        variable.offset + variable.size,
+    );
+    let _ = module;
+}
+
+/// A `let` inside a loop body is a local of the function, not of the block.
+///
+/// The block is a scope; the frame belongs to the function. Writing the body's
+/// locals and offset back is what puts them in the frame layout, and without it a
+/// local declared in a `while` body was allocated in a list that was then thrown
+/// away — so no slot was reported for it and the frame was too small to hold it.
+#[test]
+fn a_local_in_a_loop_body_is_reported_in_the_frame() {
+    let (module, frames) = lower_source(
+        r#"
+        fn main() -> i32 {
+            let mut index: i32 = 0;
+            while index < 4 {
+                let inside: i32 = index + 1;
+                index = inside;
+            }
+            return index;
+        }
+        "#,
+    );
+
+    let frame = frames
+        .iter()
+        .find(|frame| frame.function == "main")
+        .expect("main has a frame");
+    let inside = frame
+        .slots
+        .iter()
+        .find(|slot| slot.name.as_deref() == Some("inside"))
+        .expect("a local declared in the loop body is in the frame");
+    assert!(
+        u64::from(inside.offset) + u64::from(inside.size) <= u64::from(frame.size),
+        "the local at {}..{} is inside the {}-byte frame: {frame:?}",
+        inside.offset,
+        inside.offset + inside.size,
+        frame.size,
+    );
+    let _ = module;
+}
+
+/// A `for` loop leaves its body when the counter reaches the bound.
+///
+/// The loop's test asks whether the counter has *reached* the end, so the body is
+/// what happens when it has not. Branching the other way runs the body zero times
+/// for a non-empty range and never stops for an empty one — and a test that only
+/// looks at the shape of the IR cannot tell, because both directions produce a
+/// well-formed `Branch`.
+#[test]
+fn a_for_loop_leaves_its_body_when_the_counter_reaches_the_bound() {
+    let (module, _) = lower_source(
+        r#"
+        fn main() -> i32 {
+            let mut total: i32 = 0;
+            for index in 0..4 {
+                total = total + index;
+            }
+            return total;
+        }
+        "#,
+    );
+    let function = module.function("main").expect("main is in the module");
+    // The block that tests the counter is the one holding the comparison against
+    // the bound; its true branch has to leave the loop.
+    let test = function
+        .blocks
+        .iter()
+        .find(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::Compare {
+                        op: ComparisonOp::GreaterThanOrEqualSigned
+                            | ComparisonOp::GreaterThanOrEqualUnsigned,
+                        ..
+                    }
+                )
+            })
+        })
+        .expect("a block that compares the counter with the bound");
+    let Terminator::Branch {
+        then_block,
+        otherwise,
+        ..
+    } = test.terminator
+    else {
+        panic!("the test block ends in a branch: {:?}", test.terminator);
+    };
+    // The exit is the block that returns; the body is not.
+    let exit = function
+        .blocks
+        .iter()
+        .find(|block| matches!(block.terminator, Terminator::Return(_)))
+        .expect("a block that returns");
+    assert_eq!(
+        then_block, exit.id,
+        "the counter reaching the bound leaves the loop"
+    );
+    assert_ne!(
+        otherwise, exit.id,
+        "and the body is what happens while it has not"
     );
 }

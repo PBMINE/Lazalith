@@ -874,3 +874,112 @@ fn a_data_address_is_a_pointer() {
         "{error}"
     );
 }
+
+/// A reserved block keeps the identifier it was given, and the blocks a function
+/// ends up with are in the order they were filled in.
+///
+/// Both halves matter. A front end that has to name a block it has not built yet
+/// gets a real identifier from `reserve_block` rather than predicting one, and
+/// the finished function still lists its blocks in emission order — which is what
+/// numbers a function's values, because identifiers are dense and follow the
+/// blocks.
+#[test]
+fn a_reserved_block_keeps_its_identifier_and_its_place_in_the_emission_order() {
+    let mut module = ModuleBuilder::new("test");
+    let mut function = module
+        .function("main", Linkage::External, Vec::new(), int_type())
+        .expect("function builder");
+    function.switch_to_block("entry").expect("entry block");
+    // Reserve the loop's blocks before writing the body, the way a front end
+    // lowering `while` does, and write the body's own block in between.
+    let test = function.reserve_block("test").expect("reserve test");
+    let body = function.reserve_block("body").expect("reserve body");
+    let exit = function.reserve_block("exit").expect("reserve exit");
+    assert_ne!(test, body, "each reservation is its own block");
+    assert_ne!(body, exit, "each reservation is its own block");
+
+    function
+        .emit(Instruction::Const {
+            value: ConstValue::Int(0),
+            ty: int_type(),
+        })
+        .expect("a constant");
+    function
+        .terminate(Terminator::Jump(test))
+        .expect("jump to the test");
+    function.switch_to_block("test").expect("fill the test");
+    let condition = function
+        .emit(Instruction::Const {
+            value: ConstValue::Bool(true),
+            ty: Type::Bool,
+        })
+        .expect("a condition");
+    function
+        .terminate(Terminator::Branch {
+            condition,
+            then_block: body,
+            otherwise: exit,
+        })
+        .expect("branch");
+    function.switch_to_block("body").expect("fill the body");
+    function
+        .terminate(Terminator::Jump(exit))
+        .expect("leave the body");
+    function.switch_to_block("exit").expect("fill the exit");
+    let result = function
+        .emit(Instruction::Const {
+            value: ConstValue::Int(7),
+            ty: int_type(),
+        })
+        .expect("a result");
+    function
+        .terminate(Terminator::Return(ReturnValue::Value(result)))
+        .expect("return");
+
+    let function = function.finish().expect("the function is complete");
+    let names: Vec<&str> = function
+        .blocks
+        .iter()
+        .map(|block| block.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["entry", "test", "body", "exit"],
+        "the blocks are in the order they were filled in, which is the order \
+         their values are numbered in"
+    );
+    // Values are numbered in the order the blocks were *filled in*, not the order
+    // they were reserved: the entry block's `i32` is first even though `exit` was
+    // reserved before the entry block had a value in it.
+    let types: Vec<Option<Type>> = (0..3)
+        .map(|raw| {
+            let value = ValueId::new(raw).expect("a value");
+            lazalith_ir::value_type(&function, value)
+        })
+        .collect();
+    assert_eq!(
+        types,
+        vec![Some(int_type()), Some(Type::Bool), Some(int_type()),],
+        "one value per value-producing instruction, in block order"
+    );
+}
+
+/// A block that is reserved and never filled in is reported rather than dropped.
+///
+/// A branch to a block that does not exist is not a link error the program can
+/// survive, so leaving it out of the finished function would turn a front end's
+/// mistake into a jump to nothing.
+#[test]
+fn a_reserved_block_that_is_never_filled_in_is_reported() {
+    let mut module = ModuleBuilder::new("test");
+    let mut function = module
+        .function("main", Linkage::External, Vec::new(), int_type())
+        .expect("function builder");
+    function.switch_to_block("entry").expect("entry block");
+    function.reserve_block("never").expect("reserve a block");
+    let error = function.finish().expect_err("the function is incomplete");
+    assert!(
+        error.to_string().contains("never"),
+        "the message names the block that was left out: {error}"
+    );
+}

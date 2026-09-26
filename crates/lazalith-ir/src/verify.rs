@@ -362,7 +362,7 @@ fn check_terminator(
 }
 
 /// Whether an instruction produces a value.
-pub(crate) fn produces_value(instruction: &Instruction) -> bool {
+pub fn produces_value(instruction: &Instruction) -> bool {
     !matches!(
         instruction,
         Instruction::Store { .. } | Instruction::Trap { .. } | Instruction::BoundsCheck { .. }
@@ -417,7 +417,13 @@ pub(crate) fn operands(instruction: &Instruction) -> Vec<ValueId> {
     used
 }
 
-fn value_type(function: &Function, value: ValueId) -> Option<Type> {
+/// The type of one value in a function, or `None` when no instruction defines it.
+///
+/// A backend needs this to know how wide a value is, and it must be the verifier's
+/// own answer rather than a second implementation of it: two definitions of a
+/// value's type would eventually disagree, and the one that is wrong would be the
+/// backend's.
+pub fn value_type(function: &Function, value: ValueId) -> Option<Type> {
     let raw = value.get();
     if (raw as usize) < function.params.len() {
         return Some(function.params[raw as usize].ty.clone());
@@ -436,7 +442,11 @@ fn value_type(function: &Function, value: ValueId) -> Option<Type> {
     None
 }
 
-fn instruction_result_type(instruction: &Instruction) -> Type {
+/// The type an instruction produces.
+///
+/// This is the verifier's rule, exported so that a backend and the verifier cannot
+/// disagree about what a copy or an intrinsic produces.
+pub fn instruction_result_type(instruction: &Instruction) -> Type {
     match instruction {
         Instruction::Const { ty, .. }
         | Instruction::Binary { ty, .. }

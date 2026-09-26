@@ -24,12 +24,13 @@ agree with the standard library about. A string literal may not span a line.
 ## 1. Hello world
 
 ```lazen
-extern "syscall" fn write(fd: i32, buffer: &[u8], length: u64, result: ptr<u8>) -> i64;
+extern "syscall" fn write(fd: i32, buffer: ptr<u8>, length: u64, result: ptr<u8>) -> i64;
 
 fn main() -> i32 {
     let message = "Hello, Lazalith\n";
     let bytes = message.as_bytes();
-    write(1, bytes, message.len() as u64, bytes.as_ptr());
+    let mut result = [0u8; 16];
+    write(1, bytes.as_ptr(), message.len() as u64, result.as_ptr());
     0
 }
 ```
@@ -38,6 +39,13 @@ fn main() -> i32 {
 argument order exactly; the compiler maps the name to the shared
 `lazalith_os_abi::Syscall` value and refuses a declaration whose arity exceeds
 the ABI's own argument count.
+
+`result` is where the call leaves its `IoResult`: an eight-byte count, a
+four-byte status, and four reserved bytes, so sixteen bytes in total. It is a
+destination, and it must not be the buffer being read — a pointer to the message
+would have the kernel write the count over the message, which is a program that
+prints correctly once and then prints its own result. A 16-byte array of its own
+is the smallest thing that can be passed, and it is what every example here does.
 
 A call must pass exactly the declared arguments, no more and no fewer. There is
 no default argument and no partial call: a call that omits an argument is a
@@ -201,7 +209,7 @@ another module is a semantic error.
 ## 8. Pointers
 
 ```lazen
-extern "syscall" fn write(handle: i32, buffer: &[u8], length: u64, result: ptr<u8>) -> i64;
+extern "syscall" fn write(handle: i32, buffer: ptr<u8>, length: u64, result: ptr<u8>) -> i64;
 
 fn main() -> i32 {
     let message = "Hello, Lazalith\n";
@@ -212,7 +220,7 @@ fn main() -> i32 {
     }
     let mut scratch = [0u8; 16];
     scratch[0] = 65;
-    write(1, bytes, message.len() as u64, scratch.as_mut_slice().as_ptr() as ptr<u8>);
+    write(1, bytes.as_ptr(), message.len() as u64, scratch.as_mut_slice().as_ptr() as ptr<u8>);
     0
 }
 ```
@@ -229,19 +237,19 @@ success. This keeps the v1 type set closed and small; richer error modelling is
 deferred until the OS serves the calls that need it.
 
 ```lazen
-extern "syscall" fn open(path: &[u8], path_length: u64, flags: u32, handle: ptr<u32>) -> i64;
-extern "syscall" fn read(handle: u32, buffer: &[u8], length: u64, result: ptr<u8>) -> i64;
+extern "syscall" fn open(path: ptr<u8>, path_length: u64, flags: u32, handle: ptr<u32>) -> i64;
+extern "syscall" fn read(handle: u32, buffer: ptr<u8>, length: u64, result: ptr<u8>) -> i64;
 extern "syscall" fn close(handle: u32) -> i64;
 
 fn read_first_byte(path: &str) -> i32 {
     let mut handle: u32 = 0;
-    let status = open(path.as_bytes(), path.len() as u64, 1, &mut handle as ptr<u32>);
+    let status = open(path.as_ptr(), path.len() as u64, 1, &mut handle as ptr<u32>);
     if status != 0 {
         return -1;
     }
     let mut buffer = [0u8; 256];
     let mut result = [0u8; 16];
-    let read_status = read(handle, buffer.as_slice(), 256, result.as_ptr());
+    let read_status = read(handle, buffer.as_slice().as_ptr(), 256, result.as_ptr());
     let _ = close(handle);
     if read_status != 0 {
         return -2;

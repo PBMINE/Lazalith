@@ -6,6 +6,7 @@
 //! and a function cannot be finished while it is missing a terminator.
 
 use alloc::{
+    format,
     string::{String, ToString},
     vec::Vec,
 };
@@ -54,6 +55,17 @@ pub struct FunctionBuilder {
     params: Vec<Parameter>,
     result: Type,
     blocks: Vec<BlockBuilder>,
+    /// Blocks that have an identifier but have not been switched to yet.
+    ///
+    /// A reserved block waits here rather than in `blocks` so that `blocks` stays
+    /// in the order the front end emitted into it. That order is what numbers a
+    /// function's values — the identifiers are dense and follow the blocks — so
+    /// it has to be the emission order and not the order the blocks happened to be
+    /// reserved in. A loop reserves its exit before its body, and the body's
+    /// blocks are emitted first.
+    reserved: Vec<BlockBuilder>,
+    /// The next block identifier to hand out.
+    next_block: u32,
     current: Option<usize>,
     next_value: u32,
     span: Option<SourceSpan>,
@@ -86,6 +98,8 @@ impl FunctionBuilder {
             params,
             result,
             blocks: Vec::new(),
+            reserved: Vec::new(),
+            next_block: 0,
             current: None,
             span,
             param_values,
@@ -118,6 +132,49 @@ impl FunctionBuilder {
         })
     }
 
+    /// Reserves a block, creating it empty and returning its identifier.
+    ///
+    /// A loop or a conditional has to *name* a block it has not built yet: the
+    /// branch that leaves a loop body goes to a block that comes after it. Working
+    /// out in advance which number that block will get only works if nothing else
+    /// creates a block in between, and a body containing another `if`, or a
+    /// short-circuiting `&&`, creates blocks of its own — so a predicted number
+    /// silently becomes the wrong block.
+    ///
+    /// Reserving the block makes the identifier real instead of predicted. The
+    /// block is created empty and is *not* made current; the front end fills it
+    /// later with [`switch_to_block`](Self::switch_to_block), which finds it by
+    /// name. A name that is already reserved returns the identifier it already
+    /// has, so reserving twice is harmless.
+    pub fn reserve_block(&mut self, name: &str) -> Result<BlockId, IrError> {
+        if let Some(block) = self.blocks.iter().find(|block| block.name == name) {
+            return Ok(block.id);
+        }
+        if let Some(block) = self.reserved.iter().find(|block| block.name == name) {
+            return Ok(block.id);
+        }
+        let id = self.take_block_id()?;
+        self.reserved
+            .try_reserve(1)
+            .map_err(|_| IrError::new(IrErrorKind::Allocation))?;
+        self.reserved.push(BlockBuilder::new(id, name.to_string()));
+        Ok(id)
+    }
+
+    /// The next unused block identifier.
+    fn take_block_id(&mut self) -> Result<BlockId, IrError> {
+        let raw = self.next_block;
+        self.next_block = self
+            .next_block
+            .checked_add(1)
+            .ok_or_else(|| IrError::new(IrErrorKind::Allocation))?;
+        BlockId::new(raw).ok_or_else(|| {
+            self.error(IrErrorKind::InvalidBuilderState {
+                detail: String::from("block label out of range"),
+            })
+        })
+    }
+
     /// Switches to a block by name, creating it if it does not exist.
     ///
     /// Switching back to a block that already exists is always allowed, so a
@@ -125,6 +182,9 @@ impl FunctionBuilder {
     /// block requires the current block to be terminated first, because a
     /// front end that leaves a block open has not decided where control flow
     /// goes.
+    ///
+    /// A block that was [reserved](Self::reserve_block) keeps the identifier it
+    /// was given and joins `blocks` here, in the order the front end fills it in.
     pub fn switch_to_block(&mut self, name: &str) -> Result<BlockId, IrError> {
         if let Some(index) = self.blocks.iter().position(|block| block.name == name) {
             self.current = Some(index);
@@ -139,13 +199,13 @@ impl FunctionBuilder {
                 })
                 .with_block(self.blocks[index].id));
         }
-        let id = self.blocks.len() as u32;
-        let block_id = BlockId::new(id).ok_or_else(|| {
-            self.error(IrErrorKind::InvalidBuilderState {
-                detail: String::from("block label out of range"),
-            })
-        })?;
-        let block = BlockBuilder::new(block_id, name.to_string());
+        // A reserved block already has its identifier; only a block nobody has
+        // thought of yet needs one.
+        let block = match self.reserved.iter().position(|block| block.name == name) {
+            Some(index) => self.reserved.remove(index),
+            None => BlockBuilder::new(self.take_block_id()?, name.to_string()),
+        };
+        let block_id = block.id;
         self.blocks
             .try_reserve(1)
             .map_err(|_| IrError::new(IrErrorKind::Allocation))?;
@@ -212,6 +272,16 @@ impl FunctionBuilder {
             return Err(self.error(IrErrorKind::EmptyFunction));
         }
         let name = self.name.clone();
+        // A block that was reserved and never filled in is a block some branch
+        // names and no code reaches. Dropping it silently would turn that branch
+        // into a jump to nothing, so it is reported here instead.
+        if let Some(block) = self.reserved.first() {
+            return Err(IrError::new(IrErrorKind::InvalidBuilderState {
+                detail: format!("the reserved block `{}` was never filled in", block.name),
+            })
+            .in_function(&name)
+            .with_block(block.id));
+        }
         let mut blocks = Vec::new();
         blocks
             .try_reserve_exact(self.blocks.len())
