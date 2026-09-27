@@ -1011,24 +1011,26 @@ impl<'a> Emitter<'a> {
                 // result a string — and if the array is exactly the literal's
                 // length, C leaves off the null, so it is only written when there
                 // is room for it.
-                if let CType::Array { element, length } = ty {
-                    if let Expression::String { value, .. } = expression {
-                        let byte_element = matches!(**element, CType::Int { bits: 8, .. });
-                        if byte_element {
-                            let capacity = *length;
-                            let mut offset = 0u32;
-                            for byte in value.bytes().chain(Some(0)) {
-                                if offset >= capacity {
-                                    break;
-                                }
-                                let target = self.add_offset(address, offset)?;
-                                let value = self.constant(i64::from(byte), element)?;
-                                self.store(target, value, element)?;
-                                offset += 1;
-                            }
-                            return Ok(());
+                if let (
+                    CType::Array { element, length },
+                    Expression::String { value, .. },
+                ) = (ty, expression)
+                    && matches!(**element, CType::Int { bits: 8, .. })
+                {
+                    // The bytes to write: the literal's own, then the null that
+                    // makes the copy a string. Taking only as many as the array
+                    // holds is what C's "the null is dropped when the array is
+                    // exactly the literal's length" means.
+                    let bytes: Vec<u8> = value.bytes().chain(Some(0)).collect();
+                    for (offset, byte) in bytes.iter().enumerate() {
+                        if offset as u32 >= *length {
+                            break;
                         }
+                        let target = self.add_offset(address, offset as u32)?;
+                        let byte = self.constant(i64::from(*byte), element)?;
+                        self.store(target, byte, element)?;
                     }
+                    return Ok(());
                 }
                 let value = self.value(expression)?;
                 self.store(address, value, ty)?;
