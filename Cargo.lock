@@ -166,6 +166,7 @@ name = "lazalith-isa"
 version = "0.1.0"
 dependencies = [
  "lazalith-diagnostics",
+ "lazalith-properties",
  "lazalith-types",
 ]
 
@@ -211,6 +212,10 @@ version = "0.1.0"
 dependencies = [
  "lazalith-types",
 ]
+
+[[package]]
+name = "lazalith-properties"
+version = "0.1.0"
 
 [[package]]
 name = "lazalith-runtime"

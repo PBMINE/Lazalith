@@ -1,0 +1,13 @@
+[package]
+name = "lazalith-properties"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "A generator for the property tests, with no dependencies of its own"
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[dev-dependencies]

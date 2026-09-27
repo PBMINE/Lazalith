@@ -6,9 +6,10 @@ publish.workspace = true
 
 [dependencies]
 lazalith-types = { path = "../lazalith-types" }
-
-[dev-dependencies]
 lazalith-diagnostics = { path = "../lazalith-diagnostics" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+lazalith-properties = { path = "../lazalith-properties" }
