@@ -24,11 +24,13 @@ extern crate alloc;
 
 mod builder;
 mod error;
+mod frame;
 mod ir;
 mod verify;
 
 pub use builder::{BlockBuilder, FunctionBuilder, ModuleBuilder};
 pub use error::{IrError, IrErrorKind};
+pub use frame::{FrameLayout, FrameSlot, SlotPurpose};
 pub use ir::{
     BinaryOp, Block, BlockId, CallArg, CallTarget, ComparisonOp, ConstValue, DataSegment, Function,
     IrModule, Linkage, MemorySpace, Module, Name, Parameter, RecordField, ReturnValue, SourceEntry,

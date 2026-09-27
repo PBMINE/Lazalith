@@ -168,7 +168,9 @@ impl RuntimeProgram {
                 .map_err(|error| RuntimeError::Compile(Rendered(error.render())))?;
         let lowered = lower::lower(&checked).map_err(RuntimeError::Lower)?;
         let program = generate(
-            &lowered,
+            &lowered.module,
+            &lowered.frames,
+            &lowered.entry,
             &CodegenOptions {
                 architecture: options.architecture,
                 source_path: options.source_path.clone(),

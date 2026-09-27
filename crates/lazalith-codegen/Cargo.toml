@@ -15,7 +15,9 @@ lazalith-machine = { path = "../lazalith-machine" }
 lazalith-cpu = { path = "../lazalith-cpu" }
 lazalith-devices = { path = "../lazalith-devices" }
 lazalith-memory = { path = "../lazalith-memory" }
-lazalith-compiler = { path = "../lazalith-compiler" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+lazalith-compiler = { path = "../lazalith-compiler" }

@@ -174,6 +174,44 @@ impl TryFrom<u16> for Syscall {
     }
 }
 
+/// Every ABI syscall, named as a source program names it.
+///
+/// This table is the *ABI's* knowledge, so it lives here rather than in any one
+/// front end. Both compilers need it — Lazen declares a syscall by name, and C
+/// lowers a call to a library function by name to a syscall — and a table that
+/// only one of them can see is a table the other will get wrong.
+pub const ABI_SYSCALLS: &[(&str, Syscall)] = &[
+    ("exit", Syscall::Exit),
+    ("write", Syscall::Write),
+    ("read", Syscall::Read),
+    ("open", Syscall::Open),
+    ("close", Syscall::Close),
+    ("seek", Syscall::Seek),
+    ("stat", Syscall::Stat),
+    ("list_directory", Syscall::ListDirectory),
+    ("time", Syscall::Time),
+    ("sleep", Syscall::Sleep),
+    ("allocate_memory", Syscall::AllocateMemory),
+    ("spawn_process", Syscall::SpawnProcess),
+    ("wait_process", Syscall::WaitProcess),
+    ("clear_screen", Syscall::ClearScreen),
+    ("display_open", Syscall::DisplayOpen),
+    ("display_present", Syscall::DisplayPresent),
+    ("input_poll", Syscall::InputPoll),
+];
+
+/// The syscall a declared name maps to, if the ABI has one.
+///
+/// A front end that cannot resolve a name reports it rather than inventing a
+/// number: a call to a number the ABI never assigned is a call to whatever
+/// happens to live there.
+pub fn abi_syscall(name: &str) -> Option<Syscall> {
+    ABI_SYSCALLS
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, syscall)| *syscall)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u32)]
 pub enum SyscallError {

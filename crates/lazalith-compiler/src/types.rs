@@ -4035,28 +4035,11 @@ pub fn ty_name(ty: &Type) -> String {
 
 /// The OS ABI syscalls a Lazen program may declare, by source name.
 ///
-/// A test checks this table against `Syscall::ALL`, so adding a syscall to the
-/// ABI without naming it here fails the suite instead of silently making a
-/// declaration unresolvable.
-pub const ABI_SYSCALLS: &[(&str, Syscall)] = &[
-    ("exit", Syscall::Exit),
-    ("write", Syscall::Write),
-    ("read", Syscall::Read),
-    ("open", Syscall::Open),
-    ("close", Syscall::Close),
-    ("seek", Syscall::Seek),
-    ("stat", Syscall::Stat),
-    ("list_directory", Syscall::ListDirectory),
-    ("time", Syscall::Time),
-    ("sleep", Syscall::Sleep),
-    ("allocate_memory", Syscall::AllocateMemory),
-    ("spawn_process", Syscall::SpawnProcess),
-    ("wait_process", Syscall::WaitProcess),
-    ("clear_screen", Syscall::ClearScreen),
-    ("display_open", Syscall::DisplayOpen),
-    ("display_present", Syscall::DisplayPresent),
-    ("input_poll", Syscall::InputPoll),
-];
+/// The table itself is the ABI's, and lives in `lazalith-os-abi` so that both
+/// front ends read one copy. A test checks it against `Syscall::ALL`, so adding
+/// a syscall to the ABI without naming it there fails the suite instead of
+/// silently making a declaration unresolvable.
+pub use lazalith_os_abi::{ABI_SYSCALLS, abi_syscall};
 
 /// Syscall names the Lazen design reserves for a later ABI step.
 ///
@@ -4068,14 +4051,6 @@ pub const ABI_SYSCALLS: &[(&str, Syscall)] = &[
 /// promised and the ABI has not yet delivered, and an empty list is the honest
 /// state once every promised call exists.
 pub const RESERVED_DESIGN_SYSCALLS: &[&str] = &[];
-
-/// The syscall a declared name maps to, if the ABI has one.
-pub fn abi_syscall(name: &str) -> Option<Syscall> {
-    ABI_SYSCALLS
-        .iter()
-        .find(|(candidate, _)| *candidate == name)
-        .map(|(_, syscall)| *syscall)
-}
 
 /// Whether a name is one the design reserves for a later ABI step.
 pub fn is_reserved_design_syscall(name: &str) -> bool {

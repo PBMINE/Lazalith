@@ -23,8 +23,7 @@ use std::vec::Vec;
 
 use lazalith_compiler::frontend::compile;
 use lazalith_compiler::lower::{self, FrameLayout, LowerError, MAX_ARGUMENT_WORDS, SlotPurpose};
-use lazalith_compiler::types::Type;
-use lazalith_ir::{ComparisonOp, Instruction, Intrinsic, Module, Terminator};
+use lazalith_ir::{ComparisonOp, Instruction, Intrinsic, Module, Terminator, Type as IrType};
 use lazalith_types::SourceManager;
 
 /// Compiles and lowers a program, panicking with the diagnostic if it cannot.
@@ -564,7 +563,16 @@ fn the_frame_layout_covers_every_slot() {
     let view = frame
         .slots
         .iter()
-        .find(|slot| slot.ty == Type::Str)
+        .find(|slot| {
+            slot.ty
+                == IrType::Slice {
+                    element: Box::new(IrType::Int {
+                        bits: 8,
+                        signed: false,
+                    }),
+                    mutable: false,
+                }
+        })
         .expect("the str local has a slot");
     assert_eq!(view.size, 16, "a str is a pointer and a length");
 }
@@ -594,7 +602,7 @@ fn an_array_literal_writes_its_elements_in_place() {
     let array = frame
         .slots
         .iter()
-        .find(|slot| matches!(slot.ty, Type::Array { length: 3, .. }))
+        .find(|slot| slot.ty.is_aggregate() && slot.size == 12)
         .expect("the array local has a slot");
     assert_eq!(array.size, 12, "three i32 elements are twelve bytes");
 }
@@ -848,7 +856,7 @@ fn a_pointer_local_is_one_word() {
     let slot = frame
         .slots
         .iter()
-        .find(|slot| matches!(slot.ty, Type::Pointer { .. }))
+        .find(|slot| slot.ty == IrType::Pointer)
         .expect("the pointer has a slot");
     assert_eq!(slot.size, 8, "a pointer is one word");
 }

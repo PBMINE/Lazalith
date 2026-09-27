@@ -14,8 +14,8 @@ pub use records::{
     valid_open_flags,
 };
 pub use syscall::{
-    ABI_VERSION, MAX_ARGUMENT_BYTES, MAX_ARGUMENT_COUNT, MAX_ARGUMENT_TOTAL_BYTES, MAX_PATH_BYTES,
-    SYSCALL_ARGUMENT_COUNT, SYSCALL_FIRST_ARGUMENT_REGISTER, SYSCALL_NUMBER_REGISTER,
-    SYSCALL_RESERVED_REGISTER, Syscall, SyscallArguments, SyscallError, SyscallStatus,
-    TaggedOutcome, validate_range, validate_reserved_register,
+    ABI_SYSCALLS, ABI_VERSION, MAX_ARGUMENT_BYTES, MAX_ARGUMENT_COUNT, MAX_ARGUMENT_TOTAL_BYTES,
+    MAX_PATH_BYTES, SYSCALL_ARGUMENT_COUNT, SYSCALL_FIRST_ARGUMENT_REGISTER,
+    SYSCALL_NUMBER_REGISTER, SYSCALL_RESERVED_REGISTER, Syscall, SyscallArguments, SyscallError,
+    SyscallStatus, TaggedOutcome, abi_syscall, validate_range, validate_reserved_register,
 };

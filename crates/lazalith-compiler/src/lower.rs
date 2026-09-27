@@ -193,7 +193,6 @@ impl fmt::Display for LowerError {
 }
 
 impl Error for LowerError {}
-
 impl From<IrError> for LowerError {
     fn from(error: IrError) -> Self {
         Self::Ir(error)
@@ -201,50 +200,11 @@ impl From<IrError> for LowerError {
 }
 
 /// Why a frame slot exists, so a later stage can name it in debug information.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SlotPurpose {
-    /// A local or parameter the frontend allocated.
-    Local,
-    /// A value that the arms of an `if` write and the join reads.
-    JoinValue,
-    /// A loop's end value, computed once before the loop.
-    LoopBound,
-    /// The result of a short-circuiting operator.
-    ShortCircuit,
-    /// Somewhere to put a value whose width is changing.
-    CastScratch,
-}
-
-/// One slot in a lowered function's frame.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FrameSlot {
-    /// The slot's byte offset from the frame base.
-    pub offset: u32,
-    /// The slot's size in bytes.
-    pub size: u32,
-    /// The type the slot holds.
-    pub ty: Type,
-    /// Why the slot exists.
-    pub purpose: SlotPurpose,
-    /// Whether this slot receives one of the function's parameters.
-    ///
-    /// A backend needs this to know which slots a prologue must fill from the
-    /// argument registers, and a parameter is otherwise just a local.
-    pub is_parameter: bool,
-    /// The local's name, when it has one.
-    pub name: Option<String>,
-}
-
-/// A lowered function's frame.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FrameLayout {
-    /// The function's qualified name.
-    pub function: String,
-    /// The frame's total size in bytes, rounded up to a whole word.
-    pub size: u32,
-    /// The slots, in offset order.
-    pub slots: Vec<FrameSlot>,
-}
+///
+/// The three types are the IR's, because a slot holds a *lowered* value and
+/// the backend is what reads it. They are re-exported so a caller that has a
+/// frame in its hands names it the same way whichever front end produced it.
+pub use lazalith_ir::{FrameLayout, FrameSlot, SlotPurpose};
 
 /// A lowered program.
 #[derive(Clone, Debug)]
@@ -585,19 +545,17 @@ impl<'a> FunctionLowering<'a> {
                 .map_err(LowerError::from)?,
         );
         let lowered = builder.finish()?;
-        let mut slots: Vec<FrameSlot> = self
-            .function
-            .locals
-            .iter()
-            .map(|local| FrameSlot {
+        let mut slots: Vec<FrameSlot> = Vec::with_capacity(self.function.locals.len());
+        for local in &self.function.locals {
+            slots.push(FrameSlot {
                 offset: local.offset,
                 size: local.ty.size_in_bytes(WordWidth::W64),
-                ty: local.ty.clone(),
+                ty: ir_type(&local.ty)?,
                 purpose: SlotPurpose::Local,
                 is_parameter: local.is_parameter,
                 name: Some(local.name.clone()),
-            })
-            .collect();
+            });
+        }
         slots.append(&mut self.temporaries);
         slots.sort_by_key(|slot| slot.offset);
         Ok((
@@ -692,7 +650,11 @@ impl<'a> FunctionLowering<'a> {
         self.temporaries.push(FrameSlot {
             offset,
             size,
-            ty,
+            // The slot records the *IR* type, because that is what a backend
+            // stores there. A source type that has no IR form cannot reach this
+            // point: every type a local or temporary is given has already been
+            // translated for the instructions that write to it.
+            ty: ir_type(&ty)?,
             purpose,
             is_parameter: false,
             name: None,

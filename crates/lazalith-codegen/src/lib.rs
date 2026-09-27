@@ -84,13 +84,12 @@ extern crate alloc;
 mod emit;
 mod layout;
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::error::Error;
 use core::fmt;
 
-use lazalith_compiler::lower::{FrameLayout, Lowered};
-use lazalith_ir::{Function, Module, Name, Type as IrType};
+use lazalith_ir::{FrameLayout, Function, Module, Name, Type as IrType};
 use lazalith_isa::{Instruction as MachineInstruction, Opcode, Operand, encode};
 
 use lazalith_toolchain::{
@@ -369,8 +368,18 @@ impl Program {
 /// The module has already been through the IR verifier, so this stage does not
 /// repeat those checks; it fails instead on anything the machine cannot
 /// represent, and never approximates.
+///
+/// The three pieces are the backend's whole input: a verified module, the frame
+/// each function's values live in, and the name of the function the program
+/// starts at. None of them mentions a source language, so this is the same entry
+/// point for a Lazen program and a C one. It used to take the Lazen front end's
+/// own `Lowered` struct, which meant a C program could only be compiled by
+/// importing Lazen's types — a dependency pointing from the backend to one
+/// language, in a project with two.
 pub fn generate(
-    lowered: &Lowered,
+    module: &Module,
+    frames: &[FrameLayout],
+    entry: &str,
     options: &CodegenOptions,
     source_text: &str,
 ) -> Result<Program, CodegenError> {
@@ -379,15 +388,21 @@ pub fn generate(
             word: options.architecture.word_width(),
         });
     }
-    validate_debug_source(&lowered.module, source_text)?;
-    let frames = frame_table(lowered)?;
-    let mut generated = Generated::new(&options.architecture, &lowered.module.data);
+    validate_debug_source(module, source_text)?;
+    let frame_table = frame_table(module, frames)?;
+    let mut generated = Generated::new(&options.architecture, &module.data);
     generated.data_segments()?;
     let mut reported = Vec::new();
-    for (function, frame) in lowered.module.functions.iter().zip(frames.iter()) {
+    for (function, frame) in module.functions.iter().zip(frame_table.iter()) {
         reported.push((function.name.clone(), generated.function(function, *frame)?));
     }
-    let object = generated.finish(lowered, &options.source_path.clone(), source_text)?;
+    let object = generated.finish(
+        module,
+        frames,
+        entry,
+        &options.source_path.clone(),
+        source_text,
+    )?;
     let records = reported
         .into_iter()
         .map(|(function, emitted)| GeneratedFrame {
@@ -457,13 +472,16 @@ fn validate_debug_source(module: &Module, source_text: &str) -> Result<(), Codeg
 }
 
 /// The frame layouts, in the module's function order.
-fn frame_table(lowered: &Lowered) -> Result<Vec<Option<&FrameLayout>>, CodegenError> {
-    let mut frames = Vec::new();
-    for function in &lowered.module.functions {
+fn frame_table<'a>(
+    module: &'a Module,
+    frames: &'a [FrameLayout],
+) -> Result<Vec<Option<&'a FrameLayout>>, CodegenError> {
+    let mut table = Vec::new();
+    for function in &module.functions {
         // A declared extern has no body and therefore no frame: its one block is
         // a trap. A defined function without one is an error, because a prologue
         // sized from a missing frame would be a guess.
-        let frame = match lowered.frame(&function.name) {
+        let frame = match frames.iter().find(|frame| frame.function == function.name) {
             Some(frame) => Some(frame),
             None if function.linkage == lazalith_ir::Linkage::External => None,
             None => {
@@ -472,9 +490,9 @@ fn frame_table(lowered: &Lowered) -> Result<Vec<Option<&FrameLayout>>, CodegenEr
                 });
             }
         };
-        frames.push(frame);
+        table.push(frame);
     }
-    Ok(frames)
+    Ok(table)
 }
 
 /// A relocation the emitter recorded against a label it registered.
@@ -639,7 +657,9 @@ impl<'a> Generated<'a> {
     /// Assembles the gathered parts into an object.
     fn finish(
         mut self,
-        lowered: &Lowered,
+        module: &Module,
+        _frames: &[FrameLayout],
+        entry: &str,
         source: &str,
         source_text: &str,
     ) -> Result<ObjectFile, CodegenError> {
@@ -679,7 +699,7 @@ impl<'a> Generated<'a> {
             })?;
             order.push((name.clone(), SymbolBinding::Local, index, *offset, *size));
         }
-        for function in &lowered.module.functions {
+        for function in &module.functions {
             let name = function_symbol(&function.name);
             let offset = self
                 .function_entries
@@ -701,7 +721,7 @@ impl<'a> Generated<'a> {
             // visibility between modules; a private `main` is still the only way in
             // for the loader, and a local symbol would leave the image with an
             // entry no startup code could call.
-            let binding = if function.name == lowered.entry {
+            let binding = if function.name == entry {
                 SymbolBinding::Global
             } else {
                 binding
@@ -740,13 +760,13 @@ impl<'a> Generated<'a> {
                 mapping.length,
             ))?;
         }
-        let entry_name = function_symbol(&lowered.entry);
+        let entry_name = function_symbol(entry);
         let entry = indices
             .iter()
             .find(|(name, _)| *name == entry_name)
             .map(|(_, index)| *index)
             .ok_or_else(|| CodegenError::MissingFrame {
-                function: lowered.entry.clone(),
+                function: entry.to_string(),
             })?;
         builder.set_entry(entry)?;
         Ok(builder.build()?)
@@ -779,7 +799,7 @@ pub(crate) fn function_symbol(name: &str) -> Name {
 /// that from a second table here would be a table that could disagree with the
 /// first about which registers a call means.
 pub(crate) fn abi_syscall(name: &str) -> Option<lazalith_os_abi::Syscall> {
-    lazalith_compiler::types::abi_syscall(name)
+    lazalith_os_abi::abi_syscall(name)
 }
 
 /// The size in bytes of a value of this IR type, or `None` when the machine has

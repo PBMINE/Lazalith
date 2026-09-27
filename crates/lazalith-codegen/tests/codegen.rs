@@ -33,6 +33,26 @@ use lazalith_toolchain::{
 };
 use lazalith_types::{ArchitectureConfig, SourceManager};
 
+/// Generates code for a lowered program.
+///
+/// The backend takes a module, its frames and its entry, not a Lazen struct, so
+/// a test that happens to have built its program with Lazen has to unpack it.
+/// That unpacking is the whole of the front end's involvement in code
+/// generation, which is the point.
+fn generate_lowered(
+    lowered: &Lowered,
+    options: &CodegenOptions,
+    source: &str,
+) -> Result<Program, CodegenError> {
+    generate(
+        &lowered.module,
+        &lowered.frames,
+        &lowered.entry,
+        options,
+        source,
+    )
+}
+
 /// Compiles, lowers, and generates code for a program.
 fn generate_program(source: &str) -> (Program, Lowered) {
     let mut sources = SourceManager::new();
@@ -40,7 +60,7 @@ fn generate_program(source: &str) -> (Program, Lowered) {
         .unwrap_or_else(|error| panic!("{source} should compile:\n{}", error.render()));
     let lowered =
         lower::lower(&program).unwrap_or_else(|error| panic!("{source} should lower: {error}"));
-    let generated = generate(&lowered, &CodegenOptions::lz64("t.lazen"), source)
+    let generated = generate_lowered(&lowered, &CodegenOptions::lz64("t.lazen"), source)
         .unwrap_or_else(|error| panic!("{source} should generate code: {error}"));
     (generated, lowered)
 }
@@ -835,7 +855,9 @@ fn a_32_bit_machine_is_refused() {
         architecture: ArchitectureConfig::lz32(),
         source_path: String::from("t.lazen"),
     };
-    match generate(&lowered, &options, "").expect_err("a 32-bit machine has no code generation") {
+    match generate_lowered(&lowered, &options, "")
+        .expect_err("a 32-bit machine has no code generation")
+    {
         CodegenError::UnsupportedArchitecture { word } => {
             assert_eq!(word.bits(), 32);
         }
@@ -857,7 +879,7 @@ fn a_function_without_a_frame_is_refused() {
     object.validate().expect("the object is valid");
     // Remove the frame the lowering reported, as a caller that lost it would.
     lowered.frames.clear();
-    match generate(
+    match generate_lowered(
         &lowered,
         &CodegenOptions::lz64("t.lazen"),
         MISSING_FRAME_SOURCE,
@@ -1014,7 +1036,7 @@ fn more_than_one_source_is_refused() {
     let mut mixed = lowered.clone();
     // A data segment from another file, so the module names two sources.
     mixed.module.data[0].span = Some(other.functions[0].span.clone());
-    match generate(&mixed, &CodegenOptions::lz64("t.lazen"), "")
+    match generate_lowered(&mixed, &CodegenOptions::lz64("t.lazen"), "")
         .expect_err("two sources cannot share one debug path")
     {
         CodegenError::MultipleSources { count } => assert_eq!(count, 2),
@@ -1537,7 +1559,7 @@ fn generating_with_the_wrong_source_text_is_refused() {
     // A truncated text cannot hold the spans the program was checked against, and
     // an object written from it would carry offsets into text that is not there.
     let short = &source[..source.len() / 2];
-    let error = generate(&lowered, &CodegenOptions::lz64("t.lazen"), short)
+    let error = generate_lowered(&lowered, &CodegenOptions::lz64("t.lazen"), short)
         .expect_err("a span past the end of the text is refused");
     assert!(
         matches!(error, CodegenError::SourceOutOfRange { .. }),

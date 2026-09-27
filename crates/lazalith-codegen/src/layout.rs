@@ -13,7 +13,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use lazalith_compiler::lower::FrameLayout;
+use lazalith_ir::FrameLayout;
 use lazalith_ir::{Function, ValueId, instruction_result_type, produces_value};
 use lazalith_types::ArchitectureConfig;
 
