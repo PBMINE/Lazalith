@@ -599,6 +599,26 @@ impl<'a> Emitter<'a> {
             .unwrap_or(Shape::WORD)
     }
 
+    /// How many bytes a `sizeof` in this program is, from the checker's table.
+    ///
+    /// A `sizeof` cannot be answered from the operand alone, so it is read from
+    /// where the checker left it. Reaching for the operand's own type here would
+    /// be the mistake: the operand is a `Name`, and a name read as a value is a
+    /// *pointer*, so every `sizeof buffer` would come out a word.
+    fn sizeof_of(&self, expression: &Expression) -> Result<u32, LowerError> {
+        self.program
+            .sizeofs
+            .get(&crate::types::expression_span(expression).start().as_u32())
+            .copied()
+            .ok_or_else(|| LowerError::Unsupported {
+                what: String::from("a `sizeof` the checker did not measure"),
+                why: String::from(
+                    "every `sizeof` is measured while the program is checked, so this is a \
+                     compiler bug rather than a program error",
+                ),
+            })
+    }
+
     /// Emits an instruction that produces no value.
     fn emit_effect(&mut self, instruction: Instruction) -> Result<(), LowerError> {
         self.builder
@@ -981,6 +1001,35 @@ impl<'a> Emitter<'a> {
         };
         match initial {
             Initializer::Scalar(expression) => {
+                // A string literal may initialise a `char` array with no braces,
+                // which is the one aggregate initialiser C allows without them and
+                // the only way anybody writes `char name[] = "lazalith";`. It is a
+                // *copy*, not an assignment of the literal's address: the array is
+                // in the frame, the literal is in program space, and a program that
+                // wrote to its own buffer would otherwise be writing to the string
+                // table. The null is written too, because that is what makes the
+                // result a string — and if the array is exactly the literal's
+                // length, C leaves off the null, so it is only written when there
+                // is room for it.
+                if let CType::Array { element, length } = ty {
+                    if let Expression::String { value, .. } = expression {
+                        let byte_element = matches!(**element, CType::Int { bits: 8, .. });
+                        if byte_element {
+                            let capacity = *length;
+                            let mut offset = 0u32;
+                            for byte in value.bytes().chain(Some(0)) {
+                                if offset >= capacity {
+                                    break;
+                                }
+                                let target = self.add_offset(address, offset)?;
+                                let value = self.constant(i64::from(byte), element)?;
+                                self.store(target, value, element)?;
+                                offset += 1;
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
                 let value = self.value(expression)?;
                 self.store(address, value, ty)?;
             }
@@ -1501,8 +1550,19 @@ impl<'a> Emitter<'a> {
                     _ => Ok(value),
                 }
             }
-            Expression::SizeofType(_) | Expression::SizeofExpression(_) => {
-                self.constant(8, &CType::ulong())
+            Expression::SizeofType(name) => {
+                let size = self.sizeof_of(expression)?;
+                let _ = name;
+                self.constant(i64::from(size), &CType::ulong())
+            }
+            Expression::SizeofExpression(inner) => {
+                // `sizeof` never decays. That is the whole difference between
+                // `sizeof a` and `sizeof (a + 0)` for a `char[4]`, and between
+                // `sizeof buffer` and `sizeof (char *)buffer`, and a `sizeof`
+                // that decayed would make the first of every pair a word.
+                let _ = inner;
+                let size = self.sizeof_of(expression)?;
+                self.constant(i64::from(size), &CType::ulong())
             }
             Expression::Binary { op, left, right } => self.binary(*op, left, right),
             Expression::Logical { and, left, right } => self.logical(*and, left, right),
@@ -2124,9 +2184,18 @@ fn field_of(ty: &CType, member: &str) -> Option<crate::ctypes::Field> {
 }
 
 /// A pointer's element type.
+/// The type an index or a dereference yields.
+///
+/// Both a pointer and an array have elements, and C treats `a[i]` as `*(a + i)`
+/// whether `a` is a pointer or an array — an array *is* a pointer to its first
+/// element in every expression that reads it. So the element type of `char[4]`
+/// is `char`, and a subscript that asked only about pointers fell back to `int`
+/// and stepped eight bytes per index instead of one, which made `buffer[2]` read
+/// a byte the program had never written.
 fn element_of(ty: &CType) -> Option<CType> {
     match ty {
         CType::Pointer(element) => Some((**element).clone()),
+        CType::Array { element, .. } => Some((**element).clone()),
         _ => None,
     }
 }
@@ -2287,7 +2356,6 @@ impl Shape {
         width: 8,
         signed: true,
     };
-
 }
 
 /// The shape of an instruction's result.

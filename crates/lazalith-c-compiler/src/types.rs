@@ -153,6 +153,15 @@ pub struct CheckedCProgram {
     /// `(unsigned char)` on a signed load is a different value — so the type is
     /// recorded where it is known and read back by byte offset.
     pub cast_types: BTreeMap<u32, CType>,
+
+    /// Every `sizeof`'s answer in bytes, keyed by where the expression starts.
+    ///
+    /// A `sizeof` operand names a *type*, and the emitter cannot build one — it
+    /// would need this stage's typedef and tag tables. The answer is also not
+    /// recoverable from the operand the emitter lowers, because `sizeof` never
+    /// decays: `sizeof buffer` is a `char[16]` and `sizeof (buffer + 0)` is a
+    /// pointer, and the difference is only visible here.
+    pub sizeofs: BTreeMap<u32, u32>,
     /// The function the runtime starts at, which is `main`.
     pub entry: String,
     /// Every failure.
@@ -170,6 +179,7 @@ pub fn check(source: SourceId, sources: &SourceManager, resolved: &Resolved) -> 
         tags: BTreeMap::new(),
         function_types: BTreeMap::new(),
         cast_types: BTreeMap::new(),
+        sizeofs: BTreeMap::new(),
         program_globals: Vec::new(),
         functions: Vec::new(),
         globals: Vec::new(),
@@ -188,6 +198,7 @@ pub fn check(source: SourceId, sources: &SourceManager, resolved: &Resolved) -> 
         typedefs: core::mem::take(&mut checker.typedefs),
         function_types: core::mem::take(&mut checker.function_types),
         cast_types: core::mem::take(&mut checker.cast_types),
+        sizeofs: core::mem::take(&mut checker.sizeofs),
         tags: core::mem::take(&mut checker.tags),
         entry: String::from("main"),
         diagnostics: core::mem::take(&mut checker.errors),
@@ -210,6 +221,7 @@ struct Checker<'a> {
     /// Every file-scope object's type, for the same reason.
     /// Every cast's target type, keyed by the cast's start offset.
     cast_types: BTreeMap<u32, CType>,
+    sizeofs: BTreeMap<u32, u32>,
     program_globals: Vec<(String, CType)>,
     functions: Vec<CheckedFunction>,
     globals: Vec<CheckedVariable>,
@@ -647,6 +659,30 @@ impl<'a> Checker<'a> {
             span: name.span.clone(),
         };
         self.declarator_type(&base, &declarator)
+    }
+
+    /// Records how many bytes a `sizeof` expression is, keyed by where it starts.
+    ///
+    /// The same reasoning as `cast_types` applies, and for the same reason: a
+    /// `sizeof` operand names a *type*, and the emitter has no way to build one —
+    /// it would need this stage's typedef and tag tables. Worse, the answer is not
+    /// something the emitter can work out from the operand it lowers, because
+    /// `sizeof` never decays: `sizeof buffer` is the array's size and
+    /// `sizeof (buffer + 0)` is a word, and the two differ only in the checker's
+    /// view of the operand. A `sizeof` that answered a word for both made every
+    /// `char` buffer in the runtime eight times too large.
+    fn record_sizeof(&mut self, expression: &Expression, ty: &CType) {
+        // C has no rule for the size of a function, and says it is 1. A type with
+        // no size at all — `void`, or an incomplete record — is an error the
+        // checker has already reported, and a byte keeps the lowering going so
+        // the program still gets its other diagnostics.
+        let size = match ty {
+            CType::Function(_) => 1,
+            other => other.size_in_bytes().unwrap_or(1),
+        };
+        let _ = self
+            .sizeofs
+            .insert(expression_span(expression).start().as_u32(), size);
     }
 
     // -- declarations --
@@ -1225,12 +1261,13 @@ impl<'a> Checker<'a> {
             }
             Expression::Name { name, span } => self.name(name, span.clone()),
             Expression::SizeofType(name) => {
-                let _ = self.type_name_type(name);
+                let ty = self.type_name_type(name);
+                self.record_sizeof(expression, &ty);
                 CType::ulong()
             }
             Expression::SizeofExpression(inner) => {
                 let ty = self.expression(inner);
-                let _ = ty;
+                self.record_sizeof(expression, &ty);
                 CType::ulong()
             }
             Expression::Group(inner) => self.expression(inner),
