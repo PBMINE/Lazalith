@@ -4,6 +4,7 @@ extern crate alloc;
 
 pub use lazalith_os_abi as abi;
 
+pub mod debug;
 pub mod display;
 mod error;
 mod filesystem;

@@ -140,10 +140,12 @@ fn lzx_parser_rejects_malformed_headers_without_panicking() {
         Err(LzxError::InvalidMagic)
     ));
     let mut bad_version = encoded.clone();
-    bad_version[8..10].copy_from_slice(&2u16.to_le_bytes());
+    // A version this build does not know. Version 2 is the current one, so
+    // rejecting it would be the format refusing to be read at all.
+    bad_version[8..10].copy_from_slice(&3u16.to_le_bytes());
     assert!(matches!(
         LzxImage::from_bytes(&bad_version),
-        Err(LzxError::UnsupportedFormat { version: 2 })
+        Err(LzxError::UnsupportedFormat { version: 3 })
     ));
     let mut bad_architecture = encoded.clone();
     bad_architecture[12] = 3;
@@ -181,14 +183,8 @@ fn lzx_parser_rejects_malformed_headers_without_panicking() {
         LzxImage::from_bytes(&bad_entry_section),
         Err(LzxError::InvalidEntrySection { value: 1 })
     ));
-    let mut bad_table = encoded.clone();
-    bad_table[44..52].copy_from_slice(&65u64.to_le_bytes());
-    assert!(matches!(
-        LzxImage::from_bytes(&bad_table),
-        Err(LzxError::InvalidSectionTableOffset { .. })
-    ));
     let mut bad_table_size = encoded.clone();
-    bad_table_size[52..56].copy_from_slice(&0u32.to_le_bytes());
+    bad_table_size[44..48].copy_from_slice(&0u32.to_le_bytes());
     assert!(matches!(
         LzxImage::from_bytes(&bad_table_size),
         Err(LzxError::InvalidSectionTableSize { .. })
@@ -278,15 +274,20 @@ fn lzx_file_header_and_section_layout_are_stable() {
     let image = minimal_image();
     let encoded = image.to_bytes().unwrap();
     assert_eq!(&encoded[..LZX_MAGIC.len()], &LZX_MAGIC);
-    assert_eq!(u16::from_le_bytes([encoded[8], encoded[9]]), 1);
+    // Version 2 is what dropped the header's redundant section-table offset and
+    // used those eight bytes for the debug block's offset and length.
+    assert_eq!(u16::from_le_bytes([encoded[8], encoded[9]]), 2);
     assert_eq!(u16::from_le_bytes([encoded[10], encoded[11]]), 64);
     assert_eq!(encoded[12], 2);
     assert_eq!(u16::from_le_bytes([encoded[18], encoded[19]]), 1);
     assert_eq!(
-        u32::from_le_bytes([encoded[52], encoded[53], encoded[54], encoded[55]]),
+        u32::from_le_bytes([encoded[44], encoded[45], encoded[46], encoded[47]]),
         48
     );
-    assert_eq!(u64::from_le_bytes(encoded[56..64].try_into().unwrap()), 112);
+    assert_eq!(u64::from_le_bytes(encoded[48..56].try_into().unwrap()), 112);
+    // The last eight bytes of the header are the debug pair, and an image built
+    // without debug information writes a zero length rather than a table.
+    assert_eq!(u32::from_le_bytes(encoded[56..60].try_into().unwrap()), 0);
     assert_eq!(encoded[LZX_HEADER_SIZE], LzxSectionKind::Code as u8);
     assert_eq!(encoded[LZX_HEADER_SIZE + 1], LZX_CODE_PERMISSIONS);
 }
@@ -336,15 +337,8 @@ fn lzx_rejects_every_unreachable_header_and_table_field() {
         Err(LzxError::InvalidSectionCount { .. })
     ));
 
-    let mut table_offset = canonical.clone();
-    set_u64(&mut table_offset, 44, 8);
-    assert!(matches!(
-        LzxImage::from_bytes(&table_offset),
-        Err(LzxError::InvalidSectionTableOffset { .. })
-    ));
-
     let mut table_size = canonical.clone();
-    set_u32(&mut table_size, 52, 47);
+    set_u32(&mut table_size, 44, 47);
     assert!(matches!(
         LzxImage::from_bytes(&table_size),
         Err(LzxError::InvalidSectionTableSize { .. })

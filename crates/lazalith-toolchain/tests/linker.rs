@@ -43,12 +43,45 @@ fn linker_preserves_single_object_bridge_bytes() {
     .unwrap();
     let program = link_objects(&[object], &LinkOptions::default()).unwrap();
     assert_eq!(program.entry_offset(), 0);
+    // The canonical image is compared section by section rather than byte for
+    // byte, because it no longer can be compared byte for byte: this object was
+    // assembled from a named source, so its image carries a debug block saying
+    // so, and the canonical image carries none. What has to match is the code
+    // the linker produced and the memory it asks for, which is what this test is
+    // about.
+    let linked = program.image();
+    let canonical = build_init_image(LzxArchitecture::Lz32).unwrap();
     assert_eq!(
-        program.image().to_bytes().unwrap(),
-        build_init_image(LzxArchitecture::Lz32)
-            .unwrap()
-            .to_bytes()
-            .unwrap()
+        linked.sections().len(),
+        canonical.sections().len(),
+        "the linker did not add or drop a section"
+    );
+    for (linked, canonical) in linked.sections().iter().zip(canonical.sections()) {
+        assert_eq!(
+            linked.bytes(),
+            canonical.bytes(),
+            "a section's bytes differ"
+        );
+        assert_eq!(linked.kind(), canonical.kind(), "a section's kind differs");
+        assert_eq!(
+            linked.virtual_offset(),
+            canonical.virtual_offset(),
+            "a section's address differs"
+        );
+    }
+    assert_eq!(linked.required_data(), canonical.required_data());
+    assert_eq!(linked.required_stack(), canonical.required_stack());
+    // And the image that can be read back still is, debug block and all.
+    let round_tripped = LzxImage::from_bytes(&linked.to_bytes().unwrap()).unwrap();
+    assert_eq!(&round_tripped, linked);
+    assert_eq!(
+        round_tripped.debug().map(|debug| debug.files()[0].name()),
+        Some("exit.lzs"),
+        "the image names the object it was linked from"
+    );
+    assert!(
+        canonical.debug().is_none(),
+        "the canonical image is built without debug information"
     );
 }
 

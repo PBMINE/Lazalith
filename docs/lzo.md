@@ -23,16 +23,20 @@ Object files are little-endian and use no host-sized wire fields.
 
 ```text
 magic             LZOBJ01\0
-format version    1
+format version    2
 header size       128 bytes
 maximum file size 16 MiB
 maximum materialized names 16 MiB
 maximum sections  4096
 ```
 
-The format and ISA versions are fixed at 1. The runtime `.lzx` v1 ISA version
-is also fixed at 1; the shared ISA constant is checked against it at compile
-time.
+The ISA versions are fixed at 1. The object format version is `2`: version 1
+kept the source text out of the object and left each source record's fourth word
+reserved, and version 2 uses that word for the text's offset and the word at
+header offset 104 for the region's size. Both words were already checked to be
+zero, so every offset after them stayed exactly where it was and no record
+changed size. A version-1 object read by a version-2 reader is rejected rather
+than misread, because the two formats disagree about what those words mean.
 
 ## File layout
 
@@ -44,6 +48,7 @@ relocation table
 debug-source table
 debug-mapping table
 NUL-terminated string table
+source text region
 zero padding to an 8-byte boundary
 section payloads
 EOF
@@ -56,7 +61,10 @@ size. File-backed payloads are emitted in section order, each beginning at an
 padding is zero. There are no undeclared gaps or trailing bytes. The string
 table is canonical in the same sense: it begins with one NUL byte, and the
 names referenced by section, symbol, and debug-source records cover the rest of
-the table exactly once in order, with no unreferenced bytes left at its end.
+the table exactly once in order, with no unreferenced bytes left at its end. The
+source text region follows the same rule: it holds each source's text once, in
+source order, and a source whose offset plus length would leave it has no bytes
+to read.
 
 ## Header
 
@@ -183,21 +191,34 @@ shared ISA codec; it never masks or truncates an out-of-range value.
 
 ## Debug metadata
 
-A debug source record is 16 bytes: a 4-byte string offset, a 4-byte source byte
-length, and 8 reserved zero bytes. A debug mapping is 24 bytes: a 2-byte text
-section index, 2 reserved bytes, an 8-byte instruction offset, and three 4-byte
-fields for source index, source offset, and source length.
+A debug source record is 16 bytes: a 4-byte **debug text offset**, a 4-byte
+source byte length, and 8 reserved zero bytes. A debug mapping is 24 bytes: a
+2-byte text section index, 2 reserved bytes, an 8-byte instruction offset, and
+three 4-byte fields for source index, source offset, and source length.
 
 Mappings are strictly ordered, refer to complete text instructions, and remain
 within the referenced source length. Paths are logical source names, not host
-paths. Source text and line maps are not duplicated into the object; consumers
-recover them through the shared `SourceManager`.
+paths.
+
+The source *text* lives in the object, in one region of its own that follows the
+string table. Each source record's reserved word became that region's offset in
+version 2 of the format; before that, the word was reserved and the text was
+expected to be recovered through the shared `SourceManager`, which meant a
+mapping was an offset into text that was not in the file. An object that had to
+be read somewhere the source was not — a build cache, a bug report, a
+reproduction on another machine — resolved every offset to nothing, so the text
+travels with the mappings.
+
+The region is canonical in the same sense as the string table: it holds each
+source's text once, in source order, with no unreferenced bytes at its end. Its
+size is a header word, and a source whose offset plus length is outside it is
+rejected before any mapping is interpreted.
 
 ## Compatibility and ownership
 
 The `.lzo` model is owned by `lazalith-toolchain`; the kernel never depends on
 the toolchain. The compatibility bridge accepts only a single text object
-without relocations and emits the existing `.lzx` v1 container. The general
+without relocations and emits the existing `.lzx` container. The general
 linker resolves symbols, lays out aligned sections, evaluates the relocation
 formulas above, strips object-only metadata, and constructs the runtime
 executable.

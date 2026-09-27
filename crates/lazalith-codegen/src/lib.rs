@@ -191,6 +191,18 @@ pub enum CodegenError {
         /// How many distinct sources the spans name.
         count: usize,
     },
+    /// A span reaches past the text the caller supplied.
+    ///
+    /// The object carries the text so it is self-describing, and a mapping is an
+    /// offset into that text. An offset past the end of it is unresolvable, so it
+    /// is refused while the program is being generated rather than surfacing as a
+    /// debugger showing the wrong line.
+    SourceOutOfRange {
+        /// The end of the offending span.
+        length: u32,
+        /// How long the text actually is.
+        available: u32,
+    },
     /// The object model refused something.
     Object(ObjectError),
 }
@@ -248,6 +260,10 @@ impl fmt::Display for CodegenError {
                 f,
                 "the program's spans name {count} sources, and one debug path cannot describe \
                  them all"
+            ),
+            Self::SourceOutOfRange { length, available } => write!(
+                f,
+                "a source span reaches byte {length}, and the source is {available} bytes"
             ),
             Self::Object(error) => write!(f, "the object model refused this program: {error}"),
         }
@@ -353,13 +369,17 @@ impl Program {
 /// The module has already been through the IR verifier, so this stage does not
 /// repeat those checks; it fails instead on anything the machine cannot
 /// represent, and never approximates.
-pub fn generate(lowered: &Lowered, options: &CodegenOptions) -> Result<Program, CodegenError> {
+pub fn generate(
+    lowered: &Lowered,
+    options: &CodegenOptions,
+    source_text: &str,
+) -> Result<Program, CodegenError> {
     if options.architecture.word_width() != WordWidth::W64 {
         return Err(CodegenError::UnsupportedArchitecture {
             word: options.architecture.word_width(),
         });
     }
-    let source = debug_source(&lowered.module, options)?;
+    validate_debug_source(&lowered.module, source_text)?;
     let frames = frame_table(lowered)?;
     let mut generated = Generated::new(&options.architecture, &lowered.module.data);
     generated.data_segments()?;
@@ -367,7 +387,7 @@ pub fn generate(lowered: &Lowered, options: &CodegenOptions) -> Result<Program, 
     for (function, frame) in lowered.module.functions.iter().zip(frames.iter()) {
         reported.push((function.name.clone(), generated.function(function, *frame)?));
     }
-    let object = generated.finish(lowered, &source.0, source.1)?;
+    let object = generated.finish(lowered, &options.source_path.clone(), source_text)?;
     let records = reported
         .into_iter()
         .map(|(function, emitted)| GeneratedFrame {
@@ -388,14 +408,20 @@ pub fn generate(lowered: &Lowered, options: &CodegenOptions) -> Result<Program, 
     })
 }
 
-/// The single source a lowered program's spans name, and how long it is.
+/// Checks that a lowered program's spans can be described by one source.
 ///
-/// The length is the end of the last span the module carries, which is all the
-/// debug information needs: a mapping's source range must fit inside the source,
-/// and no mapping refers to anything past the last span. Taking it from the
-/// module rather than from a file on disk keeps this stage independent of how the
-/// program was read.
-fn debug_source(module: &Module, options: &CodegenOptions) -> Result<(String, u32), CodegenError> {
+/// Two things have to hold for a debug mapping to mean anything: every span names
+/// the same file, because one path cannot describe two; and no span reaches past
+/// the end of the text, because a mapping is an offset into that text and an offset
+/// past its end resolves to no line at all. Both are checked here, while the
+/// program is being generated, rather than surfacing later as a debugger showing
+/// the wrong one.
+///
+/// The *text* comes from the caller, because the spans only carry offsets into it
+/// and this stage has no source manager. That is deliberate: the text goes into
+/// the object so the object is self-describing, and whoever built the program is
+/// the only thing that still has it.
+fn validate_debug_source(module: &Module, source_text: &str) -> Result<(), CodegenError> {
     let mut ids: Vec<SourceId> = Vec::new();
     let mut length = 0u32;
     let mut note = |span: &lazalith_types::SourceSpan| {
@@ -417,7 +443,17 @@ fn debug_source(module: &Module, options: &CodegenOptions) -> Result<(String, u3
     if ids.len() > 1 {
         return Err(CodegenError::MultipleSources { count: ids.len() });
     }
-    Ok((options.source_path.clone(), length))
+    // A span that reaches past the text it came from is a bug in the front end,
+    // and carrying the text anyway would put an offset in the object that no
+    // reader could resolve — so it is refused here rather than discovered by a
+    // debugger showing the wrong line.
+    if usize::try_from(length).unwrap_or(usize::MAX) > source_text.len() {
+        return Err(CodegenError::SourceOutOfRange {
+            length,
+            available: u32::try_from(source_text.len()).unwrap_or(u32::MAX),
+        });
+    }
+    Ok(())
 }
 
 /// The frame layouts, in the module's function order.
@@ -460,10 +496,10 @@ struct Emitted {
 
 /// A code offset and the source range it came from.
 #[derive(Clone, Copy, Debug)]
-struct PendingMapping {
-    offset: u64,
-    start: u32,
-    length: u32,
+pub(crate) struct PendingMapping {
+    pub(crate) offset: u64,
+    pub(crate) start: u32,
+    pub(crate) length: u32,
 }
 
 struct Generated<'a> {
@@ -562,6 +598,7 @@ impl<'a> Generated<'a> {
         };
         let layout = FunctionLayout::new(function, frame, self.architecture)
             .map_err(|error| error.with_function(&function.name))?;
+        let first_mapping = self.mappings.len();
         let mut emitter = FunctionEmitter::new(
             function,
             self.segments,
@@ -570,20 +607,27 @@ impl<'a> Generated<'a> {
             &mut self.text,
             &mut self.text_labels,
             &mut self.relocations,
+            &mut self.mappings,
         );
         let offset = emitter.run()?;
         self.function_entries
             .push((function_symbol(&function.name), offset));
-        // The IR keeps a span per function, so that is the finest mapping the
-        // object model can be given without a span per instruction.
+        // The function's own span is inserted *first*, covering the prologue the
+        // per-instruction map does not reach. Inserting rather than pushing keeps
+        // the table in address order, which is what the linker's fix-up and the
+        // debugger's backwards walk both assume, and assuming it in one place and
+        // providing it in another is how a table ends up half sorted.
         if let Some(span) = &function.span {
             let from = span.start().as_u32();
             let to = span.end().as_u32();
-            self.mappings.push(PendingMapping {
-                offset,
-                start: from,
-                length: to.saturating_sub(from),
-            });
+            self.mappings.insert(
+                first_mapping,
+                PendingMapping {
+                    offset,
+                    start: from,
+                    length: to.saturating_sub(from),
+                },
+            );
         }
         Ok(Emitted {
             total: layout.total,
@@ -597,7 +641,7 @@ impl<'a> Generated<'a> {
         mut self,
         lowered: &Lowered,
         source: &str,
-        source_length: u32,
+        source_text: &str,
     ) -> Result<ObjectFile, CodegenError> {
         let text_section = Section::text("text", *self.architecture, &self.text)?;
         let data_section = if !self.has_data {
@@ -686,7 +730,7 @@ impl<'a> Generated<'a> {
                 pending.addend,
             ))?;
         }
-        let source = builder.add_debug_source(DebugSource::new(source, source_length))?;
+        let source = builder.add_debug_source(DebugSource::new(source, source_text))?;
         for mapping in core::mem::take(&mut self.mappings) {
             builder.add_debug_mapping(CodeMapping::new(
                 text_index,

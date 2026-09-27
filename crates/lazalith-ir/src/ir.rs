@@ -615,7 +615,30 @@ pub struct Parameter {
     pub ty: Type,
 }
 
-/// An IR function.
+/// One instruction's place in the source.
+///
+/// The map is a *side table* rather than a field on `Instruction`, and that is a
+/// deliberate choice. A span on every instruction would mean every construction
+/// site of the forty-odd `Instruction` variants grew a second argument, and the
+/// compiler would have to thread a span through paths where the span is genuinely
+/// not known — a synthesised loop's latch, a spill, a bounds check. A side table
+/// says the same thing without either cost.
+///
+/// The entries are the *first* instruction of each run that shares a span, not one
+/// per instruction. A statement that lowers to thirty instructions needs one
+/// entry, and a debugger resolving a PC inside any of the thirty finds the
+/// statement by walking back to the nearest entry at or before it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceEntry {
+    /// Index into the function's `blocks`.
+    pub block: usize,
+    /// Index into that block's `instructions`.
+    pub instruction: usize,
+    /// Where in the source those instructions came from.
+    pub span: lazalith_types::SourceSpan,
+}
+
+/// A function.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Function {
     /// Function name.
@@ -630,6 +653,13 @@ pub struct Function {
     pub blocks: Vec<Block>,
     /// Where the function came from in the source, when known.
     pub span: Option<lazalith_types::SourceSpan>,
+    /// Which source construct each run of instructions came from.
+    ///
+    /// Empty when the front end recorded nothing, and a backend that needs the
+    /// map must treat that as "no debug information" rather than as an error: an
+    /// assembly object has no source at all, and refusing to generate one because
+    /// of it would put the source map in charge of the object format.
+    pub source_map: Vec<SourceEntry>,
 }
 
 impl Function {
@@ -641,6 +671,33 @@ impl Function {
     /// Looks up a block by label.
     pub fn block(&self, id: BlockId) -> Option<&Block> {
         self.blocks.iter().find(|block| block.id == id)
+    }
+
+    /// The source span covering the instruction at (`block`, `instruction`).
+    ///
+    /// The answer is the span of the nearest entry at or before the position, so
+    /// an instruction with no entry of its own still resolves — to the statement
+    /// it was part of. A position before the first entry, or a position in a block
+    /// the map never mentions, has no answer, and saying so is the point: a
+    /// debugger that invented one would be showing a line that is not the line the
+    /// program came from.
+    ///
+    /// The scan walks the map backwards without assuming it is sorted. It is
+    /// written in emission order today, but "nearest entry at or before" is
+    /// defined by emission order and not by the order the entries happen to be
+    /// stored in, so the answer would not change if that changed.
+    pub fn source_of(
+        &self,
+        block: usize,
+        instruction: usize,
+    ) -> Option<&lazalith_types::SourceSpan> {
+        self.source_map
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.block < block || (entry.block == block && entry.instruction <= instruction)
+            })
+            .map(|entry| &entry.span)
     }
 }
 

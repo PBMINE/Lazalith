@@ -227,15 +227,59 @@ fn build_names_each_image_after_its_own_source() {
     project.lazen(&["build", "two.lz"]).succeeded();
     assert!(project.exists("one.lzx"), "the first image is its own");
     assert!(project.exists("two.lzx"), "the second image is its own");
-    // Identical programs must produce identical images. They are compared as
-    // bytes because that is what the file is, and reading them as text would
-    // fail on any byte that is not valid UTF-8 rather than on a real difference.
+    // Each image carries the name of the source it was built from, so two images
+    // from differently named sources are *not* byte-identical even when the code
+    // is the same. Comparing the bytes for equality was the wrong check for this:
+    // what has to hold is that each image names its own source and neither image
+    // has been overwritten with the other one. Naming is read out of the file as
+    // text because the names are stored as text, and a substring search that did
+    // not find them would fail on a real difference rather than on an encoding
+    // detail.
     let one = fs::read(project.root.join("one.lzx")).expect("the first image is readable");
     let two = fs::read(project.root.join("two.lzx")).expect("the second image is readable");
+    assert!(
+        contains(&one, b"one.lz"),
+        "the first image names the source it was built from"
+    );
+    assert!(
+        !contains(&one, b"two.lz"),
+        "the first image was not overwritten with the second program's"
+    );
+    assert!(
+        contains(&two, b"two.lz"),
+        "the second image names the source it was built from"
+    );
+    assert!(
+        !contains(&two, b"one.lz"),
+        "the second image was not overwritten with the first program's"
+    );
+}
+
+/// Whether `needle` appears in `haystack`.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// The same program built twice in different directories is the same file.
+#[test]
+fn build_is_reproducible_across_directories() {
+    let first = Project::new("build-repro-one");
+    first.write("main.lz", HELLO);
+    first.lazen(&["build", "main.lz"]).succeeded();
+    let second = Project::new("build-repro-two");
+    second.write("main.lz", HELLO);
+    second.lazen(&["build", "main.lz"]).succeeded();
+    // The images are compared as bytes because that is what the file is, and
+    // reading them as text would fail on any byte that is not valid UTF-8 rather
+    // than on a real difference. The two builds ran in different directories and
+    // produced identical files, which is the property being claimed: nothing in an
+    // image depends on where it was built.
     assert_eq!(
-        one, two,
-        "identical programs produce identical images, so the second build did \
-         not overwrite the first with something else"
+        fs::read(first.root.join("main.lzx")).expect("the first image is readable"),
+        fs::read(second.root.join("main.lzx")).expect("the second image is readable"),
+        "the same program built in two directories produces the same image"
     );
 }
 

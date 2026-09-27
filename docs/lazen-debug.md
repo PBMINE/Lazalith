@@ -107,6 +107,52 @@ width it cannot honour is worse than one that refuses.
   runs into data should show the address it stopped at, because "where does the
   code end" is a question a frontend has to be able to ask.
 
+## Source-level debugging
+
+A program built from Lazen carries where its code came from: every statement is
+marked as it is lowered, the mark becomes a code offset as instructions are
+emitted, the object carries those offsets with the source text they point into,
+and the linker rewrites them to the addresses that code actually got in the
+image. So a program counter can be answered with a file and a line, and the
+answer comes from the build rather than from a table anyone wrote by hand.
+
+Three questions, and their honest answers:
+
+- `source_location()` — where is the program counter, in the source it was
+  written in? This walks *backwards* to the mapping at or before the address, so
+  it answers for a PC in the middle of a statement as well as on its first
+  instruction.
+- `source_location_at(address)` — the same, for an address that is not the
+  program counter. This is what makes a stack view readable: the return addresses
+  on a stack are addresses the program passed through, and each resolves to its
+  own line.
+- `set_source_breakpoint(process, name, line)` — walk *forwards* over the mappings
+  that start on that line and set a breakpoint on each.
+
+`set_source_breakpoint` returns the addresses it resolved to, and **an empty
+answer is not an error**. A line can be a comment, a declaration with no code, a
+blank line, or a branch the backend never emitted. "No code for that line" is the
+answer; a breakpoint on whatever instruction happened to be next would be a
+breakpoint the user did not ask for, on a line they did not write. A frontend
+that wants the conventional "first statement on the line" takes the lowest of the
+addresses returned.
+
+The line is found by resolving each mapping's start offset through the file's own
+line map — the same map that made the offsets. Comparing offsets against a line
+start instead would be the same answer written a second way, and a second way to
+be wrong.
+
+`debug_info()` returns the table itself, or `None`. A program assembled by hand,
+or built by a toolchain that had no source, has no block: `source_location()`
+answers `None` and no source breakpoint can be set, while every address-level
+feature keeps working and the program runs exactly as it would without a
+debugger. Losing debug information must not change what a program *does*.
+
+The stack is still not a call chain. Source information does not fix that: the
+calling convention reserves the return address below the frame and records no
+frame pointer, so there is nothing to walk. A frontend that wants frames needs
+the ISA to grow a frame pointer first.
+
 ## Snapshots
 
 `DebugSnapshot` captures a **session's debugging state**: its breakpoints, its

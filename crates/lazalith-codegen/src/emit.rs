@@ -56,8 +56,8 @@ use lazalith_types::{ArchitectureConfig, RegisterIndex};
 
 use crate::layout::{FunctionLayout, OUTGOING_ARGUMENT_BYTES};
 use crate::{
-    BRANCH_RELOCATION, CodegenError, DATA_RELOCATION, PendingRelocation, function_symbol,
-    value_size,
+    BRANCH_RELOCATION, CodegenError, DATA_RELOCATION, PendingMapping, PendingRelocation,
+    function_symbol, value_size,
 };
 
 /// The address scratch, and the register the OS ABI reserves at a syscall.
@@ -163,6 +163,12 @@ pub struct FunctionEmitter<'a> {
     code: &'a mut Vec<u8>,
     text_labels: &'a mut Vec<(Name, u64)>,
     relocations: &'a mut Vec<PendingRelocation>,
+    /// Source spans for the code emitted, filled in as instructions are emitted.
+    ///
+    /// These offsets are relative to the *text section*, not to the function, so
+    /// the caller can hand them straight to the object without knowing where this
+    /// function landed.
+    mappings: &'a mut Vec<PendingMapping>,
     /// A counter for machine-only label names.
     next_label: u32,
     /// The next value identifier this function's instructions will define.
@@ -195,6 +201,7 @@ impl<'a> FunctionEmitter<'a> {
         code: &'a mut Vec<u8>,
         text_labels: &'a mut Vec<(Name, u64)>,
         relocations: &'a mut Vec<PendingRelocation>,
+        mappings: &'a mut Vec<PendingMapping>,
     ) -> Self {
         Self {
             name: function.name.clone(),
@@ -205,6 +212,7 @@ impl<'a> FunctionEmitter<'a> {
             code,
             text_labels,
             relocations,
+            mappings,
             next_label: 0,
             next_value: u32::try_from(function.params.len()).unwrap_or(u32::MAX),
             terminated: false,
@@ -227,10 +235,24 @@ impl<'a> FunctionEmitter<'a> {
             return Ok(entry);
         }
         self.prologue()?;
-        for block in &self.function.blocks {
+        for (block_index, block) in self.function.blocks.iter().enumerate() {
             self.terminated = false;
             self.mark(&self.block_label(block.id));
-            for instruction in &block.instructions {
+            for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+                // The mapping is taken *before* the instruction is emitted, so the
+                // offset is where that instruction's code begins. An instruction
+                // that emits nothing — a folded constant, say — therefore maps to
+                // the same offset as the next one that does, which is still the
+                // right answer: a PC can only be inside code that exists.
+                if let Some(span) = self.function.source_of(block_index, instruction_index) {
+                    let from = span.start().as_u32();
+                    let to = span.end().as_u32();
+                    self.mappings.push(PendingMapping {
+                        offset: self.code.len() as u64,
+                        start: from,
+                        length: to.saturating_sub(from),
+                    });
+                }
                 self.instruction(instruction)?;
             }
             self.terminator(&block.terminator)?;

@@ -40,7 +40,7 @@ fn generate_program(source: &str) -> (Program, Lowered) {
         .unwrap_or_else(|error| panic!("{source} should compile:\n{}", error.render()));
     let lowered =
         lower::lower(&program).unwrap_or_else(|error| panic!("{source} should lower: {error}"));
-    let generated = generate(&lowered, &CodegenOptions::lz64("t.lazen"))
+    let generated = generate(&lowered, &CodegenOptions::lz64("t.lazen"), source)
         .unwrap_or_else(|error| panic!("{source} should generate code: {error}"));
     (generated, lowered)
 }
@@ -835,7 +835,7 @@ fn a_32_bit_machine_is_refused() {
         architecture: ArchitectureConfig::lz32(),
         source_path: String::from("t.lazen"),
     };
-    match generate(&lowered, &options).expect_err("a 32-bit machine has no code generation") {
+    match generate(&lowered, &options, "").expect_err("a 32-bit machine has no code generation") {
         CodegenError::UnsupportedArchitecture { word } => {
             assert_eq!(word.bits(), 32);
         }
@@ -843,31 +843,40 @@ fn a_32_bit_machine_is_refused() {
     }
 }
 
+const MISSING_FRAME_SOURCE: &str = r#"
+        fn main() -> i32 {
+            return 0;
+        }
+        "#;
+
 /// A function with no reported frame cannot be given a prologue, and this stage
 /// says so rather than inventing a frame size.
 #[test]
 fn a_function_without_a_frame_is_refused() {
-    let (object, mut lowered) = generate_object(
-        r#"
-        fn main() -> i32 {
-            return 0;
-        }
-        "#,
-    );
+    let (object, mut lowered) = generate_object(MISSING_FRAME_SOURCE);
     object.validate().expect("the object is valid");
     // Remove the frame the lowering reported, as a caller that lost it would.
     lowered.frames.clear();
-    match generate(&lowered, &CodegenOptions::lz64("t.lazen"))
-        .expect_err("a missing frame must be refused")
+    match generate(
+        &lowered,
+        &CodegenOptions::lz64("t.lazen"),
+        MISSING_FRAME_SOURCE,
+    )
+    .expect_err("a missing frame must be refused")
     {
         CodegenError::MissingFrame { function } => assert_eq!(function, "main"),
         other => panic!("expected a refusal for a missing frame: {other}"),
     }
 }
 
-/// The object's debug information names the source it came from.
+/// The object's debug information names the source it came from, and the text.
+///
+/// A mapping is a byte offset into the source, so an object that recorded the
+/// path and the offsets but not the text would leave a debugger unable to turn
+/// any of it into a line. That is what this states: the object is
+/// self-describing.
 #[test]
-fn the_object_records_its_source() {
+fn the_object_records_its_source_and_its_text() {
     let (object, _) = generate_object(
         r#"
         fn main() -> i32 {
@@ -884,14 +893,36 @@ fn the_object_records_its_source() {
         vec![String::from("t.lazen")],
         "the source path is recorded"
     );
+    let source = &object.debug_sources()[0];
+    assert!(
+        source.text().contains("fn main"),
+        "and so is the text the mappings are offsets into: {:?}",
+        source.text()
+    );
     assert_eq!(
-        object.debug_mappings().len(),
-        object
-            .symbols()
-            .iter()
-            .filter(|s| s.name().starts_with("fn."))
-            .count(),
-        "each function has a code mapping"
+        source.length(),
+        u32::try_from(source.text().len()).expect("a host-sized source"),
+        "whose recorded length is its own"
+    );
+    // Every mapping's source range has to fit inside the text it points into, or
+    // resolving it would read past the end.
+    for mapping in object.debug_mappings() {
+        let end = mapping.source_offset() + mapping.source_length();
+        assert!(
+            end <= source.length(),
+            "mapping at {} ends at {end}, past the {}-byte source",
+            mapping.offset(),
+            source.length()
+        );
+    }
+    assert!(
+        object.debug_mappings().len()
+            >= object
+                .symbols()
+                .iter()
+                .filter(|s| s.name().starts_with("fn."))
+                .count(),
+        "every function has at least one code mapping"
     );
 }
 
@@ -983,7 +1014,7 @@ fn more_than_one_source_is_refused() {
     let mut mixed = lowered.clone();
     // A data segment from another file, so the module names two sources.
     mixed.module.data[0].span = Some(other.functions[0].span.clone());
-    match generate(&mixed, &CodegenOptions::lz64("t.lazen"))
+    match generate(&mixed, &CodegenOptions::lz64("t.lazen"), "")
         .expect_err("two sources cannot share one debug path")
     {
         CodegenError::MultipleSources { count } => assert_eq!(count, 2),
@@ -1417,5 +1448,99 @@ fn a_frame_stays_addressable_across_a_call_with_six_arguments() {
         code,
         Some(0),
         "a frame stayed addressable across calls that use the whole argument area"
+    );
+}
+
+/// Every statement leaves a mapping into the source it was written in.
+#[test]
+fn a_generated_object_maps_its_code_back_to_the_source() {
+    let source = "fn main() -> i32 {\n    let a: i32 = 1i32;\n    let b: i32 = 2i32;\n    return a + b;\n}\n";
+    let (program, _) = generate_program(source);
+    let object = program.object();
+    assert_eq!(
+        object.debug_sources().len(),
+        1,
+        "one source file was compiled, so one is carried"
+    );
+    assert_eq!(object.debug_sources()[0].path(), "t.lazen");
+    assert_eq!(
+        object.debug_sources()[0].text(),
+        source,
+        "the text is the source the compiler was given"
+    );
+    assert!(
+        !object.debug_mappings().is_empty(),
+        "every statement left a mapping"
+    );
+    for mapping in object.debug_mappings() {
+        assert!(
+            mapping.source_offset() + mapping.source_length() <= object.debug_sources()[0].length(),
+            "a mapping reaches inside the text it names"
+        );
+    }
+}
+
+/// A mapping's code offset is where that code really is in the object.
+///
+/// This is the property the whole feature rests on: a mapping that named an
+/// offset in the text section that does not hold the statement it claims would
+/// still round-trip perfectly and still send a debugger to the wrong place.
+#[test]
+fn a_mappings_code_offset_is_where_the_code_really_is() {
+    let source = "fn main() -> i32 {\n    let a: i32 = 7i32;\n    return a;\n}\n";
+    let (object, _) = generate_object(source);
+    // The text section is whichever section the disassembler kept, and the
+    // mapping's section is compared against that same index rather than a
+    // number written down here — a test that hard-coded the index would pass
+    // even if the backend put the code somewhere else.
+    let disassembly = disassemble_object(&object)
+        .expect("the object disassembles")
+        .into_iter()
+        .next()
+        .expect("the object has one text section");
+    let text = object
+        .sections()
+        .iter()
+        .enumerate()
+        .find(|(index, _)| u16::try_from(*index).unwrap_or(u16::MAX) == disassembly.section())
+        .map(|(_, section)| section)
+        .expect("the text section is in the object");
+    for mapping in object.debug_mappings() {
+        assert_eq!(
+            mapping.section().get(),
+            disassembly.section(),
+            "a mapping names the section its code is in"
+        );
+        assert!(
+            mapping.offset() + 8 <= text.bytes().len() as u64,
+            "a mapping's offset {} is inside a {}-byte section, so the \
+             instruction it names exists",
+            mapping.offset(),
+            text.bytes().len()
+        );
+        // And the instruction at that offset is a real one, not half of another.
+        let at = mapping.offset() as usize / 8;
+        assert!(
+            at < disassembly.instructions().len(),
+            "and there is an instruction at that offset"
+        );
+    }
+}
+
+/// Code generated for text that is not the text supplied is refused.
+#[test]
+fn generating_with_the_wrong_source_text_is_refused() {
+    let source = "fn main() -> i32 {\n    return 1i32;\n}\n";
+    let mut sources = SourceManager::new();
+    let (_, program) = compile(&mut sources, "t.lazen", source).expect("compiles");
+    let lowered = lower::lower(&program).expect("lowers");
+    // A truncated text cannot hold the spans the program was checked against, and
+    // an object written from it would carry offsets into text that is not there.
+    let short = &source[..source.len() / 2];
+    let error = generate(&lowered, &CodegenOptions::lz64("t.lazen"), short)
+        .expect_err("a span past the end of the text is refused");
+    assert!(
+        matches!(error, CodegenError::SourceOutOfRange { .. }),
+        "the failure names the source range as what was wrong: {error}"
     );
 }

@@ -523,6 +523,7 @@ fn duplicate_functions_blocks_and_data_are_rejected() {
             },
         ],
         span: None,
+        source_map: Vec::new(),
     };
     let module = Module {
         name: String::from("test"),

@@ -12,7 +12,7 @@ use lazalith_os_abi::ABI_VERSION;
 use lazalith_types::{ArchitectureConfig, WordWidth};
 
 pub const OBJECT_MAGIC: [u8; 8] = *b"LZOBJ01\0";
-pub const OBJECT_FORMAT_VERSION: u16 = 1;
+pub const OBJECT_FORMAT_VERSION: u16 = 2;
 pub const OBJECT_ISA_VERSION: u16 = 1;
 pub const OBJECT_HEADER_SIZE: usize = 128;
 pub const OBJECT_SECTION_ENTRY_SIZE: usize = 64;
@@ -710,23 +710,42 @@ impl Relocation {
     }
 }
 
+/// A source file an object's mappings refer to.
+///
+/// The **text** is carried, not just the path and the length. A mapping is a byte
+/// offset into the source, so anything that wants to show a line has to turn that
+/// offset into one, and a length alone cannot: a debugger handed only a path
+/// cannot open a file the user has moved, and one handed nothing at all cannot
+/// show anything. Carrying the text makes the object self-describing, which is
+/// what an executable that someone debugs next month has to be.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DebugSource {
     path: String,
-    length: u32,
+    text: String,
 }
 impl DebugSource {
-    pub fn new(path: impl Into<String>, length: u32) -> Self {
+    /// A source file, with the text its mappings are offsets into.
+    ///
+    /// The length is *derived* rather than supplied. A length and a text that
+    /// disagree are the kind of pair that survives review and fails in a
+    /// debugger, so there is only one of them here and the format stores the
+    /// length as a cross-check a reader verifies against the text it found.
+    pub fn new(path: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
             path: path.into(),
-            length,
+            text: text.into(),
         }
     }
     pub fn path(&self) -> &str {
         &self.path
     }
-    pub const fn length(&self) -> u32 {
-        self.length
+    /// The source text's length, which is also its length in the format.
+    pub fn length(&self) -> u32 {
+        u32::try_from(self.text.len()).unwrap_or(u32::MAX)
+    }
+    /// The source text, which a debugger resolves offsets against.
+    pub fn text(&self) -> &str {
+        &self.text
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

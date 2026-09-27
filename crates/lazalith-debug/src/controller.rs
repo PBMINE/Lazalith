@@ -25,6 +25,7 @@ use crate::DebugError;
 use crate::registers::RegisterSnapshot;
 use crate::session::{DebugSession, DebugSnapshot, ExecutionState};
 use crate::snapshot::MachineSnapshot;
+use lazalith_os::debug::{DebugBlock, SourceLocation};
 
 /// Why a run stopped.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,6 +112,13 @@ pub struct DebugController<D: Device> {
     kernel: LazalithKernel,
     config: ArchitectureConfig,
     sessions: Vec<DebugSession>,
+    /// The loaded image's source-level debug information, if it has any.
+    ///
+    /// Taken from the image rather than from the objects, because by the time the
+    /// kernel has a process the mappings are already addresses in the image and
+    /// asking for them per object would mean asking which object a given address
+    /// came from — which is a question the linker already answered.
+    debug: Option<DebugBlock>,
     word_size: u64,
     pause_requested: bool,
     step_limit: u64,
@@ -161,6 +169,9 @@ impl<D: Device> DebugController<D> {
             kernel,
             config,
             sessions: Vec::new(),
+            // A booted controller has no program and so no source to name. The
+            // table arrives with the image, in `load_image`.
+            debug: None,
             word_size: u64::from(config.word_width().bytes()),
             pause_requested: false,
             step_limit: 1_000_000,
@@ -193,9 +204,13 @@ impl<D: Device> DebugController<D> {
         process: ProcessId,
         thread: ThreadId,
     ) -> Result<&mut DebugSession, DebugError> {
+        // Read before the kernel takes the image: the mappings are here, and the
+        // kernel is not going to hand an image back.
+        let debug = image.debug().cloned();
         self.kernel
             .start_image(image, process, thread)
             .map_err(|source| DebugError::Kernel(Box::new(source)))?;
+        self.debug = debug;
         let session = DebugSession::new(process, thread, self.word_size);
         self.sessions.push(session);
         Ok(self
@@ -444,6 +459,67 @@ impl<D: Device> DebugController<D> {
     /// Runs the process again, which is what a user means by "continue".
     pub fn continue_(&mut self, process: ProcessId) -> Result<RunOutcome, DebugError> {
         self.run(process)
+    }
+
+    /// The loaded image's source-level debug information, if it has any.
+    ///
+    /// This is the table the *linker* built, with its addresses already fixed up
+    /// to the loaded image, so resolving an address here needs no knowledge of how
+    /// the code was laid out. A program assembled without debug information has
+    /// none, and every source-level query on this controller then answers
+    /// "nothing" rather than guessing.
+    pub fn debug_info(&self) -> Option<&DebugBlock> {
+        self.debug.as_ref()
+    }
+
+    /// Where the program counter is, in the source it was written in.
+    pub fn source_location(&self) -> Option<SourceLocation<'_>> {
+        self.debug
+            .as_ref()
+            .and_then(|block| block.resolve(self.machine.architectural_state().pc().as_u64()))
+    }
+
+    /// Where a given address is, in the source it was written in.
+    ///
+    /// A frontend showing a *stack* needs this rather than
+    /// [`Self::source_location`]: the return addresses on a stack are all addresses
+    /// the program passed through, and each one resolves to its own line.
+    pub fn source_location_at(&self, address: u64) -> Option<SourceLocation<'_>> {
+        self.debug.as_ref().and_then(|block| block.resolve(address))
+    }
+
+    /// Sets a breakpoint on a line of a source file.
+    ///
+    /// The line is resolved through the debug table rather than through any
+    /// arithmetic here, so a breakpoint lands where the compiler said the code for
+    /// that line is — which is the only definition of "that line" that survives a
+    /// change in how the backend lays out code.
+    ///
+    /// Returns the addresses it resolved to. An empty answer is *not* an error:
+    /// a line can be a comment, a declaration with no code, or the body of a
+    /// branch the optimiser never emitted. Saying "no code for that line" is the
+    /// answer; inventing an address would be a breakpoint on whatever happened to
+    /// be next.
+    pub fn set_source_breakpoint(
+        &mut self,
+        process: ProcessId,
+        name: &str,
+        line: u32,
+    ) -> Result<Vec<u64>, DebugError> {
+        let addresses = self
+            .debug
+            .as_ref()
+            .map(|block| block.addresses_at_line(name, line))
+            .unwrap_or_default();
+        let session = self
+            .session_mut(process)
+            .ok_or_else(|| DebugError::Snapshot(String::from("there is no session")))?;
+        for address in &addresses {
+            session
+                .set_breakpoint(*address)
+                .map_err(|error| DebugError::Snapshot(format!("{error}")))?;
+        }
+        Ok(addresses)
     }
 
     /// Captures a process's debugging state.

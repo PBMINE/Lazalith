@@ -173,6 +173,7 @@ impl RuntimeProgram {
                 architecture: options.architecture,
                 source_path: options.source_path.clone(),
             },
+            &unit,
         )
         .map_err(RuntimeError::Codegen)?;
         let mut objects = Vec::new();

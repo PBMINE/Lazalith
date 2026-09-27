@@ -5,6 +5,7 @@ use crate::{
 use alloc::{borrow::ToOwned, collections::BTreeMap, string::String, vec::Vec};
 use core::{error::Error, fmt};
 use lazalith_isa::{Instruction, Opcode, Operand, decode, encode};
+use lazalith_os::debug::{DebugBlock, DebugEntry, DebugFile};
 use lazalith_os::{
     LZX_DATA_PERMISSIONS, LzxArchitecture, LzxError, LzxImage, LzxSection, LzxSectionKind,
     USER_CODE_START, USER_DATA_LENGTH, USER_DATA_START, USER_STACK_LENGTH,
@@ -21,11 +22,24 @@ pub struct LinkedProgram {
     image: LzxImage,
     entry_offset: u64,
     entry_symbol: String,
+    debug: DebugBlock,
 }
 
 impl LinkedProgram {
     pub const fn image(&self) -> &LzxImage {
         &self.image
+    }
+
+    /// The program's source-level debug information, if it was built with any.
+    ///
+    /// This is where the mappings stop being per-object offsets and start being
+    /// addresses in the loaded image, because that is the only thing a debugger
+    /// has. A program assembled without debug information gets an empty block
+    /// rather than a failure: assembly is a first-class input, and refusing to
+    /// link a program because nobody wrote down where it came from would make the
+    /// assembler a second-class one.
+    pub const fn debug(&self) -> &DebugBlock {
+        &self.debug
     }
 
     pub fn into_image(self) -> LzxImage {
@@ -45,20 +59,63 @@ impl LinkedProgram {
 pub enum LinkError {
     NoObjects,
     IncompatibleArchitecture,
-    IncompatibleIsa { value: u16 },
-    IncompatibleAbi { value: u16 },
+    IncompatibleIsa {
+        value: u16,
+    },
+    IncompatibleAbi {
+        value: u16,
+    },
     Object(ObjectError),
     MissingEntry,
-    DuplicateGlobal { name: String },
-    UndefinedSymbol { name: String },
-    SymbolIndex { object: usize, index: u32 },
-    SectionLayout { object: usize, section: u16 },
+    DuplicateGlobal {
+        name: String,
+    },
+    UndefinedSymbol {
+        name: String,
+    },
+    SymbolIndex {
+        object: usize,
+        index: u32,
+    },
+    SectionLayout {
+        object: usize,
+        section: u16,
+    },
     DataOverflow,
-    RelocationSymbol { object: usize, index: usize },
-    RelocationArithmetic { object: usize, index: usize },
-    RelocationTarget { object: usize, index: usize },
+    RelocationSymbol {
+        object: usize,
+        index: usize,
+    },
+    RelocationArithmetic {
+        object: usize,
+        index: usize,
+    },
+    RelocationTarget {
+        object: usize,
+        index: usize,
+    },
     Image(LzxError),
     Allocation(alloc::collections::TryReserveError),
+    /// A mapping names a source index the object did not have.
+    UnknownDebugSource {
+        /// The index that was named.
+        value: u32,
+    },
+    /// A mapping names a section index the object did not have.
+    UnknownDebugSection {
+        /// The index that was named.
+        value: u16,
+    },
+    /// More distinct sources than a `u32` index can name.
+    TooManyDebugSources,
+    /// The gathered debug table did not hold together.
+    ///
+    /// This should be unreachable: the table is built from validated objects and
+    /// validated again on the way in. It is a separate case rather than a wrapped
+    /// `DebugError` because a linker that reported "the image refused" for a
+    /// problem in the *linker's own* table would send whoever is chasing the bug
+    /// looking in the wrong place.
+    BadDebugBlock,
 }
 
 impl fmt::Display for LinkError {
@@ -99,6 +156,21 @@ impl fmt::Display for LinkError {
             ),
             Self::Image(source) => write!(f, "linked executable is invalid: {source}"),
             Self::Allocation(source) => write!(f, "linker allocation failed: {source}"),
+            Self::UnknownDebugSource { value } => write!(
+                f,
+                "a code mapping names source {value}, which the object does not have"
+            ),
+            Self::UnknownDebugSection { value } => write!(
+                f,
+                "a code mapping names section {value}, which the object does not have"
+            ),
+            Self::TooManyDebugSources => {
+                write!(
+                    f,
+                    "the program has more sources than a debug table can name"
+                )
+            }
+            Self::BadDebugBlock => write!(f, "the gathered debug table did not hold together"),
         }
     }
 }
@@ -148,6 +220,14 @@ struct LinkedLayout {
     entry_name: String,
     /// Where that symbol ended up.
     entry_address: u64,
+    /// Where each object's sections landed.
+    ///
+    /// Kept here rather than recomputed because the placements are decided once,
+    /// inside the layout, and a second pass that derived them again would be a
+    /// second answer to the same question. The debug table needs them: a mapping's
+    /// offset is relative to its own object, and only here does anyone know where
+    /// that object went.
+    placements: Vec<ObjectLayout>,
 }
 
 pub fn link_objects(
@@ -195,6 +275,7 @@ pub fn link_objects(
         .entry_address
         .checked_sub(USER_CODE_START)
         .ok_or(LinkError::MissingEntry)?;
+    let debug = collect_debug(objects, &layout)?;
     let data_mask = layout.bss_alignment - 1;
     let data_end = u64::try_from(layout.data.len())
         .ok()
@@ -204,7 +285,7 @@ pub fn link_objects(
     let required_data = data_end
         .checked_add(layout.bss_size)
         .ok_or(LinkError::DataOverflow)?;
-    let image = LzxImage::new(
+    let image = LzxImage::with_debug(
         // Every object was checked to agree on the architecture, the ISA and the
         // ABI before anything was laid out, so the first one speaks for all of
         // them and the image needs no per-object target of its own.
@@ -214,12 +295,21 @@ pub fn link_objects(
         required_data,
         USER_STACK_LENGTH,
         image_sections,
+        // The block is empty when no object had debug information, and an empty
+        // block is written as no block at all rather than as a table with no
+        // entries — a program assembled by hand should not carry the eight bytes
+        // of header that say so.
+        // The clone is because `debug` is also handed to the `LinkedProgram`
+        // below, and the two must not share: a caller that mutated one would
+        // then see the other change under it.
+        (!debug.is_empty()).then_some(debug.clone()),
     )
     .map_err(LinkError::Image)?;
     Ok(LinkedProgram {
         image,
         entry_offset,
         entry_symbol: layout.entry_name,
+        debug,
     })
 }
 
@@ -423,6 +513,7 @@ fn link_layout(objects: &[ObjectFile], options: &LinkOptions) -> Result<LinkedLa
         bss_alignment,
         entry_name,
         entry_address,
+        placements,
     })
 }
 
@@ -715,4 +806,80 @@ fn patch_code(
         encode(config, &replacement).map_err(|_| LinkError::RelocationTarget { object, index })?;
     code[start..end].copy_from_slice(&encoded);
     Ok(())
+}
+
+/// Gathers every object's debug information into one block, with real addresses.
+///
+/// A mapping's offset is relative to its own object's text section, and the
+/// linker concatenates those sections into one code region — so an offset means
+/// nothing until it is added to the base that section was placed at. Doing that
+/// here rather than leaving it to the loader is the point: the loader should not
+/// have to know how the code was laid out in order to read a table about it.
+///
+/// Sources are merged by *text*, not by name. Two objects that compiled the same
+/// file produce the same bytes, and giving them one entry makes the table smaller
+/// and the resolution unambiguous; two objects with the same name but different
+/// text are two sources, because a debugger that silently picked one of them
+/// would show a line from the wrong file.
+fn collect_debug(objects: &[ObjectFile], layout: &LinkedLayout) -> Result<DebugBlock, LinkError> {
+    let placements = &layout.placements;
+    let mut files: Vec<DebugFile> = Vec::new();
+    let mut entries: Vec<DebugEntry> = Vec::new();
+    for (object_index, object) in objects.iter().enumerate() {
+        if object.debug_sources().is_empty() {
+            continue;
+        }
+        let placement = placements
+            .get(object_index)
+            .ok_or(LinkError::DataOverflow)?;
+        let mut local: Vec<u32> = Vec::new();
+        local
+            .try_reserve(object.debug_sources().len())
+            .map_err(LinkError::Allocation)?;
+        for source in object.debug_sources() {
+            let found = files.iter().position(|file| file.text() == source.text());
+            let index = match found {
+                Some(index) => u32::try_from(index).map_err(|_| LinkError::TooManyDebugSources)?,
+                None => {
+                    files.push(DebugFile::new(
+                        String::from(source.path()),
+                        String::from(source.text()),
+                    ));
+                    let raw = files.len() - 1;
+                    u32::try_from(raw).map_err(|_| LinkError::TooManyDebugSources)?
+                }
+            };
+            local.push(index);
+        }
+        for mapping in object.debug_mappings() {
+            let source = mapping.source().get();
+            let source = local
+                .get(source as usize)
+                .copied()
+                .ok_or(LinkError::UnknownDebugSource { value: source })?;
+            let section = mapping.section().get();
+            let base = placement
+                .sections
+                .get(section as usize)
+                .map(|placed| placed.base)
+                .ok_or(LinkError::UnknownDebugSection { value: section })?;
+            // A mapping into a section the linker placed at zero — a `.bss` — is
+            // about data, not code, and no program counter is ever inside one. It
+            // is dropped rather than pointed at address zero, which is where the
+            // image starts and where a wrong answer would be least noticeable.
+            if base == 0 && layout.bss_size > 0 {
+                continue;
+            }
+            let address = base
+                .checked_add(mapping.offset())
+                .ok_or(LinkError::DataOverflow)?;
+            entries.push(DebugEntry {
+                address,
+                source,
+                offset: mapping.source_offset(),
+                length: mapping.source_length(),
+            });
+        }
+    }
+    DebugBlock::with_entries(files, entries).map_err(|_| LinkError::BadDebugBlock)
 }

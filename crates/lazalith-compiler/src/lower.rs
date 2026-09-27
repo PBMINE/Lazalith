@@ -1160,6 +1160,13 @@ impl<'a> FunctionLowering<'a> {
     }
 
     fn statement(&mut self, statement: &CheckedStmt) -> Result<(), LowerError> {
+        // The mark goes first, before any instruction for this statement is
+        // pushed, because a mark applies to the instructions that follow it. A
+        // statement that lowers to thirty instructions therefore records one
+        // entry, and a PC inside any of the thirty resolves to the statement —
+        // which is the granularity a debugger wants, and keeps the map the size
+        // of the source rather than the size of the program.
+        self.builder.mark(statement.span().clone());
         match statement {
             CheckedStmt::Let { local, value, .. } => match local {
                 Some(local) => {

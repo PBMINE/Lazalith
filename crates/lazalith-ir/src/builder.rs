@@ -15,7 +15,7 @@ use lazalith_types::SourceSpan;
 
 use crate::{
     Block, BlockId, DataSegment, Function, Instruction, IrError, IrErrorKind, Linkage, Module,
-    Name, Parameter, Terminator, Type, ValueId,
+    Name, Parameter, SourceEntry, Terminator, Type, ValueId,
 };
 
 /// A block under construction.
@@ -70,6 +70,10 @@ pub struct FunctionBuilder {
     next_value: u32,
     span: Option<SourceSpan>,
     param_values: Vec<ValueId>,
+    /// The span to record against the next instruction pushed.
+    pending_source: Option<SourceSpan>,
+    /// The source map built so far, in push order.
+    source_map: Vec<SourceEntry>,
 }
 
 impl FunctionBuilder {
@@ -103,6 +107,8 @@ impl FunctionBuilder {
             current: None,
             span,
             param_values,
+            pending_source: None,
+            source_map: Vec::new(),
         })
     }
 
@@ -227,6 +233,21 @@ impl FunctionBuilder {
         self.push(instruction)
     }
 
+    /// Records that the next instruction pushed came from `span`.
+    ///
+    /// The mark applies to *every* instruction pushed until the next mark, so a
+    /// front end calls this once per statement rather than once per instruction.
+    /// That is the granularity a debugger wants — a PC inside a thirty-instruction
+    /// statement should name the statement — and it keeps the map the size of the
+    /// source rather than the size of the program.
+    ///
+    /// Two marks on the same span in the same block record one entry, because the
+    /// second would resolve to the same answer as the first and a table of
+    /// duplicates is a table that has to be searched.
+    pub fn mark(&mut self, span: SourceSpan) {
+        self.pending_source = Some(span);
+    }
+
     fn push(&mut self, instruction: Instruction) -> Result<(), IrError> {
         let index = self.current.ok_or_else(|| {
             self.error(IrErrorKind::InvalidBuilderState {
@@ -241,6 +262,27 @@ impl FunctionBuilder {
                 .with_block(self.blocks[index].id));
         }
         self.blocks[index].instructions.push(instruction);
+        if let Some(span) = self.pending_source.take() {
+            let at = self.blocks[index].instructions.len() - 1;
+            // A mark records the *start* of a run. If the previous entry is the
+            // instruction immediately before this one and names the same span,
+            // this is the same run continuing and a second entry would resolve to
+            // the same answer.
+            let continues = self.source_map.last().is_some_and(|entry| {
+                entry.block == index
+                    && entry.instruction + 1 == at
+                    && entry.span.id() == span.id()
+                    && entry.span.start().as_u32() == span.start().as_u32()
+                    && entry.span.end().as_u32() == span.end().as_u32()
+            });
+            if !continues {
+                self.source_map.push(SourceEntry {
+                    block: index,
+                    instruction: at,
+                    span,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -307,6 +349,7 @@ impl FunctionBuilder {
             result: self.result,
             blocks,
             span: self.span,
+            source_map: self.source_map,
         })
     }
 

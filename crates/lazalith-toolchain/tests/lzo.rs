@@ -63,7 +63,7 @@ fn object(config: ArchitectureConfig) -> ObjectFile {
         ))
         .unwrap();
     let source = builder
-        .add_debug_source(DebugSource::new("object.lzs", 32))
+        .add_debug_source(DebugSource::new("object.lzs", "line one\nline two\n"))
         .unwrap();
     builder
         .add_debug_mapping(CodeMapping::new(text, 0, source, 0, 1))
@@ -354,5 +354,122 @@ fn lzo_rejects_duplicate_names_and_out_of_order_relocations() {
     assert!(
         unordered.build().is_err(),
         "relocations must be strictly ordered by target offset"
+    );
+}
+
+/// The source text travels inside the object, not beside it.
+///
+/// A mapping is an offset into text, so an object that carried only the mapping
+/// would need the text to mean anything. This states that the bytes on disk hold
+/// the text: the object's own encoding contains the source it was built from.
+#[test]
+fn an_object_embeds_the_source_its_mappings_are_offsets_into() {
+    let object = object(ArchitectureConfig::lz64());
+    let bytes = object.to_bytes().unwrap();
+    let text = b"line one\nline two\n";
+    assert!(
+        bytes.windows(text.len()).any(|window| window == text),
+        "the object file holds the source text its mappings are offsets into"
+    );
+    let read_back = ObjectFile::from_bytes(&bytes).unwrap();
+    assert_eq!(read_back.debug_sources().len(), 1);
+    assert_eq!(read_back.debug_sources()[0].path(), "object.lzs");
+    assert_eq!(read_back.debug_sources()[0].text(), "line one\nline two\n");
+}
+
+/// Two objects with different sources keep their sources apart.
+#[test]
+fn two_objects_keep_their_own_sources() {
+    let config = ArchitectureConfig::lz64();
+    let nop = encode(config, &Instruction::new(config, Opcode::Nop, &[]).unwrap()).unwrap();
+    let mut first = ObjectBuilder::new(config);
+    let text = first
+        .add_section(Section::text("text", config, &nop).unwrap())
+        .unwrap();
+    let entry = first
+        .add_symbol(Symbol::section_defined(
+            "_start",
+            SymbolBinding::Local,
+            text,
+            0,
+            0,
+        ))
+        .unwrap();
+    first.set_entry(entry).unwrap();
+    let one = first
+        .add_debug_source(DebugSource::new("one.lzs", "one\n"))
+        .unwrap();
+    first
+        .add_debug_mapping(CodeMapping::new(text, 0, one, 0, 3))
+        .unwrap();
+    let first = first.build().unwrap();
+
+    let mut second = ObjectBuilder::new(config);
+    let text = second
+        .add_section(Section::text("text", config, &nop).unwrap())
+        .unwrap();
+    let entry = second
+        .add_symbol(Symbol::section_defined(
+            "_start",
+            SymbolBinding::Local,
+            text,
+            0,
+            0,
+        ))
+        .unwrap();
+    second.set_entry(entry).unwrap();
+    let two = second
+        .add_debug_source(DebugSource::new("two.lzs", "two two\n"))
+        .unwrap();
+    second
+        .add_debug_mapping(CodeMapping::new(text, 0, two, 0, 7))
+        .unwrap();
+    let second = second.build().unwrap();
+
+    let linked = lazalith_toolchain::link_objects(
+        &[first.clone(), second.clone()],
+        &lazalith_toolchain::LinkOptions::default(),
+    )
+    .expect("the objects link");
+    let debug = linked.debug();
+    let names: Vec<&str> = debug.files().iter().map(|file| file.name()).collect();
+    assert!(
+        names.contains(&"one.lzs") && names.contains(&"two.lzs"),
+        "both sources survived the link: {names:?}"
+    );
+    // And the merged table still resolves both objects' code, which is the point
+    // of the linker's fix-up: a mapping left at its object-relative offset would
+    // resolve to whichever function happened to be laid out there, and a mapping
+    // that named the wrong file would send a frontend to the wrong source.
+    let mut one_addresses = Vec::new();
+    let mut two_addresses = Vec::new();
+    for entry in debug.entries() {
+        let located = debug.resolve(entry.address).expect("every entry resolves");
+        match located.name {
+            "one.lzs" => {
+                assert_eq!(located.line_number(), 1, "and to the line it mapped");
+                one_addresses.push(entry.address);
+            }
+            "two.lzs" => {
+                assert_eq!(located.line_number(), 1);
+                two_addresses.push(entry.address);
+            }
+            other => panic!("a mapping resolved to a file neither object had: {other}"),
+        }
+    }
+    assert_eq!(
+        one_addresses.len(),
+        1,
+        "the first object's mapping survived"
+    );
+    assert_eq!(
+        two_addresses.len(),
+        1,
+        "and the second object's did too, rather than one replacing the other"
+    );
+    assert!(
+        one_addresses[0] != two_addresses[0],
+        "the two objects' code is at different addresses, and each mapping \
+         stayed with its own"
     );
 }

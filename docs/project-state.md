@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-27 (Steps 1–75 complete and verified)
+Last updated: 2026-09-27 (Steps 1–76 complete and verified)
 
 ## Where the roadmap stands
 
@@ -22,17 +22,62 @@ Step  71      complete: the LazOS input driver and the host adapter (38be9ca)
 Step  72      complete: the first graphical Lazen application (831c1a7)
 Step  73      complete: the first-party GUI library (ffef9c8)
 Step  74      complete: the Lazalith debug API (575841c)
-Step  75      complete: machine snapshots
+Step  75      complete: machine snapshots (1caf29e)
+Step  76      complete: source-level debug information
 ```
 
-The 789 workspace tests all pass, including the 4 in
+The 814 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 7 in `crates/lazalith-gui/tests/gui.rs` that draw with the
 widget set and read the frame back, and the 13 in
 `crates/lazalith-debug/tests/debug.rs` that drive a real machine through the
 controller, and the 7 in `crates/lazalith-debug/tests/snapshot.rs` that save
-and restore whole machines.
+and restore whole machines, and the 14 in
+`crates/lazalith-debug/tests/source.rs` that build a program from Lazen source
+and read a source location and a line breakpoint out of the resulting image.
+
+## Step 76 — source-level debug information
+
+The chain the roadmap asks for is now real end to end: Lazen source, AST, IR,
+machine code, object, executable, debugger. Nothing in it is a table written by
+hand to agree with what the compiler would have said.
+
+- **The IR records statements.** `FunctionBuilder::mark` is called once per
+  checked statement, and the mark covers every instruction that statement emits.
+  The map is therefore the size of the source rather than the size of the
+  program, and a PC inside a long statement names the statement.
+- **Code generation turns marks into addresses.** Each IR instruction's code
+  offset is recorded against the statement it came from, and the function's
+  prologue is covered by an entry that resolves to the function's first
+  statement.
+- **The object carries the text.** A mapping is a byte offset, and a byte offset
+  is meaningless without the text it is an offset into, so `.lzo` version 2 has
+  a source-text region and each source record's previously reserved word points
+  into it. The two reserved words were already checked to be zero, so no record
+  changed size and no table moved.
+- **The linker merges and fixes up.** `LinkedProgram` carries a `DebugBlock`:
+  sources are merged, and each mapping's address is rewritten from the object's
+  section offset to the address that code got in the image.
+- **The image carries it.** `.lzx` version 2 spends the eight bytes that held a
+  redundant section-table offset on the block's offset and length. The block
+  follows the last section, and an image with none has both words zero.
+- **The debugger answers.** `DebugController` reads `source_location()`,
+  `source_location_at(address)` and `set_source_breakpoint(process, name, line)`.
+  A line with no code in it is reported as having none, which is a real answer.
+
+### What this does not do
+
+- The stack is still not a call chain. The calling convention reserves the
+  return address below the frame and records no frame pointer, so there is
+  nothing to walk. `source_location_at` makes the words on a stack *readable*,
+  which is not the same as being frames.
+- A line can hold more than one statement, so a breakpoint on a line resolves to
+  every address that line's statements start at. A frontend wanting the
+  conventional first-statement breakpoint takes the lowest of them.
+- Debug information is only as good as the spans the frontend produced. A span
+  covering a whole function maps a whole function.
+
 
 This milestone added code generation. Steps 1–62 are unchanged except for the
 defects Step 63 found by running the generated code, each of which is listed

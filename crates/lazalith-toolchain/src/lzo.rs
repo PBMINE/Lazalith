@@ -65,7 +65,35 @@ pub(crate) fn encode(object: &ObjectFile) -> Result<Vec<u8>, ObjectError> {
             value: strings.bytes.len() as u64,
         })?;
     let string_end = checked_add(string_offset, string_size, "string")?;
-    let payload_offset = align_up(string_end, 8)?;
+    let debug_text_offset = align_up(string_end, 8)?;
+    // The source text is *not* interned into the string table. That table is
+    // NUL-terminated and refuses an empty string, and source text is neither a
+    // name nor guaranteed free of NUL: a file with a string literal containing
+    // zero, or an empty file, is a real input. A region of its own carries any
+    // bytes at all, which is what source text needs.
+    let mut debug_text: Vec<u8> = Vec::new();
+    let mut text_offsets: Vec<u64> = Vec::with_capacity(object.debug_sources().len());
+    for source in object.debug_sources() {
+        text_offsets.push(u64::try_from(debug_text.len()).map_err(|_| {
+            ObjectError::InvalidCount {
+                table: "debug text",
+                value: debug_text.len() as u64,
+            }
+        })?);
+        debug_text
+            .try_reserve(source.text().len())
+            .map_err(ObjectError::Allocation)?;
+        debug_text.extend_from_slice(source.text().as_bytes());
+    }
+    let debug_text_size =
+        u64::try_from(debug_text.len()).map_err(|_| ObjectError::InvalidCount {
+            table: "debug text",
+            value: debug_text.len() as u64,
+        })?;
+    let payload_offset = align_up(
+        checked_add(debug_text_offset, debug_text_size, "debug text")?,
+        8,
+    )?;
 
     let mut payload_offsets = Vec::new();
     payload_offsets
@@ -172,7 +200,19 @@ pub(crate) fn encode(object: &ObjectFile) -> Result<Vec<u8>, ObjectError> {
     put_u64(&mut output, debug_mapping_offset);
     put_u64(&mut output, string_offset);
     put_u64(&mut output, payload_offset);
-    put_u64(&mut output, 0);
+    // The word at 104 was reserved. It now carries the debug-text region's
+    // size in its low half, which is what a reader needs to bound the region
+    // before slicing a source out of it, and zero in its high half, which is
+    // still checked. Using the reserved word rather than a new field is what
+    // keeps every offset after it exactly where it was.
+    put_u32(
+        &mut output,
+        u32::try_from(debug_text.len()).map_err(|_| ObjectError::InvalidCount {
+            table: "debug text",
+            value: debug_text.len() as u64,
+        })?,
+    );
+    put_u32(&mut output, 0);
     put_u64(&mut output, 0);
     put_u64(&mut output, 0);
 
@@ -226,7 +266,7 @@ pub(crate) fn encode(object: &ObjectFile) -> Result<Vec<u8>, ObjectError> {
         put_u32(&mut output, 0);
         put_u32(&mut output, 0);
     }
-    for source in object.debug_sources() {
+    for (index, source) in object.debug_sources().iter().enumerate() {
         put_u32(
             &mut output,
             strings
@@ -234,7 +274,18 @@ pub(crate) fn encode(object: &ObjectFile) -> Result<Vec<u8>, ObjectError> {
                 .ok_or(ObjectError::InvalidString { offset: 0 })?,
         );
         put_u32(&mut output, source.length());
-        put_u64(&mut output, 0);
+        // The reserved word carries the offset of this source's text inside the
+        // debug-text region. It was reserved, so the format layout is unchanged:
+        // the same slot that held zero now holds the one number a reader needs
+        // to find the text a mapping's offsets are offsets into.
+        put_u32(
+            &mut output,
+            u32::try_from(text_offsets[index]).map_err(|_| ObjectError::InvalidCount {
+                table: "debug text",
+                value: text_offsets[index],
+            })?,
+        );
+        put_u32(&mut output, 0);
     }
     for mapping in object.debug_mappings() {
         put_u16(&mut output, mapping.section().get());
@@ -245,6 +296,8 @@ pub(crate) fn encode(object: &ObjectFile) -> Result<Vec<u8>, ObjectError> {
         put_u32(&mut output, mapping.source_length());
     }
     output.extend_from_slice(&strings.bytes);
+    output.resize(debug_text_offset as usize, 0);
+    output.extend_from_slice(&debug_text);
     output.resize(payload_offset as usize, 0);
     for (index, section) in object.sections().iter().enumerate() {
         if section.file_size() != 0 {
@@ -304,7 +357,14 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ObjectFile, ObjectError> {
     let debug_mapping_offset = reader.u64()?;
     let string_offset = reader.u64()?;
     let payload_offset = reader.u64()?;
-    for offset in [104u64, 112, 120] {
+    // The word at 104 was reserved and now carries the debug-text size in its
+    // low half. Its high half is still reserved, so a file that put anything
+    // there is still refused rather than quietly reinterpreted.
+    let debug_text_size = reader.u32()?;
+    if reader.u32()? != 0 {
+        return Err(ObjectError::ReservedField { offset: 108 });
+    }
+    for offset in [112u64, 120] {
         if reader.u64()? != 0 {
             return Err(ObjectError::ReservedField { offset });
         }
@@ -373,8 +433,12 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ObjectFile, ObjectError> {
         OBJECT_DEBUG_MAPPING_ENTRY_SIZE,
         "debug mapping",
     )?;
-    let expected_payload = align_up(
+    let expected_debug_text = align_up(
         checked_add(expected_string, string_size as u64, "string")?,
+        8,
+    )?;
+    let expected_payload = align_up(
+        checked_add(expected_debug_text, debug_text_size as u64, "debug text")?,
         8,
     )?;
     check_table_offset("section", section_offset, expected_section)?;
@@ -387,6 +451,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ObjectFile, ObjectError> {
         expected_debug_mapping,
     )?;
     check_table_offset("string", string_offset, expected_string)?;
+    // The debug-text region is *derived* on this side, so there is nothing to check
+    // its offset against; what is checked is that it lies inside the file, above.
     check_table_offset("payload", payload_offset, expected_payload)?;
     if payload_offset > bytes.len() as u64 {
         let needed = usize::try_from(payload_offset)
@@ -420,6 +486,36 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ObjectFile, ObjectError> {
     }
     let config = target.architecture();
     let max_name_bytes = OBJECT_MAX_MATERIALIZED_NAME_BYTES;
+    // The debug-text region begins where the string table ends, rounded up to
+    // eight. It is derived rather than stored, so a reader cannot be pointed at
+    // a region that overlaps the table.
+    let debug_text_offset = align_up(checked_add(string_offset, string_size as u64, "string")?, 8)?;
+    let debug_text_start =
+        usize::try_from(debug_text_offset).map_err(|_| ObjectError::InvalidCount {
+            table: "debug text",
+            value: debug_text_offset,
+        })?;
+    let debug_text_len =
+        usize::try_from(debug_text_size).map_err(|_| ObjectError::InvalidCount {
+            table: "debug text",
+            value: debug_text_size as u64,
+        })?;
+    let debug_text_end =
+        debug_text_start
+            .checked_add(debug_text_len)
+            .ok_or(ObjectError::Truncated {
+                offset: debug_text_start,
+                needed: debug_text_len,
+                available: bytes.len().saturating_sub(debug_text_start),
+            })?;
+    if debug_text_end > bytes.len() {
+        return Err(ObjectError::Truncated {
+            offset: bytes.len(),
+            needed: debug_text_end - bytes.len(),
+            available: 0,
+        });
+    }
+    let debug_text = &bytes[debug_text_start..debug_text_end];
     let mut name_bytes = 0usize;
     let mut string_ranges: Vec<(usize, usize)> = Vec::new();
     let mut sections = Vec::new();
@@ -656,11 +752,28 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ObjectFile, ObjectError> {
     for index in 0..debug_source_count_usize {
         let name_offset = debug_source_reader.u32()?;
         let length = debug_source_reader.u32()?;
-        if debug_source_reader.u64()? != 0 {
+        let text_offset = debug_source_reader.u32()?;
+        if debug_source_reader.u32()? != 0 {
             return Err(ObjectError::ReservedField {
-                offset: debug_source_offset + (index as u64) * 16 + 8,
+                offset: debug_source_offset + (index as u64) * 16 + 12,
             });
         }
+        let from = usize::try_from(text_offset).map_err(|_| ObjectError::InvalidCount {
+            table: "debug text",
+            value: u64::from(text_offset),
+        })?;
+        let want = usize::try_from(length).map_err(|_| ObjectError::InvalidCount {
+            table: "debug text",
+            value: u64::from(length),
+        })?;
+        let to = from
+            .checked_add(want)
+            .filter(|end| *end <= debug_text.len())
+            .ok_or(ObjectError::Truncated {
+                offset: from,
+                needed: want,
+                available: debug_text.len().saturating_sub(from),
+            })?;
         debug_sources.push(DebugSource::new(
             read_string_bounded(
                 string_bytes,
@@ -669,7 +782,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ObjectFile, ObjectError> {
                 max_name_bytes,
                 &mut string_ranges,
             )?,
-            length,
+            String::from_utf8_lossy(&debug_text[from..to]).into_owned(),
         ));
     }
     let mut debug_mappings = Vec::new();

@@ -31,8 +31,8 @@ pub use builder::{BlockBuilder, FunctionBuilder, ModuleBuilder};
 pub use error::{IrError, IrErrorKind};
 pub use ir::{
     BinaryOp, Block, BlockId, CallArg, CallTarget, ComparisonOp, ConstValue, DataSegment, Function,
-    IrModule, Linkage, MemorySpace, Module, Name, Parameter, RecordField, ReturnValue, StoreWidth,
-    Terminator, Type, UnaryOp, ValueId,
+    IrModule, Linkage, MemorySpace, Module, Name, Parameter, RecordField, ReturnValue, SourceEntry,
+    StoreWidth, Terminator, Type, UnaryOp, ValueId,
 };
 pub use ir::{Instruction, Intrinsic, LoadWidth};
 pub use verify::{

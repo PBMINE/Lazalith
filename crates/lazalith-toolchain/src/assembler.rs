@@ -1647,10 +1647,7 @@ impl<'a> Assembler<'a> {
         }
         if !self.mappings.is_empty() {
             let source = builder
-                .add_debug_source(DebugSource::new(
-                    self.source_name.clone(),
-                    self.source_length,
-                ))
+                .add_debug_source(DebugSource::new(self.source_name.clone(), self.source))
                 .map_err(ToolchainError::Object)?;
             let text = section_indices
                 .get(&SectionKey::Text)

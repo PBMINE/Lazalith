@@ -2,13 +2,13 @@ use crate::{
     MemoryError, Process, ProcessError, ProcessId, ProgramError, ProgramImage, ThreadId,
     USER_CODE_LENGTH, USER_DATA_LENGTH, USER_STACK_LENGTH,
 };
-use alloc::{collections::TryReserveError, vec::Vec};
+use alloc::{collections::TryReserveError, format, string::String, vec::Vec};
 use core::{error::Error, fmt};
 use lazalith_os_abi::ABI_VERSION;
 use lazalith_types::ArchitectureConfig;
 
 pub const LZX_MAGIC: [u8; 8] = *b"LZXLOAD1";
-pub const LZX_FORMAT_VERSION: u16 = 1;
+pub const LZX_FORMAT_VERSION: u16 = 2;
 pub const LZX_ISA_VERSION: u16 = 1;
 pub const LZX_ABI_VERSION: u16 = ABI_VERSION;
 pub const LZX_HEADER_SIZE: usize = 64;
@@ -165,6 +165,12 @@ pub struct LzxImage {
     required_data: u64,
     required_stack: u64,
     sections: Vec<LzxSection>,
+    /// The program's source-level debug information, when it was built with any.
+    ///
+    /// `None` and an empty block mean the same thing to a reader — no mappings — but
+    /// only `Some` writes a table, so an image built without debug information does
+    /// not carry the block's eight-byte header for nothing.
+    debug: Option<crate::debug::DebugBlock>,
 }
 
 impl LzxImage {
@@ -176,6 +182,31 @@ impl LzxImage {
         required_stack: u64,
         sections: Vec<LzxSection>,
     ) -> Result<Self, LzxError> {
+        Self::with_debug(
+            architecture,
+            entry_section,
+            entry_offset,
+            required_data,
+            required_stack,
+            sections,
+            None,
+        )
+    }
+
+    /// An image that also carries source-level debug information.
+    ///
+    /// The block is taken rather than built here: it is the linker's table, already
+    /// fixed up to this image's addresses, and an image that rebuilt it would be a
+    /// second derivation of the same addresses.
+    pub fn with_debug(
+        architecture: LzxArchitecture,
+        entry_section: u16,
+        entry_offset: u64,
+        required_data: u64,
+        required_stack: u64,
+        sections: Vec<LzxSection>,
+        debug: Option<crate::debug::DebugBlock>,
+    ) -> Result<Self, LzxError> {
         let image = Self {
             architecture,
             isa_version: LZX_ISA_VERSION,
@@ -185,9 +216,15 @@ impl LzxImage {
             required_data,
             required_stack,
             sections,
+            debug,
         };
         image.validate()?;
         Ok(image)
+    }
+
+    /// The image's source-level debug information, if it has any.
+    pub const fn debug(&self) -> Option<&crate::debug::DebugBlock> {
+        self.debug.as_ref()
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, LzxError> {
@@ -463,6 +500,18 @@ impl LzxImage {
             .and_then(|value| value.checked_add(u64::try_from(table_size).ok()?))
             .ok_or(LzxError::AddressOverflow)?;
         let payload_offset = align_up(table_end, 8).ok_or(LzxError::AddressOverflow)?;
+        // The debug block goes after the sections' bytes, and the last two words
+        // of the header — which used to hold a section-table offset the header
+        // already implied — carry where it is and how long it is. An image with
+        // none writes a zero length *and* a zero offset, and a reader treats that
+        // as "there is none" rather than as an empty table at some address.
+        let mut debug = Vec::new();
+        if let Some(block) = &self.debug {
+            debug
+                .try_reserve(block.encoded_length())
+                .map_err(LzxError::Allocation)?;
+            debug.extend_from_slice(&block.encode());
+        }
         let mut file_offsets = Vec::new();
         file_offsets
             .try_reserve_exact(self.sections.len())
@@ -474,6 +523,13 @@ impl LzxImage {
                 .checked_add(section.bytes.len() as u64)
                 .ok_or(LzxError::AddressOverflow)?;
         }
+        // The debug block follows the sections, so it is measured in before the
+        // file-size check rather than after: an image that carried a huge table
+        // would otherwise be written and only then found to be too big.
+        let debug_offset = next_offset;
+        next_offset = next_offset
+            .checked_add(debug.len() as u64)
+            .ok_or(LzxError::AddressOverflow)?;
         let total = usize::try_from(next_offset).map_err(|_| LzxError::FileTooLarge {
             length: next_offset,
             maximum: LZX_MAX_FILE_SIZE,
@@ -504,9 +560,26 @@ impl LzxImage {
         put_u16(&mut bytes, 0);
         put_u64(&mut bytes, self.required_data);
         put_u64(&mut bytes, self.required_stack);
-        put_u64(&mut bytes, LZX_HEADER_SIZE as u64);
+        // Bytes 44..64 of the header carry where the section table is, where the
+        // sections' bytes begin, and where the debug block went. An image with no
+        // debug information zeroes the last two words rather than leaving an
+        // offset pointing at the end of the file: "none" then reads the same in
+        // the file as it does in memory, and a reader never has to consult a
+        // length of zero to learn that an offset is meaningless.
+        // The words are 32-bit because the header is a fixed 64 bytes and the
+        // file is capped far below what a 32-bit offset cannot address.
+        let (debug_offset, debug_length) = if debug.is_empty() {
+            (0, 0)
+        } else {
+            (
+                u32::try_from(debug_offset).map_err(|_| LzxError::AddressOverflow)?,
+                u32::try_from(debug.len()).map_err(|_| LzxError::AddressOverflow)?,
+            )
+        };
         put_u32(&mut bytes, table_size_u32);
         put_u64(&mut bytes, payload_offset);
+        put_u32(&mut bytes, debug_offset);
+        put_u32(&mut bytes, debug_length);
         for (index, section) in self.sections.iter().enumerate() {
             bytes.push(section.kind as u8);
             bytes.push(section.permissions);
@@ -524,6 +597,10 @@ impl LzxImage {
         for section in &self.sections {
             bytes.extend_from_slice(&section.bytes);
         }
+        while bytes.len() < debug_offset as usize {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&debug);
         Ok(bytes)
     }
 }
@@ -567,10 +644,6 @@ pub enum LzxError {
     InvalidEntryOffset {
         offset: u64,
         code_size: u64,
-    },
-    InvalidSectionTableOffset {
-        expected: u64,
-        actual: u64,
     },
     InvalidPayloadOffset {
         expected: u64,
@@ -648,6 +721,17 @@ pub enum LzxError {
         offset: u64,
         length: u64,
     },
+    /// The image's debug block did not read.
+    ///
+    /// A separate case from a truncated file: the bytes are all there and they are
+    /// not a table, which means the file is not the image it claims to be. The
+    /// reason is carried as text because a caller that has to report this wants to
+    /// say what was wrong, and a debugger wants to know whether to offer to open
+    /// the image at all.
+    DebugBlock {
+        /// What was wrong, as the reader saw it.
+        reason: String,
+    },
     AddressOverflow,
     MissingCode,
     Allocation(TryReserveError),
@@ -695,12 +779,6 @@ impl fmt::Display for LzxError {
                 write!(
                     f,
                     "invalid .lzx entry offset {offset:#x} for code size {code_size:#x}"
-                )
-            }
-            Self::InvalidSectionTableOffset { expected, actual } => {
-                write!(
-                    f,
-                    "invalid .lzx section table offset {actual:#x}, expected {expected:#x}"
                 )
             }
             Self::InvalidPayloadOffset { expected, actual } => {
@@ -799,6 +877,9 @@ impl fmt::Display for LzxError {
             }
             Self::TrailingBytes { offset, length } => {
                 write!(f, ".lzx file has {length} trailing bytes at {offset:#x}")
+            }
+            Self::DebugBlock { reason } => {
+                write!(f, ".lzx debug block did not read: {reason}")
             }
             Self::AddressOverflow => f.write_str(".lzx arithmetic overflowed"),
             Self::MissingCode => f.write_str(".lzx image has no code section"),
@@ -1079,17 +1160,15 @@ fn parse(bytes: &[u8]) -> Result<LzxImage, LzxError> {
     }
     let required_data = cursor.read_u64()?;
     let required_stack = cursor.read_u64()?;
-    let table_offset = cursor.read_u64()?;
     let table_size = cursor.read_u32()?;
     let payload_offset = cursor.read_u64()?;
+    // Bytes 56..64 of the header were padding and now say where the debug block
+    // went. A zero length means the image carries none, which is the normal case
+    // for a program built without debug information and not an error.
+    let debug_offset = u64::from(cursor.read_u32()?);
+    let debug_length = u64::from(cursor.read_u32()?);
     let expected_table_size = u32::try_from(usize::from(section_count) * LZX_SECTION_ENTRY_SIZE)
         .map_err(|_| LzxError::AddressOverflow)?;
-    if table_offset != LZX_HEADER_SIZE as u64 {
-        return Err(LzxError::InvalidSectionTableOffset {
-            expected: LZX_HEADER_SIZE as u64,
-            actual: table_offset,
-        });
-    }
     if table_size != expected_table_size {
         return Err(LzxError::InvalidSectionTableSize {
             expected: expected_table_size,
@@ -1229,12 +1308,47 @@ fn parse(bytes: &[u8]) -> Result<LzxImage, LzxError> {
             .ok_or(LzxError::AddressOverflow)?;
         max_file_end = max_file_end.max(section_end);
     }
-    if max_file_end != input_size {
+    // The debug block sits after the sections, so the file ends after it.
+    let debug_end = if debug_length == 0 {
+        0
+    } else {
+        let end = debug_offset
+            .checked_add(debug_length)
+            .ok_or(LzxError::AddressOverflow)?;
+        if debug_offset < max_file_end || end > input_size {
+            return Err(LzxError::SectionRange {
+                index: usize::MAX,
+                offset: debug_offset,
+                size: debug_length,
+                file_size: input_size,
+            });
+        }
+        end
+    };
+    if max_file_end.max(debug_end) != input_size {
+        let end = max_file_end.max(debug_end);
         return Err(LzxError::TrailingBytes {
-            offset: max_file_end,
-            length: input_size - max_file_end,
+            offset: end,
+            length: input_size - end,
         });
     }
+    let debug = if debug_length == 0 {
+        None
+    } else {
+        let from = usize::try_from(debug_offset).map_err(|_| LzxError::AddressOverflow)?;
+        let length = usize::try_from(debug_length).map_err(|_| LzxError::AddressOverflow)?;
+        let to = from.checked_add(length).ok_or(LzxError::AddressOverflow)?;
+        let block = bytes.get(from..to).ok_or(LzxError::Truncated {
+            offset: from as u64,
+            needed: length,
+            available: bytes.len().saturating_sub(from),
+        })?;
+        Some(
+            crate::debug::DebugBlock::decode(block).map_err(|error| LzxError::DebugBlock {
+                reason: format!("{error:?}"),
+            })?,
+        )
+    };
     validate_semantics(
         architecture,
         entry_section,
@@ -1278,13 +1392,14 @@ fn parse(bytes: &[u8]) -> Result<LzxImage, LzxError> {
             bytes: section_bytes,
         });
     }
-    LzxImage::new(
+    LzxImage::with_debug(
         architecture,
         entry_section,
         entry_offset,
         required_data,
         required_stack,
         sections,
+        debug,
     )
 }
 
