@@ -8,7 +8,7 @@ mod memory;
 mod outcome;
 mod trap;
 
-pub use fault::{CpuFault, CpuFaultCause};
+pub use fault::{CpuFault, CpuFaultCause, FaultOrigin};
 pub use interpreter::ReferenceInterpreter;
 pub use memory::{CpuMemory, DataAccess, DataAccessError, DataAccessKind};
 mod registers;

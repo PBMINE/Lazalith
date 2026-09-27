@@ -107,6 +107,7 @@ dependencies = [
  "lazalith-cpu",
  "lazalith-debug",
  "lazalith-devices",
+ "lazalith-diagnostics",
  "lazalith-isa",
  "lazalith-os",
  "lazalith-runtime",
@@ -137,6 +138,7 @@ version = "0.1.0"
 dependencies = [
  "lazalith-cpu",
  "lazalith-devices",
+ "lazalith-diagnostics",
  "lazalith-isa",
  "lazalith-memory",
  "lazalith-types",

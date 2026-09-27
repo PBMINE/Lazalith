@@ -1,5 +1,11 @@
 #![no_std]
 
+/// A bug in the emulator, reported with everything a reader needs.
+///
+/// See [`bug`] for why a guest fault and an emulator bug are different things and
+/// must never be reported the same way.
+pub mod bug;
+
 extern crate alloc;
 use alloc::{format, string::String, string::ToString, sync::Arc, vec::Vec};
 use core::{error::Error, fmt};

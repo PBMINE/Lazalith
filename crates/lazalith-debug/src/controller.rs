@@ -514,6 +514,16 @@ impl<D: Device> DebugController<D> {
         result
     }
 
+    /// The machine underneath.
+    ///
+    /// A shared reference and not an owned one: a frontend that could take the machine
+    /// could drive it, and the whole point of this API is that it cannot. A caller
+    /// that needs to *ask* the machine something reads it; a caller that needs to
+    /// change it goes through a method here.
+    pub const fn machine(&self) -> &lazalith_machine::LazalithMachine<D> {
+        &self.machine
+    }
+
     /// This target's instruction size in bytes.
     ///
     /// The same number the disassembly and the breakpoint check use, so a caller that

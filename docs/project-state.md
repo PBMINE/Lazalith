@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-27 (Steps 1–79 complete and verified)
+Last updated: 2026-09-27 (Steps 1–80 complete and verified)
 
 ## Where the roadmap stands
 
@@ -26,10 +26,11 @@ Step  75      complete: machine snapshots (1caf29e)
 Step  76      complete: source-level debug information (7c0dd70)
 Step  77      complete: the SDL3 frontend (063dd76)
 Step  78      complete: the GUI controls (c42d57f)
-Step  79      complete: structured diagnostics
+Step  79      complete: structured diagnostics (e04118a)
+Step  80      complete: internal emulator error reporting
 ```
 
-The 864 workspace tests all pass, including the 4 in
+The 878 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -37,7 +38,8 @@ programs on real machines and check every panel the frontend draws, the 15 in
 `crates/lazalith-gui/tests/controls.rs` that press every control against a real
 machine, and the 13 in `crates/lazalith-gui/tests/diagnostics.rs` that run
 programs that do something wrong and check the structured diagnostics that come
-back.
+back, and the 11 in `crates/lazalith-debug/tests/bug_reports.rs` that state
+which faults are the guest's and which are ours.
 
 ## Step 79 — structured diagnostics
 
@@ -103,6 +105,49 @@ exactly the parse-a-string approach this step exists to avoid.
 `Diagnostic` also became `Clone` and comparable: its cause moved from `Box` to
 `Arc`, because a structured diagnostic that cannot be copied is one every
 consumer has to work around, and a GUI keeps several.
+
+## Step 80 — internal emulator error reporting
+
+A **guest fault** is the *program's* mistake. An **emulator bug** is *ours*. They
+look the same to a machine and are not the same to a user: the first sends them
+to their Lazen, the second sends them to this codebase.
+
+`CpuFaultCause::origin` decides it, and the split is drawn where it is
+defensible rather than where it is convenient:
+
+- The guest's: `Decode` (its bytes), `DataAccess`/`Fetch`/`Memory` (it named the
+  address), `NextPc`/`Width` (its arithmetic left the architecture's range), and
+  the four refusals that are a program doing what it may not.
+- Ours: `Instruction` and `OperandLayout` (the *decoder* is ours, and it cannot
+  produce an instruction the ISA forbids from correctly compiled code),
+  `Control`/`Outcome`/`TrapEntry` (our own state machines refusing to move), and
+  `TerminalTrap` (this machine failed to enter a trap and is now stuck).
+
+A guest cause reports **no invariant**, because there is none: a program is
+*allowed* to read an address it does not own, and inventing a rule it broke would
+report the user's bug as ours.
+
+An `EmulatorBug` carries everything the roadmap lists — subsystem, operation,
+guest program counter, instruction, address, machine state, the invariant
+violated, and the Rust file, line and column. The location is captured by
+`Location::caller()` behind `#[track_caller]`, never typed in: a hand-written
+`"src/lib.rs:412"` goes stale the moment the file is edited, and a stale line in
+a bug report sends someone to the right file and the wrong line.
+
+A report carries **no source label**, and that is deliberate. A label points into
+the *guest's* source; an emulator bug is in this codebase. Pointing a frontend's
+"jump to source" at a line of Lazen would be a lie about where the bug is, and
+the Rust location is already in the message.
+
+`LazalithMachine::last_emulator_bug` records only faults whose origin is the
+emulator's. A program reading past the end of its array must not be reported as
+a bug in Lazalith, and a guest fault is deliberately not kept there at all.
+
+`RuntimeDiagnostic` now carries a `DiagnosticKind` that the *machine* decides and
+the frontend copies. It started as a match on code strings in the GUI, which is
+the same mistake Step 79 removed everywhere else: a frontend whose correctness
+depends on the spelling of every code. The kind is a value now, and a new code
+cannot be shown as the wrong sort of thing.
 
 
 ## Step 77 — the SDL3 frontend

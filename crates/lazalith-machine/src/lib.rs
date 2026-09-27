@@ -9,10 +9,11 @@ use alloc::{boxed::Box, collections::TryReserveError, vec::Vec};
 use core::{error::Error, fmt};
 use lazalith_cpu::{
     ArchitecturalState, ControlStateError, CpuFault, CpuFaultCause, DataAccessError,
-    ExecutionContextId, OutcomeApplication, OutcomeErrorKind, ReferenceInterpreter,
+    ExecutionContextId, FaultOrigin, OutcomeApplication, OutcomeErrorKind, ReferenceInterpreter,
     SyscallCompletion, TrapAttempt, TrapCause, TrapController, TrapRequest,
 };
 use lazalith_devices::{Device, DeviceId, DeviceManager};
+use lazalith_diagnostics::bug::{EmulatorBug, Subsystem};
 use lazalith_isa::{DecodeError, InstructionError, Opcode, ValidationError, decode};
 use lazalith_memory::{
     AddressSpace, AddressSpaceSwapError, Bus, MemoryFault, MemoryFaultKind, MemoryRegion,
@@ -207,6 +208,16 @@ pub struct LazalithMachine<D: Device> {
     /// *guest's address needs the point execution would resume at, and the
     /// instruction before that is the one that trapped.
     last_trap_resume_pc: Option<InstructionAddress>,
+    /// The last fault that was the *emulator's own, reported, if any.
+    ///
+    /// A guest fault is the program's own mistake and is not kept here: it belongs to the
+    /// guest, and the debugger reports it from the trap that carried it. This is only
+    /// for a cause no guest program can reach, where the thing to report is a bug in
+    /// this machine.
+    ///
+    /// A *report* and not the fault: the fault carries a borrowed error that a stored
+    /// value cannot outlive, and the report is what a person reads anyway.
+    last_emulator_bug: Option<Box<EmulatorBug>>,
     executed: u64,
 }
 
@@ -249,6 +260,7 @@ impl<D: Device> LazalithMachine<D> {
             interrupts: InterruptController::new(),
             last_trap_fault: None,
             last_trap_resume_pc: None,
+            last_emulator_bug: None,
             executed: 0,
         })
     }
@@ -499,6 +511,7 @@ impl<D: Device> LazalithMachine<D> {
         }
         self.last_trap_fault = None;
         self.last_trap_resume_pc = None;
+        self.last_emulator_bug = None;
         self.cpu
             .trap_controller_mut()
             .set_execution_context(execution_context);
@@ -580,6 +593,15 @@ impl<D: Device> LazalithMachine<D> {
     /// See the field for why this is not the machine's program counter.
     pub const fn last_trap_resume_pc(&self) -> Option<InstructionAddress> {
         self.last_trap_resume_pc
+    }
+
+    /// The last fault that was the emulator's own, or `None`.
+    ///
+    /// A fault whose cause is a guest's is deliberately not returned: a program that
+    /// read an address it does not own is not an emulator bug, and a debugger that
+    /// found one here would report every out-of-bounds read as a bug in Lazalith.
+    pub fn last_emulator_bug(&self) -> Option<&EmulatorBug> {
+        self.last_emulator_bug.as_deref()
     }
 
     pub fn last_trap_fault(&self) -> Option<&CpuFault<MemoryFault>> {
@@ -688,6 +710,21 @@ impl<D: Device> LazalithMachine<D> {
             }
             Err(failure) => {
                 self.state = MachineState::Faulted;
+                // A fault that stopped the trap from being entered is recorded
+                // before the attempt is looked for, because a trap that failed to
+                // enter *and* failed to be described would leave a debugger with
+                // nothing to report at all.
+                if failure.origin() == FaultOrigin::Emulator {
+                    self.last_emulator_bug = Some(Box::new(
+                        EmulatorBug::with_site(
+                            Subsystem::MACHINE,
+                            "entering a trap",
+                            failure.cause.invariant(),
+                            failure.site,
+                        )
+                        .at(failure.pc.as_u64()),
+                    ));
+                }
                 let attempt = self
                     .cpu
                     .trap_controller()

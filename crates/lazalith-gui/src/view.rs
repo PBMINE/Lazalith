@@ -387,26 +387,12 @@ impl Diagnostic {
     /// to find a number, and nothing is dropped — a stack trace the machine took
     /// the trouble to verify reaches the panel intact.
     pub fn from_runtime(diagnostic: &lazalith_debug::diagnostic::RuntimeDiagnostic) -> Self {
-        use lazalith_debug::diagnostic::RuntimeDiagnostic as Runtime;
-        let kind = match diagnostic.code().as_str() {
-            code if code == lazalith_debug::diagnostic::GUEST_TRAP
-                || code == lazalith_debug::diagnostic::GUEST_SYSCALL_FAULT
-                || code == lazalith_debug::diagnostic::GUEST_FAULT =>
-            {
-                DiagnosticKind::GuestFault
-            }
-            code if code == lazalith_debug::diagnostic::STACK_UNREADABLE => {
-                DiagnosticKind::Frontend
-            }
-            _ => DiagnosticKind::Frontend,
-        };
-        // A runtime diagnostic's label points at a span in the *image's* source,
-        // which the controller can resolve. The frontend asks rather than
-        // resolving it itself, because the sources live in the debug block and a
-        // second copy of them here would be a second thing to keep in step.
-        let _ = Runtime::severity(diagnostic);
         Self {
-            kind,
+            // The machine decided what sort of thing this is, and copying it is the
+            // whole point: a frontend that worked the kind out by matching a code
+            // string would depend on the spelling of every code, and a new one would
+            // silently be shown as the wrong sort of thing.
+            kind: DiagnosticKind::from(diagnostic.kind),
             code: String::from(diagnostic.code().as_str()),
             message: String::from(diagnostic.message()),
             source: None,
@@ -437,6 +423,16 @@ pub enum DiagnosticKind {
     /// The program reported a diagnostic of its own, such as a compile error in a
     /// source file someone is looking at.
     GuestReport,
+}
+
+impl From<lazalith_debug::diagnostic::DiagnosticKind> for DiagnosticKind {
+    fn from(kind: lazalith_debug::diagnostic::DiagnosticKind) -> Self {
+        match kind {
+            lazalith_debug::diagnostic::DiagnosticKind::GuestFault => Self::GuestFault,
+            lazalith_debug::diagnostic::DiagnosticKind::EmulatorBug => Self::EmulatorBug,
+            lazalith_debug::diagnostic::DiagnosticKind::Frontend => Self::Frontend,
+        }
+    }
 }
 
 impl DiagnosticKind {

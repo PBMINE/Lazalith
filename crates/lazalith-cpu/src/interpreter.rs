@@ -138,14 +138,14 @@ impl ReferenceInterpreter {
             cause,
             TrapCause::Syscall | TrapCause::SoftwareTrap | TrapCause::ExternalInterrupt
         ) {
-            return Err(CpuFault {
-                pc: self.architectural.pc(),
-                opcode: None,
-                cause: Cause::Control(ControlStateError::InvalidControlState {
+            return Err(CpuFault::at(
+                self.architectural.pc(),
+                None,
+                Cause::Control(ControlStateError::InvalidControlState {
                     operation: "invalid fault cause",
                     selector: 0,
                 }),
-            });
+            ));
         }
         self.enter_event(memory, cause, 0, resume_pc)
     }
@@ -178,25 +178,21 @@ impl ReferenceInterpreter {
         resume_pc: InstructionAddress,
     ) -> Result<(), CpuFault<M::Error>> {
         if self.traps.is_terminal() {
-            return Err(CpuFault {
-                pc: self.architectural.pc(),
-                opcode: None,
-                cause: Cause::TerminalTrap,
-            });
+            return Err(CpuFault::at(
+                self.architectural.pc(),
+                None,
+                Cause::TerminalTrap,
+            ));
         }
         if self.execution == ExecutionState::Halted {
-            return Err(CpuFault {
-                pc: self.architectural.pc(),
-                opcode: None,
-                cause: Cause::Halted,
-            });
+            return Err(CpuFault::at(self.architectural.pc(), None, Cause::Halted));
         }
         if self.traps.has_active_frame() {
-            return Err(CpuFault {
-                pc: self.architectural.pc(),
-                opcode: None,
-                cause: Cause::DeferredInterrupt,
-            });
+            return Err(CpuFault::at(
+                self.architectural.pc(),
+                None,
+                Cause::DeferredInterrupt,
+            ));
         }
         self.enter_event(
             memory,
@@ -213,11 +209,7 @@ impl ReferenceInterpreter {
         payload: u64,
         resume_pc: InstructionAddress,
     ) -> Result<(), CpuFault<M::Error>> {
-        let fault = |cause| CpuFault {
-            pc: self.architectural.pc(),
-            opcode: None,
-            cause,
-        };
+        let fault = |cause| CpuFault::at(self.architectural.pc(), None, cause);
         if self.execution == ExecutionState::Halted {
             if !self.traps.is_terminal() {
                 self.traps
@@ -274,11 +266,7 @@ impl ReferenceInterpreter {
     }
 
     fn validate_fetch<E>(&self) -> Result<(), CpuFault<E>> {
-        let fault = |cause| CpuFault {
-            pc: self.architectural.pc(),
-            opcode: None,
-            cause,
-        };
+        let fault = |cause| CpuFault::at(self.architectural.pc(), None, cause);
         if self.traps.is_terminal() {
             return Err(fault(Cause::TerminalTrap));
         }
@@ -305,11 +293,7 @@ impl ReferenceInterpreter {
                 self.architectural.pc(),
                 self.architectural.privilege(),
             )
-            .map_err(|source| CpuFault {
-                pc: self.architectural.pc(),
-                opcode: None,
-                cause: Cause::Fetch(source),
-            })?;
+            .map_err(|source| CpuFault::at(self.architectural.pc(), None, Cause::Fetch(source)))?;
         self.step_bytes(&bytes, memory)
     }
 
@@ -319,12 +303,13 @@ impl ReferenceInterpreter {
         memory: &mut M,
     ) -> Result<OutcomeApplication, CpuFault<M::Error>> {
         self.validate_fetch()?;
-        let instruction =
-            decode(self.architectural.config(), bytes).map_err(|source| CpuFault {
-                pc: self.architectural.pc(),
-                opcode: bytes.first().copied(),
-                cause: Cause::Decode(source),
-            })?;
+        let instruction = decode(self.architectural.config(), bytes).map_err(|source| {
+            CpuFault::at(
+                self.architectural.pc(),
+                bytes.first().copied(),
+                Cause::Decode(source),
+            )
+        })?;
         self.execute(&instruction, memory)
     }
 
@@ -339,11 +324,7 @@ impl ReferenceInterpreter {
         })?;
         let pc = self.architectural.pc();
         let opcode = instruction.opcode();
-        let fault = |cause| CpuFault {
-            pc,
-            opcode: Some(opcode.as_u8()),
-            cause,
-        };
+        let fault = |cause| CpuFault::at(pc, Some(opcode.as_u8()), cause);
         let config = self.architectural.config();
         let width = config.word_width();
         instruction

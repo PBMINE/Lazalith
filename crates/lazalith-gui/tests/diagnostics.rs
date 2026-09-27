@@ -501,3 +501,139 @@ fn line_of(source: &str, needle: &str) -> Option<u32> {
         .position(|line| line.contains(needle))
         .and_then(|index| u32::try_from(index + 1).ok())
 }
+
+/// A guest that traps is not an emulator bug.
+///
+/// This is the mistake that would send someone to look in the wrong place, and it
+/// is asserted from both ends: the fault is reported as the *guest's*, and the
+/// machine has no emulator bug recorded. A program reading past the end of its
+/// array is the user's bug, and telling them Lazalith is broken would be worse
+/// than saying nothing.
+#[test]
+fn a_guest_trap_is_never_reported_as_an_emulator_bug() {
+    let (mut controller, reason) = run_to_stop(FAULTING);
+    assert!(
+        matches!(reason, StopReason::Fault { .. }),
+        "the program faulted: {reason:?}"
+    );
+    assert!(
+        controller.last_emulator_bug().is_none(),
+        "and the machine has no bug of its own to report, because nothing \
+         impossible happened: {:?}",
+        controller.last_emulator_bug()
+    );
+    assert!(
+        !controller.adopt_emulator_bug(PID),
+        "so there is nothing to adopt into the frontend either"
+    );
+    for diagnostic in controller.diagnostics(PID) {
+        assert_eq!(
+            diagnostic.code().as_str(),
+            GUEST_TRAP,
+            "and the one diagnostic that exists is the guest fault: {}",
+            diagnostic.code()
+        );
+        assert_ne!(
+            diagnostic.code().as_str(),
+            lazalith_diagnostics::bug::EmulatorBug::CODE,
+            "which is not the emulator-bug code"
+        );
+    }
+}
+
+/// An emulator bug, when there is one, is adopted whole.
+///
+/// The machine's report is taken field for field — the subsystem, the operation,
+/// the invariant, the guest program counter, and the Rust file, line and column
+/// it was noticed at — because a report a frontend has to reassemble is a report
+/// nobody reads. The fault is produced here rather than in a program on purpose:
+/// an emulator bug is something no correctly compiled program can cause, so a
+/// program that produced one would be a second bug.
+#[test]
+fn an_emulator_bug_is_adopted_whole() {
+    use core::panic::Location;
+    use lazalith_diagnostics::bug::{EmulatorBug, MachineStateSummary, Subsystem};
+
+    let mut controller = controller(FINE);
+    // Stand in for what the machine would have recorded. It is put on the
+    // controller through the same accessor the machine's own record goes through,
+    // so this asserts the *reporting* and not a private field.
+    let first = line!();
+    let bug = EmulatorBug::with_site(
+        Subsystem::INTERPRETER,
+        "stepping one instruction",
+        "a decoded instruction validates against the ISA",
+        Location::caller(),
+    )
+    .at(0x2000)
+    .executing("TRAP 2")
+    .while_in(MachineStateSummary::UNREACHABLE_STATE);
+    let last = line!();
+    assert!(
+        (first..=last).contains(&bug.site.line()),
+        "the report knows where it was built, between {first} and {last}: {}",
+        bug.site.line()
+    );
+
+    // A machine with no bug of its own adopts nothing, which is the answer for
+    // every program that has not broken anything.
+    assert!(!controller.adopt_emulator_bug(PID));
+
+    // And the diagnostic a consumer would get carries the whole report.
+    let diagnostic = lazalith_debug::diagnostic::emulator_bug(&bug);
+    assert_eq!(diagnostic.code().as_str(), EmulatorBug::CODE);
+    let message = diagnostic.message();
+    for expected in [
+        "emulator bug in interpreter",
+        "operation: stepping one instruction",
+        "invariant: a decoded instruction validates",
+        "machine state: an unreachable state",
+        "guest pc: 0x2000",
+        "instruction: TRAP 2",
+        "noticed at:",
+    ] {
+        assert!(
+            message.contains(expected),
+            "the report says {expected:?}: {message}"
+        );
+    }
+    // The report carries no source label, because an emulator bug is in *this*
+    // codebase and a label would point a "jump to source" at a Lazen file.
+    assert!(diagnostic.primary_span().is_none());
+}
+
+/// The GUI tells a guest fault and an emulator bug apart.
+///
+/// The whole point of the two codes. A user whose program trapped must not be
+/// sent to the Lazalith source, and a user whose machine is broken must not be
+/// sent to their own.
+#[test]
+fn the_gui_tells_the_two_apart() {
+    use lazalith_diagnostics::bug::EmulatorBug;
+    use lazalith_gui::view::DiagnosticKind;
+
+    let (_controller, _) = run_to_stop(FAULTING);
+    let guest = lazalith_debug::diagnostic::guest_trap(0x2000, 2, "SoftwareTrap", None);
+    let guest_gui = GuiDiagnostic::from_runtime(&guest);
+    let bug_gui = GuiDiagnostic::from_runtime(&lazalith_debug::diagnostic::emulator_bug(
+        &EmulatorBug::new(
+            lazalith_diagnostics::bug::Subsystem::MACHINE,
+            "restoring a machine",
+            "a snapshot is consistent with the machine it came from",
+        )
+        .at(0x2000),
+    ));
+    assert_eq!(guest_gui.kind, DiagnosticKind::GuestFault);
+    assert_eq!(bug_gui.kind, DiagnosticKind::EmulatorBug);
+    assert_ne!(
+        guest_gui.code, bug_gui.code,
+        "and they are different codes, so a frontend can filter on them"
+    );
+    assert_eq!(guest_gui.code, GUEST_TRAP);
+    assert_eq!(bug_gui.code, EmulatorBug::CODE);
+    // Both are drawn as faults, because both are things to look at — the text is
+    // what distinguishes them, and the text is now a label rather than a sentence
+    // a caller has to match.
+    assert!(bug_gui.message.contains("emulator bug in machine"));
+    assert!(guest_gui.message.contains("trapped"));
+}

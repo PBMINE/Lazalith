@@ -47,6 +47,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use lazalith_diagnostics::bug::EmulatorBug;
 use lazalith_diagnostics::{Diagnostic, DiagnosticCode, Label, Severity};
 use lazalith_isa::Opcode;
 use lazalith_os::debug::SourceLocation;
@@ -108,6 +109,28 @@ pub struct RuntimeDiagnostic {
     /// Stated so a short trace is legible: a user looking at one frame should be
     /// able to tell whether there was one frame or whether the scan stopped.
     pub words_examined: usize,
+    /// What sort of thing this is.
+    ///
+    /// Decided *here*, by whoever built the diagnostic, and not by the consumer. A
+    /// frontend that worked the kind out by matching a code string would be a
+    /// frontend whose correctness depends on the spelling of every code, and a new
+    /// code would silently be shown as the wrong sort of thing.
+    pub kind: DiagnosticKind,
+}
+
+/// What sort of thing a diagnostic is about.
+///
+/// The three cases a debugger must never confuse: the *program's mistake, *our*
+/// mistake, and a frontend that could not read something. They look different to
+/// a user because they send them to different places to look.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticKind {
+    /// The guest program did something the machine had to refuse.
+    GuestFault,
+    /// The emulator found something its own rules say is impossible.
+    EmulatorBug,
+    /// The frontend could not do what it was asked.
+    Frontend,
 }
 
 /// One frame of a call chain.
@@ -205,6 +228,7 @@ pub fn guest_trap(
         guest_pc: Some(pc),
         instruction: None,
         frames: Vec::new(),
+        kind: DiagnosticKind::GuestFault,
         words_examined: 0,
     }
 }
@@ -221,6 +245,60 @@ pub fn guest_syscall_fault(detail: &str, pc: u64) -> RuntimeDiagnostic {
         instruction: None,
         frames: Vec::new(),
         words_examined: 0,
+        kind: DiagnosticKind::GuestFault,
+    }
+}
+
+/// Builds a diagnostic for a fault that is the *emulator's*.
+///
+/// This is the other half of the distinction: a guest trap is the program's
+/// mistake and says so, and this is ours.
+///
+/// The whole report becomes the message — subsystem, operation, invariant,
+/// machine state, guest program counter, instruction, address, and the file, line
+/// and column it was noticed at — so a frontend that shows this shows a bug
+/// report rather than a summary that has to be chased down afterwards.
+///
+/// It carries **no source label**, and that is deliberate. A source label points
+/// into the *guest's* source, and an emulator bug is not in the guest's source; it
+/// is in this codebase. Pointing a frontend's "jump to source" at a line of Lazen
+/// because a machine invariant was violated would be a lie about where the bug
+/// is, and the Rust location is already in the message where it belongs.
+pub fn emulator_bug(bug: &EmulatorBug) -> RuntimeDiagnostic {
+    RuntimeDiagnostic {
+        diagnostic: bug.as_diagnostic(),
+        guest_pc: bug.guest_pc,
+        instruction: bug.instruction.clone(),
+        frames: Vec::new(),
+        words_examined: 0,
+        kind: DiagnosticKind::EmulatorBug,
+    }
+}
+
+impl<D: Device> DebugController<D> {
+    /// The last fault that was the *emulator's* rather than the guest's.
+    ///
+    /// `None` for a program that has done nothing impossible, and `None` for a
+    /// guest fault too: a program reading an address it does not own is the
+    /// program's mistake, and reporting it here would tell someone their own bug
+    /// is ours.
+    pub fn last_emulator_bug(&self) -> Option<&EmulatorBug> {
+        self.machine().last_emulator_bug()
+    }
+
+    /// Records the machine's last emulator bug, if it has one, and says so.
+    ///
+    /// A host calls this once it has a frontend to show the report in. It is not
+    /// automatic, because recording a bug for a machine nobody is watching would
+    /// grow a session's history for nobody — and a debugger that reported a
+    /// machine's last bug from a year ago would be reporting something that may
+    /// have been fixed since.
+    pub fn adopt_emulator_bug(&mut self, process: ProcessId) -> bool {
+        let Some(bug) = self.machine().last_emulator_bug().map(emulator_bug) else {
+            return false;
+        };
+        self.record_diagnostic(process, bug);
+        true
     }
 }
 
@@ -384,5 +462,6 @@ pub fn guest_stack_unreadable(sp: u64) -> RuntimeDiagnostic {
         instruction: None,
         frames: Vec::new(),
         words_examined: 0,
+        kind: DiagnosticKind::Frontend,
     }
 }
