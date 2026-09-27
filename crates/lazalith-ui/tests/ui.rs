@@ -105,6 +105,13 @@ fn run(source: &str, events: &[Event]) -> (LazalithKernel, Option<u32>) {
                 break;
             }
             Some(KernelServiceOutcome::Fault(error)) => panic!("the program faulted: {error:?}"),
+            Some(KernelServiceOutcome::GuestTrap { cause, payload }) => {
+                panic!(
+                    "the program trapped ({cause:?}, payload {payload}) at {:#x}",
+                    machine.architectural_state().pc().as_u64()
+                )
+            }
+
             Some(KernelServiceOutcome::Return(_)) | None => {}
         }
     }

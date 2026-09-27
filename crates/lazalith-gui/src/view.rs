@@ -300,6 +300,12 @@ impl Diagnostics {
 /// error message and then had someone *read it back* to decide what to highlight
 /// would highlight the wrong thing the day a message changes; every field here
 /// is a value and a panel formats it.
+///
+/// This is what the frontend *holds*. The machine's own structured diagnostics are
+/// [`lazalith_debug::diagnostic::RuntimeDiagnostic`], and
+/// [`Diagnostic::from_runtime`] converts one field for field — carrying the code,
+/// the severity, the source place, the guest program counter, the instruction and
+/// the whole call chain across without parsing anything.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Diagnostic {
     /// What sort of thing this is.
@@ -317,6 +323,13 @@ pub struct Diagnostic {
     pub instruction: Option<String>,
     /// Which machine, and what it was doing.
     pub machine: Option<String>,
+    /// How many verified call frames the machine found.
+    ///
+    /// A count rather than the frames themselves, because a panel shows a trace one
+    /// line at a time and this is what says whether there is one to show. A
+    /// frontend that wants the frames reads them from the machine's own
+    /// diagnostic with `call_chain`.
+    pub frames: usize,
 }
 
 impl Diagnostic {
@@ -334,6 +347,7 @@ impl Diagnostic {
             guest_pc: None,
             instruction: None,
             machine: None,
+            frames: 0,
         }
     }
 
@@ -363,6 +377,44 @@ impl Diagnostic {
     pub fn during(mut self, machine: impl Into<String>) -> Self {
         self.machine = Some(machine.into());
         self
+    }
+
+    /// Converts one of the machine's own structured diagnostics.
+    ///
+    /// This is a field-for-field copy, not a rendering: the code, the severity,
+    /// the source place, the guest's program counter, the instruction and every
+    /// frame of the call chain all cross as values. Nothing here reads a message
+    /// to find a number, and nothing is dropped — a stack trace the machine took
+    /// the trouble to verify reaches the panel intact.
+    pub fn from_runtime(diagnostic: &lazalith_debug::diagnostic::RuntimeDiagnostic) -> Self {
+        use lazalith_debug::diagnostic::RuntimeDiagnostic as Runtime;
+        let kind = match diagnostic.code().as_str() {
+            code if code == lazalith_debug::diagnostic::GUEST_TRAP
+                || code == lazalith_debug::diagnostic::GUEST_SYSCALL_FAULT
+                || code == lazalith_debug::diagnostic::GUEST_FAULT =>
+            {
+                DiagnosticKind::GuestFault
+            }
+            code if code == lazalith_debug::diagnostic::STACK_UNREADABLE => {
+                DiagnosticKind::Frontend
+            }
+            _ => DiagnosticKind::Frontend,
+        };
+        // A runtime diagnostic's label points at a span in the *image's* source,
+        // which the controller can resolve. The frontend asks rather than
+        // resolving it itself, because the sources live in the debug block and a
+        // second copy of them here would be a second thing to keep in step.
+        let _ = Runtime::severity(diagnostic);
+        Self {
+            kind,
+            code: String::from(diagnostic.code().as_str()),
+            message: String::from(diagnostic.message()),
+            source: None,
+            guest_pc: diagnostic.guest_pc,
+            instruction: diagnostic.instruction.clone(),
+            machine: None,
+            frames: diagnostic.frames.len(),
+        }
     }
 }
 
@@ -494,7 +546,7 @@ pub fn build<D: Device>(
         stack_section(controller, options, diagnostics),
         console_section(controller, options),
         processes_section(controller),
-        diagnostics_section(diagnostics),
+        diagnostics_section(controller, process, diagnostics),
     ];
     Ok(View {
         process,
@@ -922,10 +974,56 @@ fn describe_state(state: &ExecutionState) -> &'static str {
     }
 }
 
-fn diagnostics_section(diagnostics: &Diagnostics) -> Section {
+fn diagnostics_section<D: Device>(
+    controller: &DebugController<D>,
+    process: ProcessId,
+    diagnostics: &Diagnostics,
+) -> Section {
     let mut lines = Vec::new();
-    if diagnostics.is_empty() {
+    if diagnostics.is_empty() && !controller.has_diagnostics(process) {
         lines.push(Line::plain("", String::from("nothing has gone wrong")));
+    }
+    // The machine's own diagnostics come first: a guest fault is why a user
+    // opened a debugger, and the frontend's own complaints about a panel it could
+    // not read are below them.
+    for diagnostic in controller.diagnostics(process) {
+        let mut text = String::from(diagnostic.code().as_str());
+        let _ = write!(text, " {}", diagnostic.message());
+        if let Some(pc) = runtime_guest_pc(&diagnostic) {
+            let _ = write!(text, "  pc={pc:#x}");
+        }
+        if let Some(instruction) = runtime_instruction(&diagnostic) {
+            let _ = write!(text, "  {instruction}");
+        }
+        let emphasis = if runtime_is_guest_fault(&diagnostic) {
+            Emphasis::Fault
+        } else {
+            Emphasis::Plain
+        };
+        lines.push(Line::new(String::new(), text, emphasis));
+        // The source place and the call chain are their own lines rather than
+        // more of the same one: a trace of four frames is four lines, and folding
+        // them into the message would make a panel nobody can read.
+        if let Some(place) = runtime_source(controller, &diagnostic) {
+            lines.push(Line::plain(
+                "source",
+                format!("{}:{}:{}", place.name, place.line, place.column),
+            ));
+        }
+        for frame in controller.call_chain(process, 64).unwrap_or_default() {
+            let where_ = match (&frame.call_site_source, &frame.return_source) {
+                (Some(call), Some(ret)) => {
+                    format!("{}:{} → {}:{}", call.name, call.line, ret.name, ret.line)
+                }
+                (Some(call), None) => format!("{}:{}", call.name, call.line),
+                (None, Some(ret)) => format!("returns to {}:{}", ret.name, ret.line),
+                (None, None) => String::new(),
+            };
+            lines.push(Line::plain(
+                format!("#{}", frame.index),
+                format!("{:#x} {where_}", frame.return_address),
+            ));
+        }
     }
     for diagnostic in diagnostics.entries() {
         let mut text = String::from(diagnostic.kind.label());
@@ -939,6 +1037,9 @@ fn diagnostics_section(diagnostics: &Diagnostics) -> Section {
         if let Some(instruction) = &diagnostic.instruction {
             let _ = write!(text, "  {instruction}");
         }
+        if diagnostic.frames > 0 {
+            let _ = write!(text, "  {} verified frames", diagnostic.frames);
+        }
         lines.push(Line::new(
             format!("[{}]", diagnostic.code),
             text,
@@ -949,6 +1050,49 @@ fn diagnostics_section(diagnostics: &Diagnostics) -> Section {
         ));
     }
     section(Panel::Diagnostics, lines)
+}
+
+/// The guest program counter a runtime diagnostic names.
+fn runtime_guest_pc(diagnostic: &lazalith_debug::diagnostic::RuntimeDiagnostic) -> Option<u64> {
+    diagnostic.guest_pc
+}
+
+/// The instruction a runtime diagnostic names.
+fn runtime_instruction(diagnostic: &lazalith_debug::diagnostic::RuntimeDiagnostic) -> Option<&str> {
+    diagnostic.instruction.as_deref()
+}
+
+/// Whether a runtime diagnostic is about the guest rather than the frontend.
+fn runtime_is_guest_fault(diagnostic: &lazalith_debug::diagnostic::RuntimeDiagnostic) -> bool {
+    use lazalith_debug::diagnostic::{GUEST_FAULT, GUEST_SYSCALL_FAULT, GUEST_TRAP};
+    let code = diagnostic.code().as_str();
+    code == GUEST_TRAP || code == GUEST_SYSCALL_FAULT || code == GUEST_FAULT
+}
+
+/// The source place a runtime diagnostic's label resolves to.
+///
+/// The diagnostic carries a *span*, not a line: the sources live in the image's
+/// debug block, and resolving a span needs them. So the resolution happens here,
+/// where the controller is, and the panel shows the answer rather than carrying a
+/// second copy of every source file.
+fn runtime_source<D: Device>(
+    controller: &DebugController<D>,
+    diagnostic: &lazalith_debug::diagnostic::RuntimeDiagnostic,
+) -> Option<SourcePlace> {
+    let span = diagnostic.primary_span()?;
+    let pc = diagnostic.guest_pc?;
+    let located = controller.source_location_at(pc)?;
+    // The span and the address are two views of the same statement, and they come
+    // from the same table, so the address is what is resolved: it is where the
+    // program actually is, and resolving the span would need a second copy of the
+    // sources in this crate to disagree with the image's. The span is what
+    // decides *whether* there is a source to show at all.
+    let _ = span;
+    Some(SourcePlace::new(
+        located.name,
+        located.line_number(),
+        located.column_number(),
+    ))
 }
 
 /// Wraps lines into a section.

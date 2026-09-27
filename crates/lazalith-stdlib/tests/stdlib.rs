@@ -104,6 +104,12 @@ fn run_reporting(source: &str) -> (String, Option<u32>, LazalithKernel) {
                 break;
             }
             Some(KernelServiceOutcome::Fault(error)) => panic!("the program faulted: {error:?}"),
+            Some(KernelServiceOutcome::GuestTrap { cause, payload }) => {
+                panic!(
+                    "the program trapped ({cause:?}, payload {payload}) at {:#x}",
+                    machine.architectural_state().pc().as_u64()
+                )
+            }
             Some(KernelServiceOutcome::Return(_)) | None => {}
         }
     }
@@ -1076,6 +1082,12 @@ fn run_with_script(source: &str, script: lazalith_devices::HostScript) -> (Strin
                 break;
             }
             Some(KernelServiceOutcome::Fault(error)) => panic!("the program faulted: {error:?}"),
+            Some(KernelServiceOutcome::GuestTrap { cause, payload }) => {
+                panic!(
+                    "the program trapped ({cause:?}, payload {payload}) at {:#x}",
+                    machine.architectural_state().pc().as_u64()
+                )
+            }
             Some(KernelServiceOutcome::Return(_)) | None => {}
         }
     }

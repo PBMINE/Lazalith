@@ -200,6 +200,13 @@ pub struct LazalithMachine<D: Device> {
     state: MachineState,
     interrupts: InterruptController,
     last_trap_fault: Option<Box<CpuFault<MemoryFault>>>,
+    /// The resume point of the last trap that was entered, or `None`.
+    ///
+    /// This is *not* the machine's program counter: a trapped machine is in the
+    /// kernel's trap frame, so its `pc` is the trap vector. A caller that wants the
+    /// *guest's address needs the point execution would resume at, and the
+    /// instruction before that is the one that trapped.
+    last_trap_resume_pc: Option<InstructionAddress>,
     executed: u64,
 }
 
@@ -241,6 +248,7 @@ impl<D: Device> LazalithMachine<D> {
             state: MachineState::Created,
             interrupts: InterruptController::new(),
             last_trap_fault: None,
+            last_trap_resume_pc: None,
             executed: 0,
         })
     }
@@ -490,6 +498,7 @@ impl<D: Device> LazalithMachine<D> {
             return Err(MachineError::AddressSpaceSwap(error));
         }
         self.last_trap_fault = None;
+        self.last_trap_resume_pc = None;
         self.cpu
             .trap_controller_mut()
             .set_execution_context(execution_context);
@@ -566,6 +575,13 @@ impl<D: Device> LazalithMachine<D> {
     pub const fn interrupts(&self) -> &InterruptController {
         &self.interrupts
     }
+    /// The resume point of the last trap that was entered, or `None` if none has.
+    ///
+    /// See the field for why this is not the machine's program counter.
+    pub const fn last_trap_resume_pc(&self) -> Option<InstructionAddress> {
+        self.last_trap_resume_pc
+    }
+
     pub fn last_trap_fault(&self) -> Option<&CpuFault<MemoryFault>> {
         self.last_trap_fault.as_deref()
     }
@@ -662,6 +678,7 @@ impl<D: Device> LazalithMachine<D> {
         match result {
             Ok(()) => {
                 self.last_trap_fault = original.map(Box::new);
+                self.last_trap_resume_pc = Some(resume_pc);
                 Ok(TrapEvent {
                     cause,
                     payload,

@@ -1,8 +1,7 @@
 #![no_std]
 
 extern crate alloc;
-
-use alloc::{boxed::Box, format, string::String, vec::Vec};
+use alloc::{format, string::String, string::ToString, sync::Arc, vec::Vec};
 use core::{error::Error, fmt};
 use lazalith_types::{InvalidSpan, SourceManager, SourceSpan};
 
@@ -142,12 +141,18 @@ impl Help {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Diagnostic {
     severity: Severity,
     code: DiagnosticCode,
     message: String,
-    cause: Option<Box<dyn Error + Send + Sync>>,
+    /// The underlying error, shared rather than owned.
+    ///
+    /// An `Arc` and not a `Box`, because a diagnostic is a *value* that a
+    /// frontend keeps, copies into a panel, and hands to a callback — and a type
+    /// that cannot be copied is a type every consumer has to work around. The
+    /// error itself is immutable once recorded, so sharing it costs nothing.
+    cause: Option<Arc<dyn Error + Send + Sync>>,
     labels: Vec<Label>,
     notes: Vec<Note>,
     help: Vec<Help>,
@@ -167,7 +172,7 @@ impl Diagnostic {
     }
 
     pub fn with_cause(mut self, cause: impl Error + Send + Sync + 'static) -> Self {
-        self.cause = Some(Box::new(cause));
+        self.cause = Some(Arc::new(cause));
         self
     }
 
@@ -381,6 +386,28 @@ pub fn render_plain(
     }
     Ok(output)
 }
+
+/// Two diagnostics are equal when everything a consumer can see is equal.
+///
+/// The cause is compared by its rendered text rather than by identity. A cause is
+/// a `dyn Error` and so has no equality of its own, and two diagnostics that
+/// report the same underlying error are the same diagnostic to anything reading
+/// them — a test that asserted otherwise would be asserting that two separate
+/// `WidthError` values differed, which says nothing about a diagnostic.
+impl PartialEq for Diagnostic {
+    fn eq(&self, other: &Self) -> bool {
+        self.severity == other.severity
+            && self.code == other.code
+            && self.message == other.message
+            && self.labels == other.labels
+            && self.notes == other.notes
+            && self.help == other.help
+            && self.cause.as_ref().map(ToString::to_string)
+                == other.cause.as_ref().map(ToString::to_string)
+    }
+}
+
+impl Eq for Diagnostic {}
 
 #[cfg(test)]
 mod tests {

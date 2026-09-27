@@ -647,3 +647,58 @@ fn a_repeated_array_fills_every_element_at_any_size() {
     );
     assert_eq!(output, "ok");
 }
+
+/// A program may declare a function whose name is also an ABI syscall.
+///
+/// Two bugs hid behind this one line of ordinary Lazen. First, a path with
+/// module segments fell through to the root module's items, so `fn read` in a
+/// program made every `std::io::input::read` *inside the standard library*
+/// resolve to the program's own function and the library failed to compile with
+/// an argument-count error pointing at its own source. Second, the IR keeps
+/// every function in one namespace, so the program's `read` and the ABI's `read`
+/// were the same name and the module builder refused the second one.
+///
+/// The program here calls the syscall-wrapping library, so a regression in either
+/// fix fails here rather than in a name-resolution unit test that would never
+/// have the prelude in it.
+#[test]
+fn a_function_may_share_a_name_with_an_abi_syscall() {
+    let (output, code) = build_and_run(
+        "fn read(byte: u8) -> u8 {\n    return byte + 1u8;\n}\n\
+         fn main() -> i32 {\n    let value: u8 = read(41u8);\n    rt::sys::print(\"\");\n    return 0;\n}\n",
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "the program built and ran to its own exit: {output:?}"
+    );
+}
+
+/// The same, through the standard library's own `read` wrapper.
+///
+/// The library's `std::fs::read` is a thin wrapper over the syscall, and its call
+/// site is the line the name-resolution bug broke — so reaching it is what
+/// proves the fix, rather than merely building a program with a `read` in it.
+#[test]
+fn the_standard_library_still_compiles_under_a_name_that_collides() {
+    let program = RuntimeProgram::build(
+        r#"fn read(byte: u8) -> u8 {
+    return byte + 1u8;
+}
+
+fn main() -> i32 {
+    let mut buffer: [u8; 8] = [0u8; 8];
+    let mut count: [u8; 8] = [0u8; 8];
+
+    let got: i64 = std::fs::read(0u32, buffer.as_mut_slice(), count.as_mut_slice());
+    if got == 0i64 { rt::sys::print(""); }
+    return 0;
+}
+"#,
+        &BuildOptions::lz64("test.lz"),
+    )
+    .unwrap_or_else(|error| panic!("a program with a `read` should build: {error}"));
+    // Only the build matters here: the point is that the library's own call
+    // sites still resolve with a colliding name in the program.
+    let _ = program.link().expect("and it links");
+}

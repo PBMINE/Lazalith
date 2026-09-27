@@ -98,7 +98,7 @@ impl Windowed {
         self.window.size_hint()
     }
 
-    /// Whether the machine's screen texture matches the view's.
+    /// Whether the screen texture matches the geometry of the view it holds.
     fn screen_texture_matches(&self, view: &View) -> bool {
         self.screen.is_some() && self.screen_size == (view.screen.width, view.screen.height)
     }

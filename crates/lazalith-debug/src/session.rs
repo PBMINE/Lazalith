@@ -24,14 +24,14 @@
 //! run the program to completion, and put the setup back without having to type
 //! the addresses again.
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use lazalith_os::{ProcessId, ThreadId};
 
 use crate::DebugError;
 
 /// Where a process is, from a debugger's point of view.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutionState {
     /// Loaded and not yet run, or run and finished with this code.
     Ready,
@@ -50,7 +50,13 @@ pub enum ExecutionState {
     /// The program faulted, and the controller cannot continue it.
     Faulted {
         /// The fault, as the machine reported it.
-        detail: &'static str,
+        ///
+        /// An owned `String` and not a `&'static str`, because a fault has as many
+        /// causes as the machine has: a guest trap carries a payload and a cause,
+        /// and a fixed string could only ever say one of them. A frontend that
+        /// showed "the program faulted" for every fault would be hiding the only
+        /// information the state has.
+        detail: String,
     },
 }
 
@@ -132,6 +138,12 @@ pub struct DebugSession {
     watchpoints: Vec<Watchpoint>,
     steps: u64,
     word_size: u64,
+    /// The structured diagnostics this process has produced, oldest first.
+    ///
+    /// They live here rather than on the controller because they belong to a
+    /// process: two processes on one machine each have their own, and a
+    /// frontend listing processes wants each one's history beside it.
+    diagnostics: Vec<crate::diagnostic::RuntimeDiagnostic>,
 }
 
 /// What went wrong configuring a session.
@@ -149,6 +161,7 @@ impl DebugSession {
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
             steps: 0,
+            diagnostics: Vec::new(),
             word_size,
         }
     }
@@ -164,13 +177,17 @@ impl DebugSession {
     }
 
     /// Where the process is.
-    pub const fn state(&self) -> ExecutionState {
-        self.state
+    ///
+    /// A clone rather than a copy, because a faulted state carries the fault's
+    /// own message. Returning a reference instead would tie the caller's read to the
+    /// session's borrow, which is the same coupling the owned snapshots avoid.
+    pub fn state(&self) -> ExecutionState {
+        self.state.clone()
     }
 
     /// Moves the session to a state. The controller owns this; a frontend reads
     /// it and cannot move a stopped program by saying so.
-    pub(crate) const fn set_state(&mut self, state: ExecutionState) {
+    pub(crate) fn set_state(&mut self, state: ExecutionState) {
         self.state = state;
     }
 
@@ -266,7 +283,7 @@ impl DebugSession {
             thread: self.thread,
             breakpoints: self.breakpoints.clone(),
             watchpoints: self.watchpoints.clone(),
-            state: self.state,
+            state: self.state.clone(),
             steps: self.steps,
         }
     }
@@ -284,7 +301,7 @@ impl DebugSession {
         }
         self.breakpoints = snapshot.breakpoints.clone();
         self.watchpoints = snapshot.watchpoints.clone();
-        self.state = snapshot.state;
+        self.state = snapshot.state.clone();
         self.steps = snapshot.steps;
         Ok(())
     }
@@ -328,12 +345,37 @@ impl DebugSnapshot {
     }
 
     /// Where the process was at the time of the snapshot.
-    pub const fn state(&self) -> ExecutionState {
-        self.state
+    pub fn state(&self) -> ExecutionState {
+        self.state.clone()
     }
 
     /// How many instructions the process had retired at the time.
     pub const fn steps(&self) -> u64 {
         self.steps
+    }
+}
+
+impl DebugSession {
+    /// The structured diagnostics this process has produced, oldest first.
+    pub fn diagnostics(&self) -> &[crate::diagnostic::RuntimeDiagnostic] {
+        &self.diagnostics
+    }
+
+    /// Records a diagnostic, forgetting the oldest when the history is full.
+    ///
+    /// A program in a loop that faults on every iteration would otherwise grow
+    /// this without bound, and the oldest entry is the one nobody is reading.
+    pub fn record_diagnostic(&mut self, diagnostic: crate::diagnostic::RuntimeDiagnostic) {
+        if self.diagnostics.len() == crate::diagnostic::MAX_HISTORY {
+            self.diagnostics.remove(0);
+        }
+        self.diagnostics.push(diagnostic);
+    }
+
+    /// Forgets every diagnostic, and says how many there were.
+    pub fn clear_diagnostics(&mut self) -> usize {
+        let count = self.diagnostics.len();
+        self.diagnostics.clear();
+        count
     }
 }

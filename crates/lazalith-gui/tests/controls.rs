@@ -327,7 +327,10 @@ fn a_line_breakpoint_without_debug_information_is_refused() {
     let stripped = LzxImage::new(
         with_debug.architecture(),
         0,
-        0,
+        // The entry offset is the linked image's own, not zero: the runtime links
+        // the program after the library, so offset zero is a library function and
+        // an image built with it runs something other than the program under test.
+        with_debug.entry_offset(),
         with_debug.required_data(),
         with_debug.required_stack(),
         with_debug.sections().to_vec(),

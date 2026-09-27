@@ -52,6 +52,7 @@
 extern crate alloc;
 
 mod controller;
+pub mod diagnostic;
 mod registers;
 mod session;
 mod snapshot;
@@ -89,6 +90,13 @@ pub enum DebugError {
         /// The instruction size the address has to be a multiple of.
         word_size: u64,
     },
+    /// An address asked for a whole instruction was not instruction-aligned.
+    UnalignedInstruction {
+        /// The address that was asked for.
+        address: u64,
+        /// The instruction size the address has to be a multiple of.
+        word_size: u64,
+    },
     /// A watchpoint was given a size that is not one, two, four or eight bytes.
     UnsupportedWatchpointSize {
         /// The size that was asked for, in bytes.
@@ -109,6 +117,10 @@ impl fmt::Display for DebugError {
             Self::Address(source) => write!(f, "the address is not one this target has: {source}"),
             Self::Memory(source) => write!(f, "the memory access was refused: {source}"),
             Self::Disassembly(source) => write!(f, "the bytes are not an instruction: {source}"),
+            Self::UnalignedInstruction { address, word_size } => write!(
+                f,
+                "an instruction at {address:#x} is not a multiple of {word_size}"
+            ),
             Self::UnalignedBreakpoint { address, word_size } => write!(
                 f,
                 "a breakpoint at {address:#x} is not a multiple of {word_size}"

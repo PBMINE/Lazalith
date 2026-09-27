@@ -311,6 +311,14 @@ pub fn lower(program: &CheckedProgram) -> Result<Lowered, LowerError> {
 }
 
 /// An extern's IR declaration: its signature, and no body of its own.
+///
+/// The name is [`syscall_symbol`], not the bare syscall name. The IR keeps every
+/// function in one namespace, and a Lazen function and an ABI syscall can
+/// legitimately share a name — a program that declares `fn read` collided with
+/// the ABI's `read` and the module builder refused the second one with "function
+/// read is defined twice". A dot cannot appear in a Lazen qualified name, which
+/// either has no separator or joins its module with `::`, so the prefix cannot
+/// collide with a function however the language changes.
 fn extern_declaration(declaration: &CheckedExtern) -> Result<Function, LowerError> {
     let mut params = Vec::new();
     for parameter in &declaration.parameters {
@@ -321,7 +329,7 @@ fn extern_declaration(declaration: &CheckedExtern) -> Result<Function, LowerErro
     }
     let mut module = ModuleBuilder::new("declaration");
     let mut builder = module.function(
-        &declaration.name,
+        &syscall_symbol(&declaration.name),
         Linkage::External,
         params,
         ir_type(&declaration.result)?,
@@ -329,6 +337,15 @@ fn extern_declaration(declaration: &CheckedExtern) -> Result<Function, LowerErro
     builder.switch_to_block("declaration")?;
     builder.terminate(Terminator::Unreachable)?;
     Ok(builder.finish()?)
+}
+
+/// The IR name of an ABI syscall.
+///
+/// Used by both the declaration and the call that reaches it, because the IR
+/// verifier resolves a call target by name and a declaration the verifier cannot
+/// find is the same as a call to a function that is not there.
+fn syscall_symbol(name: &str) -> String {
+    format!("syscall.{name}")
 }
 
 /// Whether a type is a view: a pointer and a length, two words.
@@ -1889,7 +1906,7 @@ impl<'a> FunctionLowering<'a> {
                     span: span.clone(),
                 });
             }
-            CallTarget::Syscall(Name::from(callee))
+            CallTarget::Syscall(Name::from(&syscall_symbol(callee)))
         } else {
             CallTarget::Function(Name::from(callee))
         };

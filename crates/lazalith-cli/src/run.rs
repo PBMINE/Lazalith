@@ -351,6 +351,18 @@ fn boot_and_run(
             Some(KernelServiceOutcome::Fault(error)) => {
                 return Err(CliError::Refused(format!("the program faulted: {error:?}")));
             }
+            // A guest trap is the program's own `TRAP` — a bounds check, a
+            // runtime check, an explicit trap. `lazen run` has no debugger to
+            // show it in, so it reports the trap rather than running on: the
+            // alternative is the program spinning in a trap frame until the step
+            // budget ran out and being reported as "did not finish", which says
+            // nothing about why.
+            Some(KernelServiceOutcome::GuestTrap { cause, payload }) => {
+                return Err(CliError::Refused(format!(
+                    "the program trapped ({cause:?}, payload {payload}) at {:#x}",
+                    machine.architectural_state().pc().as_u64()
+                )));
+            }
             Some(KernelServiceOutcome::Return(_)) | None => {}
         }
     }

@@ -438,12 +438,18 @@ fn a_32_bit_target_is_refused() {
 }
 
 /// An extern is declared in the module, so a call to it can be checked.
+///
+/// The declaration's name carries the compiler's syscall prefix. A Lazen function
+/// and an ABI syscall can share a name — a program that declares `fn read`
+/// collided with the ABI's `read` and the IR module rejected the second one — and
+/// the IR keeps every function in one namespace, so the two are told apart by a
+/// prefix a Lazen name cannot contain.
 #[test]
 fn an_extern_is_declared_with_its_signature() {
     let (module, _) = lower_source(HELLO);
     let declaration = module
-        .function("write")
-        .expect("the extern is declared in the module");
+        .function("syscall.write")
+        .expect("the extern is declared in the module, under its mangled name");
     assert_eq!(
         declaration.params.len(),
         4,
@@ -1002,4 +1008,32 @@ fn a_for_loop_leaves_its_body_when_the_counter_reaches_the_bound() {
         otherwise, exit.id,
         "and the body is what happens while it has not"
     );
+}
+
+/// Every syscall a call names resolves to a declaration in the module.
+///
+/// The verifier resolves a call target by name, so a declaration the verifier
+/// cannot find is the same as a call to a function that is not there. This walks
+/// the calls rather than one of them, because the mangling has to be consistent
+/// everywhere or the verifier rejects a program that is fine.
+#[test]
+fn every_syscall_call_resolves_to_a_declaration() {
+    let (module, _) = lower_source(HELLO);
+    for function in &module.functions {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                let lazalith_ir::Instruction::Call { target, .. } = instruction else {
+                    continue;
+                };
+                let lazalith_ir::CallTarget::Syscall(name) = target else {
+                    continue;
+                };
+                assert!(
+                    module.function(name.as_str()).is_some(),
+                    "the syscall {name} that {} calls is declared in the module",
+                    function.name
+                );
+            }
+        }
+    }
 }

@@ -753,6 +753,16 @@ impl<'a> Generated<'a> {
     }
 }
 
+/// The prefix the compiler puts on an ABI syscall's name in the IR.
+///
+/// A Lazen function and an ABI syscall can share a name — a program that declares
+/// `fn read` collides with the ABI's `read` — and the IR keeps every function in
+/// one namespace. A dot cannot appear in a Lazen qualified name, which either has
+/// no separator or joins its modules with `::`, so the prefix cannot collide with a
+/// function however the language grows. The same reasoning is behind the `fn.`
+/// prefix on a function's symbol.
+pub(crate) const SYSCALL_PREFIX: &str = "syscall.";
+
 /// A function's symbol name in the object.
 pub(crate) fn function_symbol(name: &str) -> Name {
     let mut symbol = String::from("fn.");

@@ -124,6 +124,12 @@ fn a_lazen_program_runs_under_lazos() {
             Some(KernelServiceOutcome::Fault(error)) => {
                 panic!("the program faulted: {error:?}")
             }
+            Some(KernelServiceOutcome::GuestTrap { cause, payload }) => {
+                panic!(
+                    "the program trapped ({cause:?}, payload {payload}) at {:#x}",
+                    machine.architectural_state().pc().as_u64()
+                )
+            }
             Some(KernelServiceOutcome::Return(_)) | None => {}
         }
     }
@@ -207,6 +213,12 @@ fn main() -> i32 {
                 break;
             }
             Some(KernelServiceOutcome::Fault(error)) => panic!("the program faulted: {error:?}"),
+            Some(KernelServiceOutcome::GuestTrap { cause, payload }) => {
+                panic!(
+                    "the program trapped ({cause:?}, payload {payload}) at {:#x}",
+                    machine.architectural_state().pc().as_u64()
+                )
+            }
             Some(KernelServiceOutcome::Return(_)) | None => {}
         }
     }
@@ -286,6 +298,12 @@ fn the_checked_in_example_builds_and_runs() {
                 break;
             }
             Some(KernelServiceOutcome::Fault(error)) => panic!("the example faulted: {error:?}"),
+            Some(KernelServiceOutcome::GuestTrap { cause, payload }) => {
+                panic!(
+                    "the program trapped ({cause:?}, payload {payload}) at {:#x}",
+                    machine.architectural_state().pc().as_u64()
+                )
+            }
             Some(KernelServiceOutcome::Return(_)) | None => {}
         }
     }

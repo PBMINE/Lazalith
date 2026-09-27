@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-27 (Steps 1–78 complete and verified)
+Last updated: 2026-09-27 (Steps 1–79 complete and verified)
 
 ## Where the roadmap stands
 
@@ -25,16 +25,85 @@ Step  74      complete: the Lazalith debug API (575841c)
 Step  75      complete: machine snapshots (1caf29e)
 Step  76      complete: source-level debug information (7c0dd70)
 Step  77      complete: the SDL3 frontend (063dd76)
-Step  78      complete: the GUI controls
+Step  78      complete: the GUI controls (c42d57f)
+Step  79      complete: structured diagnostics
 ```
 
-The 847 workspace tests all pass, including the 4 in
+The 864 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
-programs on real machines and check every panel the frontend draws, and the 15 in
+programs on real machines and check every panel the frontend draws, the 15 in
 `crates/lazalith-gui/tests/controls.rs` that press every control against a real
-machine and check what the program did.
+machine, and the 13 in `crates/lazalith-gui/tests/diagnostics.rs` that run
+programs that do something wrong and check the structured diagnostics that come
+back.
+
+## Step 79 — structured diagnostics
+
+The GUI consumes structured diagnostics directly. Nothing reads a rendered error
+string back to decide what to show: every field a panel draws is a value.
+
+A `RuntimeDiagnostic` **is** a `lazalith_diagnostics::Diagnostic` — the same
+stable code, severity, message and source label the compiler produces — plus the
+things only a running program has: the guest's program counter, the instruction
+there, and a call chain. That is a reuse of the existing diagnostic type rather
+than a second one built for the UI.
+
+Codes are `R0xxx`, extending the compiler's `L`/`P`/`N`/`T` namespaces, so a
+frontend can tell a program that did something wrong from a frontend that could
+not read something without reading either message.
+
+### The call chain is verified, not guessed
+
+The calling convention reserves a word below the frame for the return address and
+saves the caller's frame base, so a chain *is* walkable. This walks it by
+scanning the stack for words that could be return addresses and **checking each
+against the code**: the word must be instruction-aligned, the instruction before
+it must be a `CALL` or `CALLR`, that call's target must be real code, and the
+word must resolve through the debug table. A data word that merely looks like a
+code address does not become a frame, because it would also have to be preceded
+by a real call to a real function. A word that fails the check is skipped, and
+the diagnostic says how many words were examined so a short trace reads as a short
+trace.
+
+`DebugController::instruction_at` is new and is the structured counterpart to
+`disassemble`. A frontend that wanted to know whether an instruction is a call
+would otherwise have to read the disassembler's text and match words in it —
+exactly the parse-a-string approach this step exists to avoid.
+
+### Four bugs the tests found
+
+- **A trapping program was reported as having exited successfully.** The kernel
+  discarded every non-syscall trap, so the machine sat in a trap frame with
+  nothing able to leave it; the next run found no runnable process and reported
+  `Exit { code: 0 }`. A program whose bounds check fired was a program that
+  finished. The kernel now reports `KernelServiceOutcome::GuestTrap { cause,
+  payload }` with the real cause, the controller marks the process faulted, and a
+  `run` stops when it sees that — a fault that does not stop a run is a fault
+  nobody ever sees.
+- **A program's own `fn read` broke the standard library.** A path with module
+  segments fell through to the root module's items, so `std::io::input::read`
+  *inside the library* resolved to the program's function and the library failed
+  to compile with an argument-count error pointing at its own source. Behind that
+  was a second bug: the IR keeps every function in one namespace, so the
+  program's `read` and the ABI's `read` were the same name. Syscall
+  declarations and syscall call targets are now both `syscall.`-mangled, and the
+  root-module fallback applies only to a *bare* name.
+- **Three tests were running the wrong program.** They rebuilt an image without
+  debug information using entry offset zero, and the runtime links the program
+  *after* the library — so offset zero is a library function. They passed only
+  because the controller was swallowing the resulting trap. Every stripped-image
+  construction now keeps the linked image's own entry offset.
+- **The whole stack read failed when one word was unmapped.** A trap frame sits
+  on the stack, so its top can be past the end of the mapped region, and an
+  all-or-nothing read lost the frames *below* — the ones a trace is for. A fault's
+  trace is now read a word at a time and keeps what could be read.
+
+`Diagnostic` also became `Clone` and comparable: its cause moved from `Box` to
+`Arc`, because a structured diagnostic that cannot be copied is one every
+consumer has to work around, and a GUI keeps several.
+
 
 ## Step 77 — the SDL3 frontend
 

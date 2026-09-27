@@ -48,6 +48,27 @@ pub enum KernelServiceOutcome {
     Return(TaggedOutcome),
     Exit(u32),
     Fault(SyscallError),
+    /// The guest program trapped, and nothing handled it for it.
+    ///
+    /// A guest trap is not a syscall and not a kernel failure. It is the program
+    /// executing a `TRAP` instruction, which is also what the compiler's bounds
+    /// check and every runtime check compile down to. The kernel has no handler
+    /// for one — the program is meant to be looking at it — so it reports one and
+    /// leaves the machine in the trap frame, which is where a debugger stops and
+    /// shows the guest's own program counter.
+    ///
+    /// This variant exists because dropping the event left a trapped program in
+    /// limbo: the machine stayed in its trap frame, nothing could return from it,
+    /// and the next run found no runnable process and reported the program as
+    /// having *exited successfully*. A program whose bounds check fired was
+    /// reported as a program that finished.
+    GuestTrap {
+        /// What kind of trap it was.
+        cause: TrapCause,
+        /// The payload the guest supplied, sign-extended from the instruction's
+        /// immediate.
+        payload: i64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,9 +237,15 @@ impl LazalithKernel {
                     DispatchOutcome::Fault(error) => Some(KernelServiceOutcome::Fault(error)),
                 }
             }
-            MachineEvent::Trapped { .. } | MachineEvent::Stepped { .. } | MachineEvent::Halted => {
-                None
-            }
+            // Every other trap is the guest's own, and is reported rather than
+            // dropped. Dropping it left the machine in a trap frame with nothing
+            // able to leave it, which a caller could only see as the program
+            // having finished.
+            MachineEvent::Trapped { event } => Some(KernelServiceOutcome::GuestTrap {
+                cause: event.cause,
+                payload: event.payload as i64,
+            }),
+            MachineEvent::Stepped { .. } | MachineEvent::Halted => None,
         };
         Ok(KernelStep { scheduler, outcome })
     }

@@ -263,3 +263,57 @@ Making a syscall a stopping point means splitting `Kernel::step` so a trap is
 observable between two steps. That is a change to the kernel's shape, not to the
 debugger, and it belongs with the work that makes a debugger able to show a
 program's system calls rather than only its arithmetic.
+
+## Structured diagnostics
+
+A program that does something wrong is reported as structure, not as text. A
+`RuntimeDiagnostic` **is** a `lazalith_diagnostics::Diagnostic` — the same stable
+code, severity, message and source label the compiler produces — plus what only
+a running program has:
+
+```text
+code              R0001, a stable identifier in the runtime namespace
+message           the trap's cause and the payload the program supplied
+source            the file, line and column, from the image's own debug block
+guest PC          the address of the trapping instruction
+instruction       the disassembler's text, for a person to read
+stack trace       the calls that led here, each verified against the code
+```
+
+Codes are `R0xxx`, extending the compiler's `L`/`P`/`N`/`T` namespaces. A
+frontend can filter on the letter and tell a program that did something wrong
+from a frontend that could not read something, without parsing either message.
+
+The guest program counter is the address of the **trapping instruction**, not the
+machine's program counter. A machine that has taken a trap is in the kernel's
+trap frame, so its `pc` is the trap vector; a debugger that pointed there would
+send a user looking at the kernel instead of at their own program. The address is
+derived from the trap's resume point and then *verified* — the instruction there
+has to decode as a `TRAP`, or no address is reported at all.
+
+### A call chain is verified, not guessed
+
+`call_chain` scans the stack for words that could be return addresses and checks
+each one against the code. A word becomes a frame only if it is
+instruction-aligned, the instruction immediately before it is a `CALL` or
+`CALLR`, that call's target is itself real code, and the word resolves through
+the debug table. A data word that merely looks like a code address would also
+have to be preceded by a real call to a real function, so it does not become a
+frame.
+
+The scan reads a word at a time and keeps what it could read, because a trap
+frame sits on the stack and its top can be past the end of the mapped region.
+A trace that stopped because the memory did says how many words it looked at, so
+a short trace reads as a short trace rather than as a truncated one nobody was
+told about.
+
+`instruction_at` is the structured counterpart to `disassemble`. Anything that
+needs to *match* on an instruction — which is how the trace check works — uses it
+rather than reading the disassembler's text.
+
+### A fault stops a run
+
+A run checks whether the process has faulted before each step. A fault that does
+not stop a run is a fault nobody ever sees: the machine sits in a trap frame with
+nothing able to leave it, the next run finds no runnable process, and a program
+whose bounds check fired is reported as a program that finished.

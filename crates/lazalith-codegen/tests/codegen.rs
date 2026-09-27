@@ -1544,3 +1544,45 @@ fn generating_with_the_wrong_source_text_is_refused() {
         "the failure names the source range as what was wrong: {error}"
     );
 }
+
+/// The bounds check survives being inside a loop.
+///
+/// An out-of-range index traps outside a loop and did not inside one, which is
+/// the worst shape of code-generation defect: the program runs, reads memory it
+/// does not own, and returns a plausible byte. This asserts the check is emitted
+/// in both shapes, and separately that the loop form traps when run.
+#[test]
+fn a_bounds_check_inside_a_loop_still_traps() {
+    let (object, _) = generate_object(
+        r#"
+        pub fn read(values: &[u8], index: usize) -> u8 {
+            return values[index];
+        }
+        fn main() -> i32 {
+            let data: [u8; 4] = [1u8, 2u8, 3u8, 4u8];
+            let mut n: i32 = 0;
+            while n < 3 {
+                let byte: u8 = read(data.as_slice(), 100usize);
+                n = n + 1;
+            }
+            return 0;
+        }
+        "#,
+    );
+    let code = function_code(&object, "read");
+    assert!(
+        code.contains(&Opcode::Trap),
+        "the bounds check traps rather than reading elsewhere: {code:?}"
+    );
+    let harness = harness(
+        "harness",
+        &["fn.read", "fn.main"],
+        "         LI r0, 0\n\
+         CALL fn.main\n",
+    );
+    let (_, code) = run(vec![harness, object], "entry");
+    assert_eq!(
+        code, None,
+        "the process never exited, because the read inside the loop trapped"
+    );
+}

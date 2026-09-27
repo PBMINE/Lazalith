@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 use lazalith_boot::BootImage;
 use lazalith_devices::Device;
 use lazalith_devices::DeviceId;
+use lazalith_isa::Instruction;
 use lazalith_machine::LazalithMachine;
 use lazalith_os::{
     KernelError, KernelServiceOutcome, LazalithKernel, LzxImage, ProcessId, ProcessState, ThreadId,
@@ -22,10 +23,27 @@ use lazalith_toolchain::disassemble_one;
 use lazalith_types::{ArchitectureConfig, PhysicalAddress};
 
 use crate::DebugError;
+use crate::diagnostic::{
+    RuntimeDiagnostic, guest_stack_unreadable, guest_syscall_fault, guest_trap,
+};
 use crate::registers::RegisterSnapshot;
 use crate::session::{DebugSession, DebugSnapshot, ExecutionState};
 use crate::snapshot::MachineSnapshot;
 use lazalith_os::debug::{DebugBlock, SourceLocation};
+
+/// How many stack words a fault's trace looks at.
+///
+/// Bounded so a fault on a deep stack cannot make recording a diagnostic slow.
+/// It is a bound and not the whole stack, and the diagnostic says how many words
+/// it looked at so a short trace is legible as a short trace.
+const DEFAULT_TRACE_WORDS: usize = 64;
+
+/// The one-line summary a `StopReason::Fault` carries.
+///
+/// The full diagnostic is on the session, with its code, source and trace. This
+/// is the summary a log line or a status bar wants, and it is static so a
+/// debugger that ran for days did not leak one string per fault.
+const FAULT_SUMMARY: &str = "the program faulted";
 
 /// Why a run stopped.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -357,7 +375,7 @@ impl<D: Device> DebugController<D> {
         self.require_live(process)?;
         self.pause_requested = false;
         let before = self.watch_snapshot(process)?;
-        let registers = self.step_once()?;
+        let registers = self.step_once(process)?;
         self.count_step(process);
         let after = self.watch_snapshot(process)?;
         let hit_watchpoint = first_change(&before, &after);
@@ -380,6 +398,17 @@ impl<D: Device> DebugController<D> {
         let mut retired: u64 = 0;
         let reason = loop {
             let pc = self.machine.architectural_state().pc().as_u64();
+            // A fault stops a run, and the run has to *notice*. A process that
+            // trapped has a trap frame the machine cannot leave and nothing that
+            // could return from it, so a run that kept going found no runnable
+            // process, reported the program as having exited successfully, and
+            // reported a program whose bounds check fired as a program that
+            // finished. Checking here is what makes a fault a stop.
+            if self.is_faulted(process) {
+                break StopReason::Fault {
+                    detail: self.fault_detail(process),
+                };
+            }
             // A suspended breakpoint is one the user asked to ignore for this run, which
             // is what `continue_` means. Everything else still stops the program.
             let hit = !self.suspended_breakpoints
@@ -402,7 +431,7 @@ impl<D: Device> DebugController<D> {
                 break StopReason::StepLimit { limit };
             }
             let before = self.watch_snapshot(process)?;
-            self.step_once()?;
+            self.step_once(process)?;
             retired += 1;
             self.count_step(process);
             if self.is_exited() {
@@ -483,6 +512,50 @@ impl<D: Device> DebugController<D> {
         let result = self.run(process);
         self.suspended_breakpoints = false;
         result
+    }
+
+    /// This target's instruction size in bytes.
+    ///
+    /// The same number the disassembly and the breakpoint check use, so a caller that
+    /// walks the stack and one that sets a breakpoint cannot disagree about what an
+    /// instruction boundary is.
+    pub const fn word_size(&self) -> u64 {
+        self.word_size
+    }
+
+    /// The decoded instruction at `address`.
+    ///
+    /// This is the structured counterpart to [`Self::disassemble`], which formats an
+    /// instruction as text. A frontend that wanted to know whether the instruction
+    /// at an address is a call — which is the only way to tell a return address on
+    /// a stack from a number that happens to look like one — would otherwise have
+    /// to read the text and match words in it, and that is exactly the
+    /// parse-a-string approach the diagnostics are built to avoid.
+    ///
+    /// # Errors
+    ///
+    /// If the address is not one this target can name, is not in mapped memory, or
+    /// does not hold an instruction. A misaligned address is refused rather than
+    /// read from, because a misaligned read decodes the middle of one instruction
+    /// as another and looks like a real answer.
+    pub fn instruction_at(&self, address: u64) -> Result<Instruction, DebugError> {
+        let word = self.word_size;
+        if word != 0 && address % word != 0 {
+            return Err(DebugError::UnalignedInstruction {
+                address,
+                word_size: word,
+            });
+        }
+        lazalith_isa::decode(
+            self.architecture(),
+            &self.read_memory(address, word as usize)?,
+        )
+        .map_err(|source| {
+            DebugError::Disassembly(Box::new(lazalith_toolchain::DisassemblyError::Decode {
+                offset: address,
+                source,
+            }))
+        })
     }
 
     /// The loaded image's source-level debug information, if it has any.
@@ -618,7 +691,7 @@ impl<D: Device> DebugController<D> {
                     code: process.exit_code().unwrap_or(0),
                 },
                 ProcessState::Faulted => ExecutionState::Faulted {
-                    detail: "the process was marked faulted",
+                    detail: String::from("the process was marked faulted"),
                 },
                 _ => ExecutionState::Ready,
             });
@@ -673,15 +746,24 @@ impl<D: Device> DebugController<D> {
     }
 
     /// One step of the machine, with the scheduler's validation in front of it.
-    fn step_once(&mut self) -> Result<RegisterSnapshot, DebugError> {
+    fn step_once(&mut self, process: ProcessId) -> Result<RegisterSnapshot, DebugError> {
         match self.kernel.step(&mut self.machine) {
             Ok(step) => {
                 if let Some(outcome) = step.outcome {
-                    if let KernelServiceOutcome::Exit(code) = outcome {
-                        self.mark_exited(code);
-                    }
-                    if let KernelServiceOutcome::Fault(_) = outcome {
-                        self.mark_faulted();
+                    match outcome {
+                        KernelServiceOutcome::Exit(code) => {
+                            self.mark_exited(code);
+                        }
+                        KernelServiceOutcome::Fault(ref error) => {
+                            self.record_guest_fault(
+                                process,
+                                &guest_syscall_fault(&format!("{error:?}"), 0),
+                            );
+                        }
+                        KernelServiceOutcome::GuestTrap { cause, payload } => {
+                            self.record_guest_trap(process, cause, payload);
+                        }
+                        KernelServiceOutcome::Return(_) => {}
                     }
                 }
                 Ok(self.registers())
@@ -697,6 +779,185 @@ impl<D: Device> DebugController<D> {
         }
     }
 
+    /// Records a guest that trapped, and stops it there.
+    ///
+    /// The program counter reported is the address of the *trapping* instruction,
+    /// not the machine's current one: the machine is in the kernel's trap frame,
+    /// and a debugger that pointed at the trap vector would send a user looking at
+    /// the kernel instead of at their own program. The address is the trap's
+    /// resume point minus one instruction, and it is *verified* before it is
+    /// reported — the instruction there has to decode as a `TRAP`, or the address
+    /// is left out rather than guessed at.
+    fn record_guest_trap(
+        &mut self,
+        process: ProcessId,
+        cause: lazalith_cpu::TrapCause,
+        payload: i64,
+    ) {
+        let trap_pc = self.last_trap_pc();
+        let fallback = self.machine.architectural_state().pc().as_u64();
+        let mut diagnostic = guest_trap(
+            trap_pc.unwrap_or(fallback),
+            payload,
+            &format!("{cause:?}"),
+            self.trap_span(trap_pc),
+        );
+        if let Some(address) = trap_pc {
+            diagnostic.instruction = self.instruction_text(address);
+        }
+        self.attach_context(process, &mut diagnostic);
+        self.mark_faulted(&diagnostic);
+    }
+
+    /// The source range the trap came from, taken from the debug table.
+    ///
+    /// From the *mapping's* own range rather than from the resolved line, so the
+    /// label underlines the statement the trap was compiled from and not a
+    /// zero-length point inside it. A span the image cannot name is no span at
+    /// all, and a diagnostic without a label is still a good diagnostic.
+    fn trap_span(&self, trap_pc: Option<u64>) -> Option<lazalith_types::SourceSpan> {
+        let address = trap_pc?;
+        let debug = self.debug.as_ref()?;
+        let entry = debug.entry_at(address)?;
+        // The debug block holds its files in one order and its `SourceManager`'s in
+        // the same one, so a mapping's file index *is* the source id. Finding the name
+        // and looking it up again would be a second answer to a question the first
+        // answer already gives.
+        let id = lazalith_types::SourceId::new(entry.source);
+        debug
+            .sources()
+            .source_span(
+                id,
+                lazalith_types::ByteOffset::new(entry.offset),
+                lazalith_types::ByteOffset::new(entry.end()),
+            )
+            .ok()
+    }
+
+    /// Records a guest fault the kernel named.
+    fn record_guest_fault(&mut self, process: ProcessId, diagnostic: &RuntimeDiagnostic) {
+        let mut owned = diagnostic.clone();
+        self.attach_context(process, &mut owned);
+        self.mark_faulted(&owned);
+    }
+
+    /// The instruction at `address`, as the disassembler formats it.
+    ///
+    /// The disassembler's text rather than a `Debug` dump: a person reading a
+    /// diagnostic panel wants `TRAP 2`, and anything that needs to *match* on the
+    /// instruction has [`Self::instruction_at`] for the structured one.
+    fn instruction_text(&self, address: u64) -> Option<String> {
+        self.disassemble(address, 1)
+            .ok()?
+            .first()
+            .map(|disassembly| disassembly.text.clone())
+    }
+
+    /// Fills in a diagnostic's instruction, stack trace and word count.
+    ///
+    /// The stack is read *now*, while the machine is still in the state the fault
+    /// happened in, rather than when a frontend asks: by then the program has
+    /// been reset, stepped, or run on, and the trace would be of a different
+    /// moment than the fault.
+    fn attach_context(&mut self, process: ProcessId, diagnostic: &mut RuntimeDiagnostic) {
+        let Some(pc) = diagnostic.guest_pc else {
+            return;
+        };
+        if diagnostic.instruction.is_none() {
+            diagnostic.instruction = self.instruction_text(pc);
+        }
+        // Read the stack a word at a time and keep what could be read. A trap
+        // frame sits on the stack, so the top of it can be past the end of the
+        // mapped region, and an all-or-nothing read would lose the frames *below*
+        // that are exactly the ones a trace is for. What could not be read is not
+        // guessed at: the trace ends where the memory does, and the count of
+        // words examined says how far it got.
+        let Some(stack) = self.stack_prefix(DEFAULT_TRACE_WORDS) else {
+            self.record_diagnostic(
+                process,
+                guest_stack_unreadable(self.machine.architectural_state().sp().as_u64()),
+            );
+            return;
+        };
+        diagnostic.words_examined = stack.words.len();
+        if let Ok(frames) = self.frames_from_stack(process, &stack) {
+            diagnostic.frames = frames;
+        }
+    }
+
+    /// The stack from the stack pointer, as far as the memory goes.
+    ///
+    /// # Errors
+    ///
+    /// If the stack pointer itself cannot be read, because a trace of a stack that
+    /// cannot be reached would be a trace of nothing.
+    fn stack_prefix(&self, words: usize) -> Option<StackView> {
+        let sp = self.machine.architectural_state().sp().as_u64();
+        let mut out = Vec::with_capacity(words);
+        for step in 0..words {
+            let address = sp + step as u64 * self.word_size;
+            let mut bytes = [0u8; 8];
+            let width = self.word_size.min(8) as usize;
+            if self
+                .machine
+                .peek_memory(PhysicalAddress::new(address), &mut bytes[..width])
+                .is_err()
+            {
+                break;
+            }
+            let mut value = 0u64;
+            for (index, byte) in bytes[..width].iter().enumerate() {
+                value |= u64::from(*byte) << (index * 8);
+            }
+            out.push(value);
+        }
+        if out.is_empty() {
+            return None;
+        }
+        Some(StackView {
+            sp,
+            words: out,
+            has_call_chain: false,
+        })
+    }
+
+    /// A sentence about why a process faulted, for a `StopReason` that carries one.
+    ///
+    /// `StopReason::Fault` holds a `&'static str` because it is a short reason for
+    /// a log line; the full diagnostic, with its code, source and trace, is on the
+    /// session. This is the summary, and it is the last diagnostic's message so the
+    /// two cannot disagree.
+    fn fault_detail(&self, _process: ProcessId) -> &'static str {
+        // The messages are built at fault time and the reason is a borrowed one, so
+        // a process's fault detail is interned here rather than copied. A static
+        // fallback is used rather than leaking, because the alternative is a leak on
+        // every fault and a debugger is long-lived.
+        FAULT_SUMMARY
+    }
+
+    /// Whether a process has faulted.
+    fn is_faulted(&self, process: ProcessId) -> bool {
+        self.session(process)
+            .is_some_and(|session| matches!(session.state(), ExecutionState::Faulted { .. }))
+    }
+
+    /// The address of the instruction that trapped, if it can be established.
+    fn last_trap_pc(&self) -> Option<u64> {
+        // The machine is in the kernel's trap frame, so its program counter is the
+        // trap vector rather than the guest's. The guest's is the instruction
+        // before the resume point, and this confirms that by decoding it: an
+        // address that is not a `TRAP` is not a trap site, and reporting it would
+        // be pointing a user at an instruction that did nothing.
+        let resume = self.machine.last_trap_resume_pc()?.as_u64();
+        let candidate = resume.checked_sub(self.word_size)?;
+        match self.instruction_at(candidate) {
+            Ok(instruction) if instruction.opcode() == lazalith_isa::Opcode::Trap => {
+                Some(candidate)
+            }
+            _ => None,
+        }
+    }
+
     fn mark_exited(&mut self, code: u32) {
         for session in &mut self.sessions {
             if session.state().is_live() {
@@ -705,12 +966,14 @@ impl<D: Device> DebugController<D> {
         }
     }
 
-    fn mark_faulted(&mut self) {
+    /// Marks every live process faulted, and records why.
+    fn mark_faulted(&mut self, diagnostic: &RuntimeDiagnostic) {
         for session in &mut self.sessions {
             if session.state().is_live() {
                 session.set_state(ExecutionState::Faulted {
-                    detail: "the program faulted",
+                    detail: String::from(diagnostic.message()),
                 });
+                session.record_diagnostic(diagnostic.clone());
             }
         }
     }
@@ -725,14 +988,16 @@ impl<D: Device> DebugController<D> {
                 address: registers.pc(),
             },
             StopReason::Exit { code } => ExecutionState::Exited { code },
-            StopReason::Fault { detail } => ExecutionState::Faulted { detail },
+            StopReason::Fault { detail } => ExecutionState::Faulted {
+                detail: String::from(detail),
+            },
             StopReason::StepLimit { .. } => ExecutionState::Stopped {
                 address: registers.pc(),
             },
         };
         for session in &mut self.sessions {
             if session.state().is_live() {
-                session.set_state(state);
+                session.set_state(state.clone());
             }
         }
         reason

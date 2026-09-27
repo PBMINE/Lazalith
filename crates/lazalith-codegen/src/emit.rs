@@ -57,7 +57,7 @@ use lazalith_types::{ArchitectureConfig, RegisterIndex};
 use crate::layout::{FunctionLayout, OUTGOING_ARGUMENT_BYTES};
 use crate::{
     BRANCH_RELOCATION, CodegenError, DATA_RELOCATION, PendingMapping, PendingRelocation,
-    function_symbol, value_size,
+    SYSCALL_PREFIX, function_symbol, value_size,
 };
 
 /// The address scratch, and the register the OS ABI reserves at a syscall.
@@ -1556,6 +1556,19 @@ impl<'a> FunctionEmitter<'a> {
         args: &[CallArg],
         _result: &IrType,
     ) -> Result<(), CodegenError> {
+        // The IR mangles a syscall's name so that it cannot collide with a Lazen
+        // function of the same name, and the mangling has to come off again
+        // before the ABI table is consulted: the table is keyed by the source
+        // name, and looking up `syscall.write` would report a syscall the ABI has
+        // never heard of.
+        let name = match name.strip_prefix(SYSCALL_PREFIX) {
+            Some(bare) => bare,
+            // An unmangled name is accepted rather than refused. The compiler is
+            // the only thing that mangles, and a name without the prefix is what
+            // an IR written by hand would carry; refusing it would mean this
+            // stage could only ever see the compiler's spelling.
+            None => name,
+        };
         let abi = crate::abi_syscall(name).ok_or_else(|| CodegenError::UnnumberedSyscall {
             function: self.name.clone(),
             name: String::from(name),

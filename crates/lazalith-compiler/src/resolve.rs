@@ -795,9 +795,17 @@ pub fn lookup_from<'a>(
     }
 
     // A nested module also sees the file's top-level items, because the root
-    // module encloses every other module.
+    // module encloses every other module — but *only* for a bare name.
+    //
+    // A path that names modules is absolute, and the walk above is its only
+    // meaning. Letting it fall through to the root's items was a real bug: a
+    // program that declared `fn read` made every `std::io::input::read` call
+    // *inside the standard library* resolve to the program's own function, and
+    // the library then failed to compile with an argument-count error pointing
+    // at its own source. A name the path could not reach is a miss, not a
+    // licence to find something else with the same last segment.
     if !from.is_empty()
-        && !crossed_any(resolved, from, modules)
+        && modules.is_empty()
         && let Some(found) = found(&resolved.root, last, from)
     {
         return Some(found);
@@ -840,35 +848,6 @@ fn walk<'a>(
 
 /// Whether walking `modules` from `from` reaches a module at all.
 ///
-/// This is only used to decide whether the enclosing-root fallback applies, so it
-/// answers "did the path name a module" rather than "was the item found": a path
-/// that names a real module and then misses on the item must report that miss, not
-/// fall through and find something else with the same last segment.
-fn crossed_any(resolved: &Resolved, from: &[String], modules: &[&str]) -> bool {
-    if modules.is_empty() {
-        return false;
-    }
-    let mut path: Vec<String> = from.to_vec();
-    let mut current = match resolved.modules.get(&path) {
-        Some(module) => module,
-        None if path.is_empty() => &resolved.root,
-        None => return false,
-    };
-    for segment in modules {
-        if !matches!(current.items.get(*segment), Some(Symbol::Module(_))) {
-            return false;
-        };
-        path.push((*segment).to_string());
-        match resolved.modules.get(&path) {
-            Some(module) => current = module,
-            None => return false,
-        }
-    }
-    let _ = current;
-    true
-}
-
-/// Looks one name up in one module, and decides whether it is visible.
 ///
 /// An item is visible if it is `pub`, if it lives in the module that is asking,
 /// or if it lives in the file's root module, which encloses every other module.
