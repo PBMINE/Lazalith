@@ -3,25 +3,34 @@ name = "lazalith-gui"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "The Lazen GUI library, as Lazen source"
+description = "The SDL3 frontend: a debugger window built on the debug API"
 license = "MIT OR Apache-2.0"
 
-# The library itself has no dependencies, for the same reason
-# `lazalith-stdlib` has none: the library is *text*, and this crate exists only
-# to hold it. Whatever composes the text with the prelude and the standard
-# library does that in `lazalith-runtime`, and depending on the runtime here
-# would make the two crates depend on each other.
+# This crate holds the host frontend: the window a person debugs in. It is the
+# `lazalith-gui` of the roadmap, and it is not the same thing as `lazalith-ui`,
+# which is the widget library a *guest* program links against. One is for the
+# person, the other is for the program.
 #
-# The test dependencies are the opposite: a widget set that was only ever
-# type-checked is a widget set nobody has seen draw.
+# It depends on `lazalith-debug` and `lazalith-sdl3`, and on nothing that holds
+# machine internals. Everything it shows, it shows through the debug API, which
+# is what makes "never access CPU internals directly" a property of the
+# dependency graph rather than a promise in a document.
+[dependencies]
+lazalith-debug = { path = "../lazalith-debug" }
+lazalith-devices = { path = "../lazalith-devices" }
+lazalith-os = { path = "../lazalith-os" }
+lazalith-sdl3 = { path = "../lazalith-sdl3" }
+lazalith-types = { path = "../lazalith-types" }
+
+# The tests drive a real machine through a real program and check what the
+# frontend would draw, so they need the rest of the pipeline to produce an image.
 [dev-dependencies]
 lazalith-boot = { path = "../lazalith-boot" }
 lazalith-cpu = { path = "../lazalith-cpu" }
-lazalith-devices = { path = "../lazalith-devices" }
 lazalith-isa = { path = "../lazalith-isa" }
 lazalith-os = { path = "../lazalith-os" }
 lazalith-runtime = { path = "../lazalith-runtime" }
-lazalith-types = { path = "../lazalith-types" }
+lazalith-toolchain = { path = "../lazalith-toolchain" }
 
 [lints]
 workspace = true

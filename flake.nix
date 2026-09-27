@@ -22,6 +22,18 @@
           cargoBuildFlags = [ "--workspace" ];
           cargoTestFlags = [ "--workspace" ];
           doCheck = true;
+          # `lazalith-sdl3` reaches SDL3 through pkg-config and compiles a C probe
+          # against its headers to check the layout it mirrors. Both need to be in
+          # the *build* environment, not only in the dev shell: a package that
+          # builds in `nix develop` and not in `nix build` is a package that is
+          # broken for everyone who installs it.
+          #
+          # `PKG_CONFIG_PATH` is set explicitly rather than left to the
+          # pkg-config setup hook. The hook would usually do it, and when it does
+          # not the failure is a confusing one — pkg-config found, no `sdl3.pc`,
+          # in a build that looks correctly configured.
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.sdl3 ];
+          PKG_CONFIG_PATH = "${pkgs.lib.getDev pkgs.sdl3}/lib/pkgconfig";
           installPhase = ''
             runHook preInstall
             mkdir -p "$out/lib"

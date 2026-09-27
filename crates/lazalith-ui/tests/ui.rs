@@ -1,6 +1,6 @@
 //! Step 73: the Lazen GUI library, drawing.
 //!
-//! The library is Lazen source in `lazalith-gui`, so testing it is a matter of
+//! The library is Lazen source in `lazalith-ui`, so testing it is a matter of
 //! writing Lazen programs that use it and looking at the pixels. Nothing here
 //! reaches into the library: a program draws with `gui::draw_*` and this test
 //! reads the frame the device presented, exactly as Step 72's does.

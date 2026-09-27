@@ -70,7 +70,7 @@ pub use startup::{StartupError, startup_object, startup_source};
 pub fn library_text() -> String {
     use alloc::string::String as StdString;
     let mut text = StdString::from(PRELUDE);
-    for part in [lazalith_stdlib::STDLIB, lazalith_gui::GUI] {
+    for part in [lazalith_stdlib::STDLIB, lazalith_ui::UI] {
         if !text.ends_with('\n') {
             text.push('\n');
         }

@@ -104,10 +104,13 @@ version = "0.1.0"
 dependencies = [
  "lazalith-boot",
  "lazalith-cpu",
+ "lazalith-debug",
  "lazalith-devices",
  "lazalith-isa",
  "lazalith-os",
  "lazalith-runtime",
+ "lazalith-sdl3",
+ "lazalith-toolchain",
  "lazalith-types",
 ]
 
@@ -178,7 +181,6 @@ dependencies = [
  "lazalith-compiler",
  "lazalith-cpu",
  "lazalith-devices",
- "lazalith-gui",
  "lazalith-isa",
  "lazalith-machine",
  "lazalith-memory",
@@ -186,6 +188,14 @@ dependencies = [
  "lazalith-stdlib",
  "lazalith-toolchain",
  "lazalith-types",
+ "lazalith-ui",
+]
+
+[[package]]
+name = "lazalith-sdl3"
+version = "0.1.0"
+dependencies = [
+ "pkg-config",
 ]
 
 [[package]]
@@ -214,3 +224,22 @@ dependencies = [
 [[package]]
 name = "lazalith-types"
 version = "0.1.0"
+
+[[package]]
+name = "lazalith-ui"
+version = "0.1.0"
+dependencies = [
+ "lazalith-boot",
+ "lazalith-cpu",
+ "lazalith-devices",
+ "lazalith-isa",
+ "lazalith-os",
+ "lazalith-runtime",
+ "lazalith-types",
+]
+
+[[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"

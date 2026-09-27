@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-27 (Steps 1–76 complete and verified)
+Last updated: 2026-09-27 (Steps 1–77 complete and verified)
 
 ## Where the roadmap stands
 
@@ -23,13 +23,62 @@ Step  72      complete: the first graphical Lazen application (831c1a7)
 Step  73      complete: the first-party GUI library (ffef9c8)
 Step  74      complete: the Lazalith debug API (575841c)
 Step  75      complete: machine snapshots (1caf29e)
-Step  76      complete: source-level debug information
+Step  76      complete: source-level debug information (7c0dd70)
+Step  77      complete: the SDL3 frontend
 ```
 
-The 814 workspace tests all pass, including the 4 in
+The 830 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
-input drivers, and the 7 in `crates/lazalith-gui/tests/gui.rs` that draw with the
+input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
+programs on real machines and check every panel the frontend draws.
+
+## Step 77 — the SDL3 frontend
+
+`lazalith-gui` is the window a person debugs in, and it shows the ten things the
+roadmap lists by asking the debug API and nothing else. There is no
+`&mut LazalithMachine` in the crate and no path to one, because
+`DebugController` does not hand them out.
+
+Three crates, because the `unsafe` had to go somewhere and the tests had to be
+able to run without a display:
+
+- **`lazalith-sdl3`** is the entire `unsafe` surface of the project: `extern "C"`
+  declarations and the safe functions wrapping them. Every other crate keeps
+  `unsafe_code = "forbid"`. The build script compiles a probe against SDL3's real
+  headers and the library asserts its own struct layouts against the numbers the
+  C compiler measured, so "this matches SDL3" is checked rather than claimed.
+- **`lazalith-gui`** splits what the frontend shows from how. `view.rs` turns a
+  controller into panels of lines and needs no display; `window.rs` draws them
+  with SDL3 and knows nothing about registers or addresses; `font.rs` is a 5×7
+  bitmap font, because a debugger's output is mostly words and a frontend that
+  assumed the host had a font would show nothing on a machine without one.
+- **`lazalith-ui`** is the guest-side Lazen widget library, renamed from
+  `lazalith-gui` so the roadmap's name could be the host frontend. One is for the
+  person, the other is for the program.
+
+### Two defects the tests found
+
+- **The screen would have shown every picture with two channels swapped.** The
+  guest writes a pixel as alpha, red, green, blue; SDL wants red, green, blue.
+  Uploading the guest's bytes unchanged swaps red and blue, and it looks
+  *plausible* because a mostly-grey test image survives a channel swap almost
+  perfectly. The conversion is now in the view model, where a test can check it
+  against a program that puts a known colour at a known pixel.
+- **SDL3's `SDL_Keycode` is four bytes**, not the eight the first version of the
+  FFI shim assumed. Only the C probe found that; it would have read the wrong
+  field of every key event and reported plausible nonsense keycodes.
+
+### What deliberately did not land
+
+- The frontend has no controls yet. That is Step 78.
+- The window layer is not tested with a real window. The view model is tested
+  against real machines, which is where every decision is made; opening a window
+  in CI needs a display, and a test that needs a display does not get run.
+
+`crates/lazalith-runtime/tests/window.rs` that build
+`examples/window/main.lz` from the repository and run it through the display and
+input drivers, and the 7 in `crates/lazalith-ui/tests/ui.rs` that draw with the
 widget set and read the frame back, and the 13 in
 `crates/lazalith-debug/tests/debug.rs` that drive a real machine through the
 controller, and the 7 in `crates/lazalith-debug/tests/snapshot.rs` that save
@@ -78,6 +127,8 @@ hand to agree with what the compiler would have said.
 - Debug information is only as good as the spans the frontend produced. A span
   covering a whole function maps a whole function.
 
+
+## Earlier milestones
 
 This milestone added code generation. Steps 1–62 are unchanged except for the
 defects Step 63 found by running the generated code, each of which is listed

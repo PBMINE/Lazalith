@@ -1,0 +1,37 @@
+[package]
+name = "lazalith-sdl3"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "The SDL3 boundary: raw FFI declarations, wrapped in a safe API"
+license = "MIT OR Apache-2.0"
+
+# This is the only crate in the workspace that contains `unsafe`.
+#
+# The workspace forbids `unsafe_code` everywhere else, and that rule is the point
+# — every layer above this one is written without it, which means a CPU register
+# cannot be written from a frontend and a guest pointer cannot be built by
+# accident. SDL3 is a C library, and calling into one needs `unsafe`. Rather than
+# relax the rule everywhere, the rule is relaxed *here*, in the smallest possible
+# place: a crate whose entire content is a set of `extern "C"` declarations and
+# the safe functions that wrap them. Everything above this line is checked.
+#
+# That means the `unsafe` in this crate is auditable by reading one file, and
+# that file has no Lazalith logic in it at all. It draws rectangles and reads
+# key events. It cannot execute a guest instruction, read a register file, or
+# construct a pointer into machine memory, because it knows none of those types
+# exist.
+[package.metadata.lazalith]
+unsafe_boundary = true
+
+# `unsafe` is allowed here and nowhere else. The `forbid` in the workspace lints
+# is overridden rather than removed, so a future crate cannot opt in by accident
+# without writing its own `[lints]` section and saying so in review.
+[lints.rust]
+unsafe_code = "allow"
+
+# SDL3 is a C library, so the only way to reach it is a build script that asks
+# pkg-config where it is. The `-sys`-style split is not worth a crate here: there
+# is one build, in Nix, and one library.
+[build-dependencies]
+pkg-config = "0.3"

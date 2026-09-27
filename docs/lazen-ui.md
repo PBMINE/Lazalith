@@ -5,7 +5,7 @@ built on the Lazen SDK, and it does not talk to SDL3 or to any host library.
 
 ## Where it lives
 
-The library is Lazen source in the `lazalith-gui` crate, and the runtime
+The library is Lazen source in the `lazalith-ui` crate, and the runtime
 composes it after the standard library. That is the same arrangement the
 standard library has, and for the same reason: a widget set that is *generated*
 code can disagree with the compiler about what the language means, and a bug in
@@ -14,7 +14,7 @@ code can disagree with the compiler about what the language means, and a bug in
 ```text
 rt::      the syscall wrappers and memory primitives   (lazalith-runtime)
 std::     core, io, text, math, collections, fs, ...  (lazalith-stdlib)
-gui::     the widget set                               (lazalith-gui)
+gui::     the widget set                               (lazalith-ui)
 ```
 
 Nothing in `gui` names a window handle, a device, an event queue, or SDL3. The
@@ -121,7 +121,7 @@ which is the bug a person notices first and believes least.
 
 ## Verifying the contract
 
-The seven tests in `crates/lazalith-gui/tests/gui.rs` write Lazen programs that
+The seven tests in `crates/lazalith-ui/tests/ui.rs` write Lazen programs that
 use the library and read the frame the device presented. They state that a widget
 set can open a window and present a frame with no `std::graphics` call of its
 own; that a layout puts a widget where its cursor said; that a hit test and the
