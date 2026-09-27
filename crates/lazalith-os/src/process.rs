@@ -601,6 +601,7 @@ impl Default for ProcessHandles {
     }
 }
 
+#[derive(Clone)]
 pub struct ProgramImage {
     config: ArchitectureConfig,
     entry: InstructionAddress,
@@ -701,6 +702,7 @@ impl fmt::Debug for ProgramImage {
     }
 }
 
+#[derive(Clone)]
 pub struct Thread {
     process_id: ProcessId,
     id: ThreadId,
@@ -830,6 +832,7 @@ pub struct ProcessParts {
     pub execution_context: Option<ExecutionContextId>,
 }
 
+#[derive(Clone)]
 pub struct Process {
     id: ProcessId,
     state: ProcessState,
@@ -840,6 +843,22 @@ pub struct Process {
     threads: Vec<Thread>,
     handles: ProcessHandles,
     execution_context: Option<ExecutionContextId>,
+}
+
+impl Process {
+    /// Puts back a state this process produced.
+    ///
+    /// The whole process is replaced, not patched field by field. A snapshot is a
+    /// clone of this struct, and a restore that assigned only the fields it
+    /// remembered would leave a process that was *almost* the one that was saved
+    /// — with, say, the handles of the snapshot and the threads of whatever ran
+    /// in between. Replacing the whole value is the only version that cannot
+    /// forget a field, and the identity check is what keeps it from putting one
+    /// process's memory into another.
+    pub fn restore(&mut self, snapshot: &Self) {
+        debug_assert_eq!(self.id, snapshot.id, "restoring into the wrong process");
+        *self = snapshot.clone();
+    }
 }
 
 impl Process {

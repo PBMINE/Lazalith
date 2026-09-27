@@ -509,6 +509,42 @@ impl<D: Device> LazalithMachine<D> {
     pub fn devices(&self) -> &DeviceManager<D> {
         self.bus.devices()
     }
+
+    /// The devices, mutably, for a caller restoring a machine snapshot.
+    ///
+    /// A device's registers are the guest's to read and write, so restoring them
+    /// is restoring guest-visible state rather than reaching past the guest. What
+    /// makes this safe is that a restore goes through
+    /// [`Device::restore`](lazalith_devices::Device::restore), which checks that
+    /// the bytes are the ones that device's own `snapshot` produces — so a
+    /// caller cannot put a display's state into an input device, and cannot pad a
+    /// snapshot into a shape the device would have refused.
+    pub fn devices_mut(&mut self) -> &mut DeviceManager<D> {
+        self.bus.devices_mut()
+    }
+
+    /// The processor, for a caller that has to save or restore it whole.
+    ///
+    /// This is the one accessor that hands out a mutable reference to the CPU, and
+    /// it exists for exactly two callers: a machine snapshot, which has to capture
+    /// the architectural state *and* the trap frame stack together because a
+    /// program stopped in a syscall is neither resumable without them nor
+    /// describable without them; and this crate's own tests.
+    ///
+    /// It is not a debugging convenience. A frontend that could reach the
+    /// processor through this would be able to forge a trap frame and set the
+    /// program counter, which is the thing the debug API deliberately does not
+    /// offer — so nothing outside the workspace's own machine-level code uses it,
+    /// and `lazalith-debug` reaches the CPU only through the machine's
+    /// snapshot methods.
+    pub fn processor(&self) -> &ReferenceInterpreter {
+        &self.cpu
+    }
+
+    /// The processor, mutably. See [`Self::processor`].
+    pub fn processor_mut(&mut self) -> &mut ReferenceInterpreter {
+        &mut self.cpu
+    }
     pub const fn memory(&self) -> &AddressSpace {
         self.bus.address_space()
     }

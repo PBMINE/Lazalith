@@ -54,6 +54,9 @@ impl<D: Device> Bus<D> {
     pub const fn devices(&self) -> &DeviceManager<D> {
         &self.devices
     }
+    pub fn devices_mut(&mut self) -> &mut DeviceManager<D> {
+        &mut self.devices
+    }
     pub fn reset_devices(&mut self, elapsed: lazalith_types::CycleCount) {
         self.devices.reset_at(elapsed);
     }

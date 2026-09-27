@@ -54,12 +54,14 @@ extern crate alloc;
 mod controller;
 mod registers;
 mod session;
+mod snapshot;
 
 pub use controller::{
     DebugController, Disassembly, RunOutcome, StackView, StepOutcome, StopReason,
 };
 pub use registers::{REGISTER_COUNT, RegisterSnapshot, RegisterValue};
 pub use session::{DebugSession, DebugSnapshot, ExecutionState, Watchpoint, WatchpointSize};
+pub use snapshot::{CpuSnapshot, DeviceSnapshot, MachineSnapshot, ProcessSnapshot};
 
 use core::fmt;
 

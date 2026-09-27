@@ -89,6 +89,27 @@ impl Device for RegisterDevice {
     fn tick(&mut self, elapsed: CycleCount) {
         self.ticks = elapsed.as_u64();
     }
+    fn snapshot(&self) -> Vec<u8> {
+        // The test device.s whole state is its eight bytes and its tick count,
+        // and a machine snapshot should carry a test device as faithfully as
+        // a real one.
+        let mut bytes = self.bytes.to_vec();
+        bytes.extend_from_slice(&self.reads.to_le_bytes());
+        bytes.extend_from_slice(&self.ticks.to_le_bytes());
+        bytes
+    }
+    fn restore(&mut self, bytes: &[u8]) -> Result<(), E> {
+        if bytes.len() != 24 {
+            return Err(E::SnapshotShape {
+                expected: 24,
+                found: bytes.len(),
+            });
+        }
+        self.bytes.copy_from_slice(&bytes[..8]);
+        self.reads = u64::from_le_bytes(bytes[8..16].try_into().expect("eight bytes"));
+        self.ticks = u64::from_le_bytes(bytes[16..24].try_into().expect("eight bytes"));
+        Ok(())
+    }
 }
 
 fn manager(peekable: bool) -> DeviceManager<RegisterDevice> {

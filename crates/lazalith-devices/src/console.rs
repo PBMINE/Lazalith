@@ -97,4 +97,30 @@ impl Device for ConsoleDevice {
     fn tick(&mut self, elapsed: CycleCount) {
         self.elapsed = elapsed;
     }
+
+    /// Nothing.
+    ///
+    /// A console device's whole job is to hand bytes to a *host*, and its output
+    /// is not readable by a guest: the device's registers are write-only from the
+    /// guest's side, and `peek` above refuses for exactly that reason. So there
+    /// is no guest-visible state here to capture, and the bytes the console has
+    /// already emitted belong to whoever is showing them, not to the machine.
+    ///
+    /// An empty snapshot is therefore the honest one. Returning the output would
+    /// put host state in a machine snapshot, and would do it in the one place
+    /// where a snapshot's contents are most likely to be assumed to be about the
+    /// guest.
+    fn snapshot(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    fn restore(&mut self, bytes: &[u8]) -> Result<(), DeviceError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        Err(DeviceError::SnapshotShape {
+            expected: 0,
+            found: bytes.len(),
+        })
+    }
 }

@@ -75,7 +75,7 @@ impl Error for AddressSpaceSwapError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct AddressSpace {
     config: ArchitectureConfig,
     identity: AddressSpaceIdentity,

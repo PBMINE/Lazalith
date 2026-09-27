@@ -474,3 +474,91 @@ fn a_tick_records_the_clock() {
     assert!(!device.is_open(), "a tick does not open a window");
     assert_eq!(device.presented(), None, "nor present a frame");
 }
+
+/// A display's snapshot is the window, and restoring it brings the window back.
+///
+/// This is the content test Step 75's shape test could not make: the controller's
+/// tests run with no devices, so what a device's snapshot actually *contains* is
+/// only checkable here, against a device that has a window.
+#[test]
+fn a_display_snapshot_carries_the_window_and_the_frame_count() {
+    use lazalith_devices::Device;
+    let mut device = DisplayDevice::new();
+    device.open(64, 32, 0x40_0000).expect("a window opens");
+    device.present().expect("a frame is presented");
+    device.present().expect("and another");
+
+    let saved = device.snapshot();
+    // Close the window and forget the frames, which a reset does.
+    device.reset();
+    assert!(!device.is_open(), "the window is gone");
+    assert_eq!(device.presented().map(|frame| frame.present_count), None);
+
+    device.restore(&saved).expect("a restore");
+    assert_eq!(device.width(), 64, "the width came back");
+    assert_eq!(device.height(), 32, "the height came back");
+    assert_eq!(
+        device.framebuffer(),
+        0x40_0000,
+        "and the framebuffer's address"
+    );
+    assert_eq!(
+        device.presented().map(|frame| frame.present_count),
+        Some(2),
+        "and both frames are still counted, which a program can read"
+    );
+}
+
+/// A snapshot's bytes are the device's own, and a wrong shape is refused.
+///
+/// A restore that padded or truncated would leave a device partly restored, and
+/// one whose behaviour afterwards depended on what it had been doing before is a
+/// device nobody could reason about.
+#[test]
+fn a_display_refuses_a_snapshot_that_is_not_its_shape() {
+    use lazalith_devices::{Device, DeviceError};
+    let mut device = DisplayDevice::new();
+    let saved = device.snapshot();
+
+    assert!(matches!(
+        device.restore(&[]),
+        Err(DeviceError::SnapshotShape {
+            expected: 40,
+            found: 0
+        }),
+    ));
+    let mut too_long = saved.clone();
+    too_long.push(0);
+    assert!(matches!(
+        device.restore(&too_long),
+        Err(DeviceError::SnapshotShape { .. }),
+    ));
+    // A refused restore changed nothing, so the device is still the one it was.
+    assert_eq!(
+        device.snapshot(),
+        saved,
+        "a refused restore is not a partial one"
+    );
+}
+
+/// The device's clock is not in its snapshot.
+///
+/// The clock is host bookkeeping: a device ticks against it, but nothing in the
+/// register file reports it and no guest instruction can observe it. A snapshot
+/// that carried it would put host state in the one place a frontend is most
+/// likely to assume is about the guest.
+#[test]
+fn a_display_snapshot_leaves_the_clock_out() {
+    use lazalith_devices::Device;
+    let mut device = DisplayDevice::new();
+    device.tick(CycleCount::new(987_654));
+    let with_clock = device.snapshot();
+
+    let other = DisplayDevice::new();
+    let without_clock = other.snapshot();
+    assert_eq!(
+        with_clock, without_clock,
+        "ticking the device changed nothing a guest could see, so it changed \
+         nothing the snapshot holds"
+    );
+}

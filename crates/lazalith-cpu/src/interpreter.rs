@@ -34,6 +34,35 @@ impl ReferenceInterpreter {
     pub const fn trap_controller(&self) -> &TrapController {
         &self.traps
     }
+    /// Puts back a whole processor state, trap frames included.
+    ///
+    /// A machine snapshot needs this because a program stopped in a syscall is
+    /// not resumable from its architectural state alone: the trap frame is where
+    /// the return address and the saved registers are, and restoring the
+    /// registers without it would leave a frame the program never returns
+    /// through. The architectural state is restored *first* and through
+    /// `restore_architectural_state`, so the validation that refuses a state with
+    /// a live frame or a terminal controller still applies — a restore is not a way
+    /// to smuggle an inconsistent processor past the checks a normal step makes.
+    pub fn restore(
+        &mut self,
+        architectural: ArchitecturalState,
+        execution: ExecutionState,
+        traps: TrapController,
+    ) -> Result<(), ControlStateError> {
+        self.restore_architectural_state(architectural)?;
+        self.traps = traps;
+        self.execution = execution;
+        Ok(())
+    }
+    /// The processor's own state, for a snapshot.
+    pub fn capture(&self) -> (ArchitecturalState, ExecutionState, TrapController) {
+        (
+            self.architectural.clone(),
+            self.execution,
+            self.traps.clone(),
+        )
+    }
     pub fn trap_controller_mut(&mut self) -> &mut TrapController {
         &mut self.traps
     }

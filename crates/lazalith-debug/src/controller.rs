@@ -12,9 +12,10 @@ use alloc::vec::Vec;
 
 use lazalith_boot::BootImage;
 use lazalith_devices::Device;
+use lazalith_devices::DeviceId;
 use lazalith_machine::LazalithMachine;
 use lazalith_os::{
-    KernelError, KernelServiceOutcome, LazalithKernel, LzxImage, ProcessId, ThreadId,
+    KernelError, KernelServiceOutcome, LazalithKernel, LzxImage, ProcessId, ProcessState, ThreadId,
     VirtualFileSystem, VirtualTerminal,
 };
 use lazalith_toolchain::disassemble_one;
@@ -23,6 +24,7 @@ use lazalith_types::{ArchitectureConfig, PhysicalAddress};
 use crate::DebugError;
 use crate::registers::RegisterSnapshot;
 use crate::session::{DebugSession, DebugSnapshot, ExecutionState};
+use crate::snapshot::MachineSnapshot;
 
 /// Why a run stopped.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -451,6 +453,79 @@ impl<D: Device> DebugController<D> {
             .ok_or_else(|| DebugError::Snapshot(String::from("there is no such session")))
     }
 
+    /// Captures the whole machine: its processor, its devices, and its
+    /// processes.
+    ///
+    /// What is *not* here is the point of the type. No clock, no terminal
+    /// output, no filesystem, and no copy of any framebuffer's pixels — see
+    /// `snapshot`'s module documentation for the whole list. A guest cannot
+    /// observe any of them, and a snapshot that carried host state would be a
+    /// thing a frontend could restore into a shape the machine had never been in.
+    pub fn snapshot_machine(&self) -> MachineSnapshot {
+        let processes = self.kernel.scheduler().processes().to_vec();
+        MachineSnapshot::of(self.machine.processor(), self.machine.devices(), processes)
+    }
+
+    /// Puts a whole machine back.
+    ///
+    /// The devices and the processes are checked against the machine *before*
+    /// anything is written, so a snapshot taken from a machine with a different
+    /// set of devices or a different set of processes is refused rather than
+    /// half-applied. A snapshot that named the wrong process and put its memory
+    /// into another one would be worse than no restore at all.
+    pub fn restore_machine(&mut self, snapshot: &MachineSnapshot) -> Result<(), DebugError> {
+        if snapshot.process_count() != self.kernel.scheduler().processes().len() {
+            return Err(DebugError::Snapshot(String::from(
+                "the snapshot has a different number of processes",
+            )));
+        }
+        let states: Vec<(DeviceId, Vec<u8>)> = snapshot
+            .devices()
+            .iter()
+            .map(|device| (device.id(), device.bytes().to_vec()))
+            .collect();
+        self.machine
+            .devices_mut()
+            .restore(&states)
+            .map_err(|error| DebugError::Snapshot(format!("a device refused: {error:?}")))?;
+        for captured in snapshot.processes() {
+            let process = self
+                .kernel
+                .scheduler_mut()
+                .process_mut(captured.id())
+                .ok_or_else(|| {
+                    DebugError::Snapshot(String::from(
+                        "the snapshot is of a process this kernel does not have",
+                    ))
+                })?;
+            process.restore(captured.process());
+        }
+        snapshot
+            .cpu()
+            .restore(self.machine.processor_mut())
+            .map_err(DebugError::Snapshot)?;
+        // The sessions follow the processes. Without this a program that had
+        // exited when the snapshot was taken would come back with a *running*
+        // process and a session that still said it had exited, so `run` would
+        // refuse to continue a machine that was perfectly able to — the restore
+        // would have worked and the debugger would not have believed it.
+        for session in &mut self.sessions {
+            let Some(process) = self.kernel.scheduler().process(session.process()) else {
+                continue;
+            };
+            session.set_state(match process.state() {
+                ProcessState::Exited => ExecutionState::Exited {
+                    code: process.exit_code().unwrap_or(0),
+                },
+                ProcessState::Faulted => ExecutionState::Faulted {
+                    detail: "the process was marked faulted",
+                },
+                _ => ExecutionState::Ready,
+            });
+        }
+        Ok(())
+    }
+
     /// Puts a process's debugging state back.
     ///
     /// The process must not be running: a restore that changed the breakpoints
@@ -477,6 +552,14 @@ impl<D: Device> DebugController<D> {
     /// The kernel's terminal output, for a frontend that shows it.
     pub fn terminal_output(&self) -> Vec<u8> {
         self.kernel.terminal().terminal().output().to_vec()
+    }
+
+    /// How many devices the machine has.
+    ///
+    /// A snapshot holds one entry per device, in device order, so a frontend
+    /// showing "the machine's state" can say how many pieces of it are devices.
+    pub fn device_count(&self) -> usize {
+        self.machine.devices().len()
     }
 
     /// The display device, for a frontend that draws the program's window.

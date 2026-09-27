@@ -459,3 +459,64 @@ fn the_same_script_produces_the_same_stream() {
     };
     assert_eq!(run(), run(), "two runs of one script agree exactly");
 }
+
+/// An input device's snapshot carries the queue, because the program owns it.
+///
+/// This is the property that makes an input snapshot worth taking. A snapshot that
+/// kept the counters but not the queued events would restore a device that handed
+/// the same keystroke to the program a second time — and the program is the thing
+/// that drained it, so the repetition would be visible to the guest and not to
+/// anybody else.
+#[test]
+fn an_input_snapshot_carries_the_queue() {
+    use lazalith_devices::Device;
+    let mut device = InputDevice::new();
+    let key = Event::new(EventKind::KeyDown, 30);
+    device.inject(key).expect("the event is queued");
+    device.inject(key).expect("and another");
+    assert_eq!(device.queued(), 2, "two events are waiting");
+
+    let saved = device.snapshot();
+
+    // Drain both, the way a program would: poll into an array of records.
+    let mut events = [Event::decode(&[0u8; EVENT_BYTES as usize]).unwrap(); 4];
+    let capacity = 4u64;
+    let drained = device.poll(&mut events, capacity).expect("a poll");
+    assert_eq!(drained, 2, "the device handed over both");
+    assert_eq!(device.queued(), 0, "the queue is empty");
+
+    device.restore(&saved).expect("a restore");
+    assert_eq!(
+        device.queued(),
+        2,
+        "both events are back, so restoring will not hand the program a third"
+    );
+    assert_eq!(
+        device.delivered(),
+        0,
+        "and the delivered count came back with them, so the program is not told \
+         it has already seen them"
+    );
+}
+
+/// An input device refuses a snapshot that is not its shape.
+#[test]
+fn an_input_device_refuses_a_snapshot_that_is_not_its_shape() {
+    use lazalith_devices::{Device, DeviceError};
+    let mut device = InputDevice::new();
+    // Only the *length* can be checked, and that is worth checking: every
+    // sixteen-byte pattern decodes to some event — sixteen zero bytes are a
+    // perfectly good "a key this build does not name, code zero" — so a length
+    // is the only shape a restore can refuse, and a refused restore must leave
+    // the device as it was rather than partly restored.
+    for wrong in [3usize, 47, 49, 63] {
+        assert!(
+            matches!(
+                device.restore(&vec![0u8; wrong]),
+                Err(DeviceError::SnapshotShape { .. }),
+            ),
+            "{wrong} bytes is not a whole number of events plus the trailer"
+        );
+    }
+    assert_eq!(device.queued(), 0, "and no refused restore queued anything");
+}

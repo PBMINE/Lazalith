@@ -27,7 +27,7 @@ pub enum RegionKind {
     Rom,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MemoryRegion {
     start: PhysicalAddress,
     end: PhysicalAddress,

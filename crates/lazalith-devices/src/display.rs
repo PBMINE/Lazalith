@@ -404,6 +404,58 @@ impl Device for DisplayDevice {
     fn tick(&mut self, elapsed: CycleCount) {
         self.elapsed = elapsed;
     }
+
+    /// The window, as a guest can see it.
+    ///
+    /// Five words: the width, the height, the framebuffer's address, how many
+    /// frames have been presented, and the last address presented. All five are
+    /// readable through the device's registers, so a program is entitled to see
+    /// them again after a restore.
+    ///
+    /// The `elapsed` clock is *not* here. A device ticks against it, but nothing
+    /// in the register file reports it and no guest instruction can observe it,
+    /// so capturing it would put host state in a machine snapshot.
+    ///
+    /// The pixels themselves are not here either, and that is the more interesting
+    /// omission: they belong to the guest, and they are in the process's memory
+    /// rather than in the device. A snapshot that copied them would hold a second
+    /// copy of every framebuffer, which is the one thing this device's design
+    /// refuses to be.
+    fn snapshot(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(5 * 8);
+        for value in [
+            self.width,
+            self.height,
+            self.framebuffer,
+            self.present_count,
+            self.last_present,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn restore(&mut self, bytes: &[u8]) -> Result<(), DeviceError> {
+        const WORDS: usize = 5;
+        if bytes.len() != WORDS * 8 {
+            return Err(DeviceError::SnapshotShape {
+                expected: WORDS * 8,
+                found: bytes.len(),
+            });
+        }
+        let mut words = [0u64; WORDS];
+        for (index, word) in words.iter_mut().enumerate() {
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+            *word = u64::from_le_bytes(chunk);
+        }
+        self.width = words[0];
+        self.height = words[1];
+        self.framebuffer = words[2];
+        self.present_count = words[3];
+        self.last_present = words[4];
+        Ok(())
+    }
 }
 
 impl DisplayDevice {

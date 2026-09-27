@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-27 (Steps 1–74 complete and verified)
+Last updated: 2026-09-27 (Steps 1–75 complete and verified)
 
 ## Where the roadmap stands
 
@@ -21,17 +21,18 @@ Step  70      complete: the LazOS display driver and the Lazen SDK (a8da827)
 Step  71      complete: the LazOS input driver and the host adapter (38be9ca)
 Step  72      complete: the first graphical Lazen application (831c1a7)
 Step  73      complete: the first-party GUI library (ffef9c8)
-Step  74      complete: the Lazalith debug API
-Step  75      NOT started. No snapshot code exists.
+Step  74      complete: the Lazalith debug API (575841c)
+Step  75      complete: machine snapshots
 ```
 
-The 777 workspace tests all pass, including the 4 in
+The 789 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 7 in `crates/lazalith-gui/tests/gui.rs` that draw with the
 widget set and read the frame back, and the 13 in
 `crates/lazalith-debug/tests/debug.rs` that drive a real machine through the
-controller.
+controller, and the 7 in `crates/lazalith-debug/tests/snapshot.rs` that save
+and restore whole machines.
 
 This milestone added code generation. Steps 1–62 are unchanged except for the
 defects Step 63 found by running the generated code, each of which is listed
@@ -3807,3 +3808,102 @@ delivered, with the gap named.
 - **`DebugError` boxes its sources.** Clippy's `result_large_err` was right:
   `KernelError` alone is 128 bytes, and an error type that size is returned on
   every path a frontend can take. Boxed, so the common case is a pointer.
+
+## Step 75 — Machine Snapshots
+
+`CpuSnapshot`, `DeviceSnapshot`, `ProcessSnapshot` and `MachineSnapshot` in
+`crates/lazalith-debug/src/snapshot.rs`, with `DebugController::snapshot_machine`
+and `restore_machine`; seven tests in `crates/lazalith-debug/tests/snapshot.rs`
+plus five in the device crate. The design is in `docs/lazen-debug.md`, in the
+same file as Step 74's because a snapshot is what a debug session saves.
+
+### The trap frame is in the CPU snapshot, and that is not a detail
+
+A program stopped in a syscall has its return address and saved registers in the
+*trap frame*, not in the architectural state. A snapshot of the registers alone
+would restore a machine the program could never return from. So `CpuSnapshot`
+carries the trap controller's frame stack alongside the state, and restores
+through `ReferenceInterpreter::restore`, which puts the architectural state in
+first and *through the same validation a normal step uses* — a restore is not a
+way to smuggle an inconsistent processor past the checks the machine makes every
+step.
+
+### A debugger cannot step into a syscall, and the reason is the kernel's shape
+
+This is the significant finding of the step, and it is a limitation rather than a
+bug. `Kernel::step` traps, dispatches **and** returns from the syscall before it
+comes back, so the machine is never at rest inside one. A search for a live trap
+frame across a whole run finds nothing: the only supervisor-privilege moment
+observable from outside is the pre-handoff state.
+
+So no snapshot support changes it — it is the shape of `Kernel::step`. Making a
+syscall a stopping point means splitting that step so a trap is observable
+between two of them, which is a change to the kernel rather than to the debugger.
+It is written down in `docs/lazen-debug.md` under its own heading so the next
+person to look for "why can't I step into a syscall" finds the answer rather than
+the search.
+
+The `CpuSnapshot` carries the frame stack anyway, and
+`a_snapshot_carries_the_whole_processor` holds the snapshot and the machine to
+agreeing about a frame at every one of 200 steps. A machine *can* rest in a trap,
+and a snapshot that dropped the frames would silently omit the return path of
+whatever was stopped in one.
+
+### Only guest-visible state, and the list of what is not
+
+The roadmap's sentence is the design constraint, so the exclusions are the
+interesting part. A device's `elapsed` clock, a console's emitted output, the
+machine's instruction count and virtual clock, and every framebuffer's pixels are
+all **out**. The last is the one worth explaining: the pixels belong to the guest
+and they live in the process's memory, so a snapshot that copied them would hold
+a second copy of every framebuffer, which is the single thing the display
+device's design refuses to be. `a_snapshot_carries_no_host_state` and
+`a_display_snapshot_leaves_the_clock_out` hold this.
+
+### The devices are the one thing that is encoded rather than cloned
+
+`CpuSnapshot` and `ProcessSnapshot` hold clones, so a field added to a process
+without a decision here is a field a snapshot carries. `DeviceSnapshot` holds the
+device's *own* encoding, because a device's state is a device's business and a
+common encoding in the `Device` trait would have to be a lowest common denominator
+that lost whatever made each device different. `restore` checks the bytes are that
+device's own, so a display's state cannot be put into an input device.
+
+An input device's snapshot carries **the whole queue**, and that is the property
+that makes one worth taking: a program *owns* the queue, it drains it, and a
+snapshot that kept the counters but not the events would hand the same keystroke
+to the program a second time. Only the guest can see that, because the guest is
+what drained it.
+
+### Two real bugs the tests found
+
+**A restore left the sessions behind.** The processes came back correctly, but a
+session whose process had exited still said `Exited`, so `run` refused to continue
+a machine that was perfectly able to. The restore worked and the debugger did not
+believe it. A restore now brings each session into line with the process it
+watches.
+
+**`InputDevice::restore` read its trailer from the wrong place.** The trailer is
+*appended*, so it begins after the events — at 32 for a two-event snapshot — and
+the code used the trailer's *length* (48) as its start offset, running off the end
+of a snapshot of exactly the right length. Found by
+`an_input_snapshot_carries_the_queue`, which restores a snapshot of a real drained
+queue and then reads it back.
+
+A third was a test's own fault and is worth recording because it is a limit of
+what can be checked: the input device's shape test asserted that sixteen zero
+bytes are not a valid event. They are — a key this build does not name, code zero —
+so *only the length* can be refused, and the test now says so.
+
+### Limits
+
+- **A snapshot is a clone, so it is as large as the memory it holds.** A process
+  with 256 KiB of framebuffer makes a 256 KiB snapshot. That is the price of a
+  snapshot that cannot forget a field, and a machine with many processes would want
+  copy-on-write sharing — which is real work and is not here.
+- **A snapshot cannot be restored into a machine with a different shape.** The
+  process count and the device list are checked first, so a refusal is a refusal
+  rather than a half-applied restore. A snapshot taken before a process was
+  spawned is not usable on the machine that process was spawned on.
+- **No source-level information**, so a snapshot records addresses and not lines.
+  That is Step 76.

@@ -483,6 +483,84 @@ impl Device for InputDevice {
     fn tick(&mut self, elapsed: CycleCount) {
         self.elapsed = elapsed;
     }
+
+    /// The queue, as a guest can see it.
+    ///
+    /// The whole queue, from the head onwards, then the head's position, then
+    /// the two counters a program can read through the device's registers. The
+    /// queue belongs here because a program *owns* it: it drains it, and a
+    /// snapshot that left the drained events out would restore a device that
+    /// handed the same keystroke to the program a second time. That is not a
+    /// detail of the host's timing — it is the one thing about input a program
+    /// can observe, because the program is what drained it.
+    ///
+    /// The delivered count is included for the same reason. The `elapsed` clock is
+    /// not: nothing in the register file reports it and no guest instruction can
+    /// observe it.
+    ///
+    /// The encoding is the events' own sixteen-byte record form, then five words:
+    /// the queue's length, the head, the delivered count, the injected count, the
+    /// last reported count, and the last reported capacity.
+    fn snapshot(&self) -> Vec<u8> {
+        let queued = &self.queue[self.head..];
+        let mut bytes = Vec::with_capacity(queued.len() * EVENT_BYTES as usize + 6 * 8);
+        for event in queued {
+            bytes.extend_from_slice(&event.encode());
+        }
+        for value in [
+            queued.len() as u64,
+            self.head as u64,
+            self.delivered,
+            self.injected,
+            self.last_count,
+            self.last_capacity,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn restore(&mut self, bytes: &[u8]) -> Result<(), DeviceError> {
+        const WORDS: usize = 6;
+        // The trailer is *appended*, so it begins after the events rather than at
+        // a fixed offset: two events make it start at 32, and reading it from 48
+        // would run off the end of a snapshot of exactly the right length.
+        let trailer_bytes = WORDS * 8;
+        let event_bytes = EVENT_BYTES as usize;
+        if bytes.len() < trailer_bytes || !(bytes.len() - trailer_bytes).is_multiple_of(event_bytes)
+        {
+            return Err(DeviceError::SnapshotShape {
+                expected: bytes.len(),
+                found: bytes.len(),
+            });
+        }
+        let records = (bytes.len() - trailer_bytes) / event_bytes;
+        let mut queue = Vec::new();
+        for index in 0..records {
+            let at = index * event_bytes;
+            let event =
+                Event::decode(&bytes[at..at + event_bytes]).ok_or(DeviceError::SnapshotShape {
+                    expected: event_bytes,
+                    found: 0,
+                })?;
+            queue.push(event);
+        }
+        let start = records * event_bytes;
+        let mut words = [0u64; WORDS];
+        for (index, word) in words.iter_mut().enumerate() {
+            let at = start + index * 8;
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&bytes[at..at + 8]);
+            *word = u64::from_le_bytes(chunk);
+        }
+        self.queue = queue;
+        self.head = 0;
+        self.delivered = words[2];
+        self.injected = words[3];
+        self.last_count = words[4];
+        self.last_capacity = words[5];
+        Ok(())
+    }
 }
 
 /// The access size a `peek` of `len` bytes is asking for.

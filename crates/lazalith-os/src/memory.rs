@@ -229,7 +229,7 @@ impl UserMemoryLayout {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UserMemory {
     layout: UserMemoryLayout,
     space: AddressSpace,

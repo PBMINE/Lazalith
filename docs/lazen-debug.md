@@ -135,3 +135,85 @@ and consumed once, that a run with nothing to stop it stops at its limit, that
 memory inspection reads the program's own bytes and refuses a partial word, that
 the stack says it is not a call chain, that disassembly names where it stopped,
 and that a session snapshot round-trips and refuses the wrong process.
+
+## Machine snapshots
+
+Step 75 added four types to this crate, and a `Device::snapshot` / `Device::restore`
+pair to the device trait.
+
+| Type | What it holds |
+| --- | --- |
+| `CpuSnapshot` | the architectural registers, the execution state, and the trap frame stack |
+| `DeviceSnapshot` | one device's guest-visible state, as that device encoded it |
+| `ProcessSnapshot` | a process's state, memory, threads and handles |
+| `MachineSnapshot` | the three above, for a whole machine |
+
+`DebugController::snapshot_machine` and `restore_machine` are the entry points.
+
+### Only guest-visible state, and the list of what is not
+
+The roadmap's sentence is the whole design constraint, so the exclusions are the
+interesting part:
+
+| Excluded | Why |
+| --- | --- |
+| a device's elapsed clock | a device ticks against it, but nothing in the register file reports it and no guest instruction can observe it |
+| a console's emitted output | a console hands bytes to a *host*; its registers are write-only from the guest's side, so its output is not the guest's to see again |
+| the machine's instruction count and virtual clock | host bookkeeping about how the machine got here |
+| a framebuffer's pixels | those belong to the guest, and they are in the process's memory — a snapshot that copied them would hold a second copy of every one |
+
+`a_snapshot_carries_no_host_state` and
+`a_display_snapshot_leaves_the_clock_out` hold these.
+
+### Why these are clones and not encodings
+
+Every type but `DeviceSnapshot` holds a clone of the state it names. An encoding
+has to be kept in step with the thing it encodes, and a snapshot that silently
+omits a field is a snapshot that restores a machine which is *almost* the one that
+was saved — which is the failure this step exists to prevent. A clone cannot
+forget a field, so a field added to a process without a decision here is a field a
+snapshot carries.
+
+`DeviceSnapshot` is the exception, and deliberately: a device's state is a
+device's business, and a common encoding in the `Device` trait would have to be a
+lowest common denominator that lost whatever made each device different. A
+display's snapshot is the window; an input device's is the whole queue, because a
+program *owns* that queue — it drains it, and a snapshot that left the drained
+events out would hand the same keystroke to the program twice, which is the one
+thing about input the guest can observe.
+
+`restore` checks the bytes are that device's own, so a display's state cannot be
+put into an input device and a snapshot cannot be padded into a shape the device
+would have refused.
+
+### A restore is checked before anything is written
+
+`restore_machine` compares the process count and the device list *before* it
+touches anything, so a snapshot taken from a machine with a different shape is
+refused rather than half-applied. A snapshot that named the wrong process and put
+its memory into another would be worse than no restore at all.
+
+A restore also brings the **sessions** back into line with the processes they
+watch. That was a real bug: a program that had exited when the snapshot was taken
+came back as a *running* process with a session that still said it had exited, so
+`run` refused to continue a machine that was perfectly able to. The restore worked
+and the debugger did not believe it.
+
+## A debugger cannot step into a syscall
+
+`Kernel::step` traps, dispatches **and** returns from the syscall before it comes
+back, so the machine is never at rest inside one. A debugger can therefore not
+stop inside a syscall on this machine, and no amount of snapshot support changes
+that: it is the shape of `Kernel::step`, not of the debug API.
+
+This is a real gap and it is recorded here rather than papered over. The
+`CpuSnapshot` still carries the trap frame stack, because a machine *can* rest in
+a trap and a snapshot that dropped the frames would be a snapshot that silently
+omitted the return path of whatever was stopped in one — and
+`a_snapshot_carries_the_whole_processor` holds the snapshot and the machine to
+agreeing about a frame at every step of a run.
+
+Making a syscall a stopping point means splitting `Kernel::step` so a trap is
+observable between two steps. That is a change to the kernel's shape, not to the
+debugger, and it belongs with the work that makes a debugger able to show a
+program's system calls rather than only its arithmetic.

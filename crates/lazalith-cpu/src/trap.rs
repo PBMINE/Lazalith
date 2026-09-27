@@ -174,7 +174,7 @@ impl DoubleTrap {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ControllerIdentity {
     marker: Arc<u8>,
 }
@@ -267,7 +267,7 @@ impl SyscallCompletion {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrapController {
     identity: ControllerIdentity,
     config: ArchitectureConfig,

@@ -40,7 +40,10 @@ pub enum DeviceError {
     UnknownDevice(DeviceId),
     DuplicateDevice(DeviceId),
     EmptyDevice,
-    InvalidRange { offset: DeviceOffset, bytes: u64 },
+    InvalidRange {
+        offset: DeviceOffset,
+        bytes: u64,
+    },
     UnsupportedSize(DataSize),
     ReadUnsupported,
     WriteUnsupported,
@@ -48,6 +51,18 @@ pub enum DeviceError {
     Capacity,
     Allocation(TryReserveError),
     Clock(ClockOverflow),
+    /// A snapshot's bytes are not the shape this device produces.
+    ///
+    /// This is a separate case from `InvalidRange` because a *range* is about
+    /// where in the device's registers a read or write landed, and a snapshot is
+    /// not a register access at all: it is the device's own encoding of its
+    /// state. A length that differs is refused rather than padded or truncated.
+    SnapshotShape {
+        /// How many bytes the device's own `snapshot` produces.
+        expected: usize,
+        /// How many bytes were offered.
+        found: usize,
+    },
 }
 
 impl fmt::Display for DeviceError {
@@ -85,6 +100,32 @@ pub trait Device: fmt::Debug {
     ) -> Result<(), DeviceError>;
     fn peek(&self, offset: DeviceOffset, output: &mut [u8]) -> Result<(), DeviceError>;
     fn tick(&mut self, elapsed: CycleCount);
+
+    /// This device's guest-visible state, as bytes.
+    ///
+    /// A machine snapshot holds one of these per device, so this is the only way
+    /// a device's state can be captured. What belongs in the bytes is a rule and
+    /// not a type: **only state a guest can observe or affect**. A display's
+    /// window geometry and its frame count belong — a program reads both through
+    /// MMIO and is entitled to see them again after a restore. The host clock a
+    /// device ticks against does not, and neither does a host file handle, a
+    /// buffer the host is using to stage a window, or anything else the guest
+    /// cannot name.
+    ///
+    /// The encoding is the device's own, and that is deliberate: a device's state
+    /// is a device's business, and a common encoding in this trait would have to
+    /// be a lowest common denominator that lost whatever made each device
+    /// different. [`Device::restore`] is what checks the bytes are this device's
+    /// own, so a mismatch is a refusal rather than a misreading.
+    fn snapshot(&self) -> Vec<u8>;
+
+    /// Puts back a state this device produced.
+    ///
+    /// `bytes` must be exactly what this device's `snapshot` would produce. A
+    /// length that differs is refused rather than padded or truncated, because a
+    /// restored device that silently kept some of its old state is a device whose
+    /// behaviour after a restore depends on what it happened to be doing before.
+    fn restore(&mut self, bytes: &[u8]) -> Result<(), DeviceError>;
 }
 
 #[derive(Debug)]
@@ -113,6 +154,12 @@ impl Device for NoDevice {
         match *self {}
     }
     fn tick(&mut self, _: CycleCount) {
+        match *self {}
+    }
+    fn snapshot(&self) -> Vec<u8> {
+        match *self {}
+    }
+    fn restore(&mut self, _bytes: &[u8]) -> Result<(), DeviceError> {
         match *self {}
     }
 }
@@ -188,6 +235,45 @@ impl<D: Device> DeviceManager<D> {
     }
     pub const fn clock(&self) -> &VirtualClock {
         &self.clock
+    }
+
+    /// Every device's guest-visible state, in device order.
+    ///
+    /// The order is insertion order, which is the order a machine's setup used, so
+    /// a snapshot's `entries[i]` belongs to the same device as the manager's
+    /// `entries[i]` was. Restoring walks the same order and checks each device's
+    /// own encoding, so a snapshot taken from a machine with a different set of
+    /// devices is refused rather than applied to the wrong one.
+    ///
+    /// The manager's `VirtualClock` is **not** here. It is the host's notion of
+    /// when devices were ticked, no guest can read it, and a machine snapshot is
+    /// about what a guest can see.
+    pub fn snapshot(&self) -> Vec<(DeviceId, Vec<u8>)> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.id, entry.device.snapshot()))
+            .collect()
+    }
+
+    /// Puts every device's state back, in the order `snapshot` produced them.
+    pub fn restore(&mut self, states: &[(DeviceId, Vec<u8>)]) -> Result<(), DeviceError> {
+        if states.len() != self.entries.len() {
+            return Err(DeviceError::SnapshotShape {
+                expected: self.entries.len(),
+                found: states.len(),
+            });
+        }
+        // Validated before anything is written, so a snapshot that names the
+        // wrong device does not leave half of them restored.
+        for (index, (id, _)) in states.iter().enumerate() {
+            if self.entries[index].id != *id {
+                return Err(DeviceError::UnknownDevice(*id));
+            }
+        }
+        for (index, (_, bytes)) in states.iter().enumerate() {
+            self.entries[index].device.restore(bytes)?;
+        }
+        Ok(())
     }
 
     fn validate_range(
