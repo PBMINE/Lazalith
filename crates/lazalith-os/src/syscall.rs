@@ -1106,8 +1106,17 @@ impl SyscallDispatcher {
     ) -> Result<ValidatedSyscall, ValidationError> {
         let word_bytes = u64::from(config.word_bytes());
         match call {
+            // The exit status is a *bit pattern*, and a program that computed a
+            // negative one did not do anything the ABI should refuse. A C `int`
+            // is 32 bits in a 64-bit register, so `return -42` from `main`
+            // arrives sign-extended to `0xffffffffffffffd6`, and reading argument
+            // zero as a `u32` rejected the call — a kernel that made "report a
+            // negative number" impossible, for a program that did nothing but
+            // report a negative number. The status is the low 32 bits whatever
+            // sign the register carries, which is also what every host does with
+            // `exit(-1)`.
             Syscall::Exit => Ok(ValidatedSyscall::from_kind(ValidatedSyscallKind::Exit {
-                exit_code: abi(arguments.u32(0))?,
+                exit_code: abi(arguments.word(config, 0))? as u32,
             })),
             Syscall::Write => {
                 let handle = IoHandle::from_raw(abi(arguments.u32(0))?).map_err(Abi)?;

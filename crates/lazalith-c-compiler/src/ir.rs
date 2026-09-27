@@ -453,6 +453,7 @@ impl<'a> Lowerer<'a> {
             syscall_names: Vec::new(),
             strings: Vec::new(),
             block_number: 0,
+            result: signature.result.clone(),
         };
         // A parameter is a slot the prologue fills, and it is marked as one
         // before anything else is allocated, because the backend fills
@@ -590,6 +591,12 @@ struct Emitter<'a> {
     /// whole module rather than per function.
     strings: Vec<(String, Name)>,
     block_number: u32,
+    /// What this function returns, as C wrote it.
+    ///
+    /// A `return` converts to this, and it has to be here rather than looked up
+    /// from the module because the module holds the *IR* type, which has already
+    /// forgotten the difference between an `int` and a `long` that share a width.
+    result: CType,
 }
 
 impl<'a> Emitter<'a> {
@@ -1223,6 +1230,21 @@ impl<'a> Emitter<'a> {
             }
             Statement::Return { value, .. } => {
                 let returned = match value {
+                    // C converts a returned expression to the function's declared
+                    // result type, and this is not a formality. `int main` that
+                    // returns -42 produces a 32-bit `int`, but a register is 64
+                    // bits wide and the value arrives sign-extended; `exit` reads
+                    // its argument as a `u32` and *refuses* anything that does not
+                    // fit, so a program that returned a negative number was
+                    // rejected by the kernel for reporting a negative number.
+                    // Converting here is what makes the low 32 bits the answer and
+                    // the high 32 the sign extension of an `int` rather than part
+                    // of the value.
+                    Some(value) if !self.result.is_void() => {
+                        let value = self.value(value)?;
+                        let result = self.result.clone();
+                        ReturnValue::Value(self.convert(value, &result)?)
+                    }
                     Some(value) => ReturnValue::Value(self.value(value)?),
                     None => ReturnValue::Void,
                 };
