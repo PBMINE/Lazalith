@@ -1585,6 +1585,16 @@ impl<'a> Checker<'a> {
     /// resolver, so the `int` here is a placeholder for a program that already
     /// failed — and it is `int` rather than a panic because a second failure on
     /// an already-failing program helps nobody.
+    /// The type a name has, reporting it if nothing declares one.
+    ///
+    /// Every source of a name is asked in turn — a local, a function, the
+    /// standard library, the OS ABI, a file-scope variable — and the first that
+    /// knows it answers. If none does, that is an error, and it was not always
+    /// one: an unknown name used to be given the type `int`, which is the same
+    /// thing as assuming the program was right about a declaration nobody wrote.
+    /// `printf("hi")` therefore type-checked as *calling an `int`*, and the
+    /// program was told `int` cannot be called, which is a complaint about the
+    /// wrong name in the wrong place.
     fn name(&mut self, name: &str, span: SourceSpan) -> CType {
         if let Some(ty) = self.lookup(name) {
             return ty;
@@ -1605,7 +1615,16 @@ impl<'a> Checker<'a> {
         {
             return ty.clone();
         }
-        let _ = span;
+        self.error(
+            span,
+            codes::UNDECLARED,
+            alloc::format!("`{name}` is not declared"),
+            "a name has to come from a declaration, from the standard library, or \
+             from the OS ABI",
+        );
+        // An `int` so the rest of the program still gets checked and still gets
+        // its other diagnostics. Every stage past this one keeps going after an
+        // error on purpose; a second error on the same name would be noise.
         CType::int()
     }
 
@@ -2475,13 +2494,12 @@ pub fn library_signature(name: &str) -> Option<CType> {
             vec![CType::ulong(), CType::ulong()],
             false,
         ),
-        "realloc" => returns(
-            byte_pointer.clone(),
-            vec![void_pointer.clone(), CType::ulong()],
-            false,
-        ),
         "free" => returns(CType::Void, vec![void_pointer.clone()], false),
-        "exit" | "abort" => returns(CType::Void, vec![CType::int()], false),
+        // `exit` is deliberately absent. It is an ABI syscall, and the compiler asks the
+        // library table *before* the ABI, so a runtime wrapper of the same name would
+        // win — and the wrapper cannot exit, because there is no other exit.
+        // `abort` has no ABI call to shadow, so it is a runtime function and is here.
+        "abort" => returns(CType::Void, vec![CType::int()], false),
         "atoi" => returns(CType::int(), vec![byte_pointer.clone()], false),
         "abs" | "labs" => returns(
             if name == "abs" {
@@ -2532,28 +2550,6 @@ pub fn library_signature(name: &str) -> Option<CType> {
         "ftell" => returns(CType::long(), vec![void_pointer.clone()], false),
         "fclose" => returns(CType::int(), vec![void_pointer.clone()], false),
         "fflush" => returns(CType::int(), vec![void_pointer.clone()], false),
-        // The three variadic formatters. They are declared here so a call
-        // *checks*, and they are *defined* by the runtime in Lazen, because a
-        // variadic function's body is the one thing this C cannot write.
-        "printf" | "fprintf" | "sprintf" | "snprintf" => {
-            let count = match name {
-                "printf" => 1,
-                "fprintf" => 2,
-                "sprintf" => 2,
-                _ => 3,
-            };
-            let mut params = Vec::new();
-            for _ in 0..count {
-                params.push(byte_pointer.clone());
-            }
-            if name == "snprintf" {
-                params.push(CType::ulong());
-            }
-            if name == "sprintf" {
-                params.push(void_pointer.clone());
-            }
-            returns(CType::int(), params, true)
-        }
         _ => None,
     }
 }

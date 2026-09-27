@@ -306,3 +306,76 @@ fn the_number_helpers_work() {
     // number, and the kernel reports it as a `u32`. -42 is 0xffffffd6.
     assert_eq!(finished.exit_code, u32::MAX - 41, "atoi parsed -42");
 }
+
+/// Printing is a call per piece, because a variadic body is what this C cannot
+/// write. Both halves are checked: the text, and the digits.
+#[test]
+fn printing_needs_no_format_string() {
+    let finished = run(r#"
+        int main(void) {
+            print("n=");
+            print_decimal(-1234);
+            print_line("");
+            print("done");
+            return 0;
+        }
+        "#);
+    assert_eq!(String::from_utf8_lossy(&finished.output), "n=-1234\ndone");
+    assert_eq!(finished.exit_code, 0);
+}
+
+/// `print_decimal(0)` is the one value with no digits, and a loop that divides
+/// by ten until it is zero writes nothing at all for it.
+#[test]
+fn zero_has_a_digit() {
+    let finished = run(r#"
+        int main(void) {
+            print_decimal(0);
+            print_line("");
+            return 0;
+        }
+        "#);
+    assert_eq!(String::from_utf8_lossy(&finished.output), "0\n");
+}
+
+/// `exit` is the ABI's own syscall, and the runtime must not shadow it with a
+/// wrapper that cannot exit. A program that returns normally and a program that
+/// calls `exit` have to be distinguishable by their status.
+#[test]
+fn exit_is_the_syscall() {
+    let finished = run(r#"
+        int main(void) {
+            print("bye");
+            exit(7);
+            return 1;
+        }
+        "#);
+    assert_eq!(finished.exit_code, 7, "exit set the status");
+    assert_eq!(String::from_utf8_lossy(&finished.output), "bye");
+}
+
+/// The C runtime and the Lazen helpers are two objects, and a shared name would
+/// The C runtime and the Lazen helpers are two objects, and a shared *definition*
+/// would be a link error on the day somebody linked both. Checked in the
+/// direction that can actually collide: every name Lazen defines must be absent
+/// from the C source, because the C side is the one that is text-matched here.
+#[test]
+fn the_two_halves_share_no_names() {
+    let lazen: Vec<&str> = lazalith_c_runtime::VARIADIC
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pub fn "))
+        .filter_map(|rest| rest.split('(').next())
+        .collect();
+    assert!(
+        !lazen.is_empty(),
+        "the Lazen half defines nothing, so this test would pass on an empty list"
+    );
+    for name in lazen {
+        let defined = format!("{name}(");
+        assert!(
+            !lazalith_c_runtime::C_RUNTIME.contains(&format!(" {defined}")),
+            "Lazen defines `{name}` and so does the C runtime; a program linking \
+             both would get one of them at random"
+        );
+    }
+}

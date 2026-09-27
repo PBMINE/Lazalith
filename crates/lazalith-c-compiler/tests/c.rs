@@ -627,3 +627,49 @@ fn a_type_names_itself_as_c_spells_it() {
     assert_eq!(CType::array_of(CType::int(), 3).name(), "int[3]");
     assert_eq!(CType::ulong().name(), "unsigned long");
 }
+
+/// The standard library's variadic formatters are not declared, on purpose.
+///
+/// Declaring them so a call would *check* against a plausible signature was tried
+/// and is worse than not having them: the program compiled, and the failure came
+/// back from the linker as an undefined symbol, which names neither the reason
+/// nor the file to look at. An unknown name is a compile error that says the
+/// name.
+#[test]
+fn printf_is_not_declared() {
+    // The resolver reports this one, so its code is the resolver's `UNDECLARED`
+    // and not the checker's. Both say the same thing about the same name; which
+    // stage catches it first is a detail of the pipeline, not of the rule.
+    let codes = all_codes("int main(void) { printf(\"hi\"); return 0; }");
+    assert!(
+        codes.iter().any(|code| code == "C0301" || code == "C0403"),
+        "a call to `printf` should be an undeclared name, got {codes:?}"
+    );
+    let rendered = message("int main(void) { printf(\"hi\"); return 0; }");
+    assert!(
+        rendered.contains("printf") && rendered.contains("not declared"),
+        "the message should name what it could not find, got:\n{rendered}"
+    );
+}
+
+/// `exit` is the ABI's, and the library table must not answer for it.
+#[test]
+fn exit_is_the_syscalls() {
+    let lowered = build("int main(void) { exit(3); return 0; }")
+        .unwrap_or_else(|error| panic!("`exit` should compile: {error}"));
+    let calls: Vec<&str> = instructions(only_function(&lowered))
+        .iter()
+        .filter_map(|instruction| match instruction {
+            lazalith_ir::Instruction::Call {
+                target: lazalith_ir::CallTarget::Syscall(name),
+                ..
+            } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        ["syscall.exit"],
+        "`exit` should lower to the syscall"
+    );
+}

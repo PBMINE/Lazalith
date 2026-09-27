@@ -24,19 +24,25 @@
 //! no way to return memory to the kernel — and a `free` that did nothing would be
 //! a lie a program could not see. See `free` below.
 //!
-//! # `printf` is not in this file, and that is not an oversight
+//! # There is no `printf`, and that is not an oversight
 //!
 //! A variadic function's body has to find the arguments past the ones it names,
-//! and the C in this compiler cannot do that: a variadic *definition* is refused,
-//! because the IR's blocks are built in the order a body is walked and a
-//! variadic frame has nowhere to put the extra arguments. So the three
-//! formatters are declared here — a call to one *checks*, with the right
-//! signature — and defined in [`VARIADIC`], which is Lazen, because Lazen *can*
-//! express them.
+//! and the C in this compiler cannot do that: a variadic *definition* is
+//! refused, because the IR's blocks are built in the order a body is walked and
+//! a variadic frame has nowhere to put the extra arguments. So printing is a
+//! call per piece — [`C_RUNTIME`] has `print`, `print_line` and `print_decimal`,
+//! which between them cover what a `%s` and a `%d` would have, and a program
+//! that needs interleaving says so by making two calls.
 //!
-//! That is the honest arrangement: one formatters' implementation, in the
-//! language that can write one, rather than a second C implementation that would
-//! have to invent a calling convention and hope it matched.
+//! Declaring `printf` anyway, so that a call to it *checks* against a real
+//! signature, was tried and is worse than not having it. The program compiles,
+//! and the failure arrives from the linker as an undefined symbol — which says
+//! nothing about the real problem, and points at the wrong file. An unknown name
+//! is a compile error that names the name.
+//!
+//! [`VARIADIC`] is the other half and is *not* part of the C translation unit:
+//! it is Lazen, for Lazen callers, and the two are separate objects with
+//! separate names for the same jobs.
 
 /// The C runtime, as C source.
 pub const C_RUNTIME: &str = r#"
@@ -256,14 +262,12 @@ void free(void *pointer) {
     (void)pointer;
 }
 
-void exit(int status) {
-    /* `exit` is the ABI's own syscall, reached through the compiler's syscall
-     * table, so this is a call and not a wrapper around a wrapper. */
-    (void)status;
-}
-
-void abort(void) {
-    exit(1);
+void abort(int status) {
+    /* There is no `exit` here on purpose. It is an ABI syscall, and the compiler
+     * asks its library table before the ABI, so a runtime `exit` would win — and a
+     * wrapper around the only exit there is cannot exit. Leaving the name out is
+     * what lets `abort` call the real one. */
+    exit(status);
 }
 
 int abs(int value) { if (value < 0) { return 0 - value; } return value; }
@@ -313,6 +317,67 @@ int putchar(int value) {
     one[0] = (char)value;
     if (write_to(1, one, 1) < 0) { return -1; }
     return value & 255;
+}
+
+/* Printing without a format string.
+ *
+ * There is no `printf` here, and the reason is in `VARIADIC`: reading the
+ * arguments past the ones a function names is the one thing this C cannot do,
+ * because a variadic definition is refused. Declaring `printf` so that a call
+ * *checks* was tried and is worse than not having it — the program compiled, and
+ * the failure arrived from the linker as an undefined symbol, which says nothing
+ * about the real problem.
+ *
+ * So printing is what it can honestly be: a call per piece. A program writes a
+ * number by asking for its digits. These are named apart from `VARIADIC`'s Lazen
+ * helpers on purpose, because the two are separate objects and a shared name
+ * would be a link error waiting for the day somebody links both.
+ */
+
+/* Writes `text` to the console, with no newline. */
+void print(const char *text) {
+    (void)write_to(1, text, strlen(text));
+}
+
+/* Writes `text` to the console and then a newline. */
+void print_line(const char *text) {
+    (void)write_to(1, text, strlen(text));
+    (void)putchar(10);
+}
+
+/* Writes `value` in decimal, with a leading `-` when it is negative.
+ *
+ * Written with a local buffer rather than by building a string, because `malloc`
+ * would make printing depend on the allocator, and a program whose first act is
+ * to print a diagnostic should not be the reason the allocator runs. Thirty-two
+ * bytes covers every 64-bit value: twenty digits, a sign, and room to be wrong.
+ */
+void print_decimal(long value) {
+    char digits[32];
+    unsigned long at = 0;
+    unsigned long negative = 0;
+    if (value < 0) {
+        negative = 1;
+        value = 0 - value;
+    }
+    if (value == 0) {
+        digits[0] = 48;
+        at = 1;
+    }
+    while (value > 0) {
+        long rest = value / 10;
+        long last = value - rest * 10;
+        digits[at] = (char)(48 + last);
+        at = at + 1;
+        value = rest;
+    }
+    if (negative != 0) {
+        (void)putchar(45);
+    }
+    while (at > 0) {
+        at = at - 1;
+        (void)putchar((int)digits[at]);
+    }
 }
 
 int puts(const char *text) {
@@ -400,29 +465,25 @@ long ftell(void *stream) {
 }
 "#;
 
-/// The variadic formatters, as Lazen source.
+/// The Lazen printing helpers, as Lazen source.
 ///
-/// A C function cannot be written for these, and writing them in Lazen is not a
-/// workaround so much as an admission: the machine's C does not yet have
-/// variadic function bodies, and a second C implementation would have to invent
-/// a calling convention and hope it matched the one the C compiler emits.
+/// These are *not* the C runtime's `printf`, and they are not standing in for
+/// one. A C variadic function body is the one thing the C in this compiler
+/// cannot write, so the C runtime prints with a call per piece — `print`,
+/// `print_line` and `print_decimal` — and these are the same three jobs for a
+/// Lazen caller, written in the language whose callers are Lazen.
+///
+/// They are a separate object with separate names. A C program links
+/// [`C_RUNTIME`]; a Lazen program links this. There is no combined form, and
+/// there was one: a `unit()` that concatenated the two into a single string,
+/// which is C and Lazen in the same translation unit and would have compiled
+/// exactly as far as the first Lazen `pub`.
 pub const VARIADIC: &str = r#"
-// The formatters the C runtime declares and does not define.
+// Printing for Lazen callers, named apart from the C runtime's so that the two
+// objects can both be linked without a collision.
 //
-// Implemented here in Lazen because a variadic function's body is the one thing
-// the C in this compiler cannot express: its body has to find the arguments
-// past the ones it names, and the IR builds a function's blocks in the order the
-// body is walked.
-//
-// Each one forwards to the runtime's own printing, which takes a `str` and an
-// integer, so a caller that wants a number formats it and passes a string. That
-// is not a full `printf` and it does not pretend to be: a `%d` in a C string is
-// a C concept and this compiler has no macro expansion, so a C program spells a
-// number by asking for its digits.
-//
-// The C declarations in `C_RUNTIME` are what make a *call* check. A call to a
-// name with no definition here would link to nothing, and the linker is right to
-// refuse it.
+// Each forwards to the runtime's own printing, which takes a `str` and an
+// integer, so a caller that wants a number formats it and passes a string.
 
 /// Writes `text` to the console.
 pub fn put(text: &str) -> bool {
@@ -462,17 +523,3 @@ pub fn print_line_number(value: i64) -> bool {
     return io::write("\n");
 }
 "#;
-
-/// The C runtime and the variadic support, concatenated in the order they must
-/// be compiled.
-///
-/// The order matters in exactly one way: the variadic part may call the runtime's
-/// `strlen` and `strcpy`, so the runtime comes first. Neither part defines a name
-/// the other defines, which is checked by a test rather than asserted here.
-pub fn unit() -> String {
-    let mut source = String::with_capacity(C_RUNTIME.len() + VARIADIC.len());
-    source.push_str(C_RUNTIME);
-    source.push('\n');
-    source.push_str(VARIADIC);
-    source
-}
