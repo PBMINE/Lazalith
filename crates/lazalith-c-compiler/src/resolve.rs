@@ -347,7 +347,7 @@ impl<'a> Resolver<'a> {
             let is_function = declarator
                 .derivation
                 .last()
-                .is_some_and(|derivation| matches!(derivation, Derivation::Function(_, _)));
+                .is_some_and(|derivation| matches!(derivation, Derivation::Function(_, _, _)));
             self.declare(Binding {
                 name: name.clone(),
                 kind: if is_function {
@@ -444,7 +444,9 @@ impl<'a> Resolver<'a> {
             file_scope: false,
             external: false,
         });
-        if let Some(Derivation::Function(parameters, _)) = definition.declarator.derivation.last() {
+        if let Some(Derivation::Function(parameters, _, _)) =
+            definition.declarator.derivation.last()
+        {
             for parameter in parameters {
                 let Some(declarator) = &parameter.declarator else {
                     continue;

@@ -789,10 +789,16 @@ impl<'a> Emitter<'a> {
         if let Some(ty) = self.program.function_types.get(name) {
             return Some(ty.clone());
         }
-        // A call to an ABI name has the ABI's signature, not the program's, and
-        // that is what makes the call's arguments convertible: a `write` whose
-        // first argument is an `int` needs the argument to *be* an `int`.
-        crate::types::abi_signature(name)
+        // A call to a name the *libraries* provide has that library's signature,
+        // and a call to an ABI name has the ABI's. Neither is the program's, and
+        // both are what make a call's arguments convertible: a `write` whose first
+        // argument is an `int` needs the argument to *be* an `int`, and a
+        // `strlen` whose argument is a `char *` needs a `char *`.
+        //
+        // The library is asked *first*, because `printf` is a library function
+        // and `write` is a syscall, and a compiler that lowered both the same way
+        // would be claiming the kernel has a `printf`.
+        crate::types::library_signature(name).or_else(|| crate::types::abi_signature(name))
     }
 
     /// Reads a value of a type from an address.
@@ -1446,7 +1452,18 @@ impl<'a> Emitter<'a> {
                     },
                 })
             }
-            Expression::Cast { operand, .. } => self.value(operand),
+            Expression::Cast { operand, .. } => {
+                // A cast is applied, not ignored. `(unsigned char)` on a signed load
+                // is a *different value* and `(int)` on a pointer-sized value is a
+                // different width, so dropping the cast would make both mean
+                // something the program did not write.
+                let value = self.value(operand)?;
+                let target = self.cast_type(expression);
+                match target {
+                    Some(target) if !matches!(target, CType::Void) => self.convert(value, &target),
+                    _ => Ok(value),
+                }
+            }
             Expression::SizeofType(_) | Expression::SizeofExpression(_) => {
                 self.constant(8, &CType::ulong())
             }
@@ -1963,14 +1980,21 @@ impl<'a> Emitter<'a> {
                     self.type_of(left)
                 }
             }
-            Expression::Cast { ty, .. } => self.cast_type(ty),
+            Expression::Cast { .. } => self.cast_type(expression),
             _ => None,
         }
     }
 
-    /// A cast's target type, which the emitter cannot rebuild on its own.
-    fn cast_type(&self, _ty: &crate::ast::TypeName) -> Option<CType> {
-        None
+    /// A cast's target type, as the type checker recorded it.
+    ///
+    /// `(T)` names a *type*, and building one needs the typedef and tag tables,
+    /// which belong to the checker. So the checker records the type it resolved and
+    /// this reads it back by where the cast starts.
+    fn cast_type(&self, expression: &Expression) -> Option<CType> {
+        self.program
+            .cast_types
+            .get(&crate::types::expression_span(expression).start().as_u32())
+            .cloned()
     }
 
     /// Converts a value to a type, through a temporary.

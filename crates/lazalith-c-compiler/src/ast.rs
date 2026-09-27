@@ -312,7 +312,13 @@ pub enum Derivation {
     /// `[n]`, with its constant size.
     Array(Option<Expression>),
     /// `(parameters)`.
-    Function(Vec<ParameterDeclaration>, bool),
+    ///
+    /// The second field is whether the parentheses were *written* around what came
+    /// before. It is the whole difference between `int *f(void)` and
+    /// `int (*f)(void)`, and it cannot be recovered from the list of derivations
+    /// afterwards: both produce the same list, in the same order, and mean opposite
+    /// things.
+    Function(Vec<ParameterDeclaration>, bool, bool),
 }
 
 /// One parameter in a function declarator.

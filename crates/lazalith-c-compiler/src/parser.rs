@@ -413,7 +413,7 @@ impl<'a> Parser<'a> {
         // variable holding a pointer, and there is no body for one here.
         if !matches!(
             declarator.derivation.last(),
-            Some(Derivation::Function(_, _))
+            Some(Derivation::Function(_, _, _))
         ) {
             self.error_at(
                 self.span_from(start, self.at),
@@ -514,7 +514,14 @@ impl<'a> Parser<'a> {
                 shorts += 1;
                 width_seen = true;
                 self.advance();
-            } else if base.is_none() && !width_seen && self.starts_base_type() {
+            } else if base.is_none()
+                // A *keyword* type may follow a width keyword — `unsigned char`
+                // and `long int` are both C. A bare *name* may not, and allowing
+                // it is how `typedef long number;` became a declaration of
+                // something with no name.
+                && (self.is_keyword_base_type()
+                    || (!width_seen && self.is_typedef_name_at(0)))
+            {
                 base = Some(self.base_type());
             } else {
                 break;
@@ -547,15 +554,7 @@ impl<'a> Parser<'a> {
     /// A name is a base type only if it is a `typedef`, which is the one piece
     /// of type knowledge a C parser needs and the only reason it needs any.
     fn starts_base_type(&self) -> bool {
-        self.is_keyword_at(0, "void")
-            || self.is_keyword_at(0, "char")
-            || self.is_keyword_at(0, "int")
-            || self.is_keyword_at(0, "float")
-            || self.is_keyword_at(0, "double")
-            || self.is_keyword_at(0, "_Bool")
-            || self.is_keyword_at(0, "struct")
-            || self.is_keyword_at(0, "union")
-            || self.is_keyword_at(0, "enum")
+        self.is_keyword_base_type()
             // The width and signedness keywords are a base type on their own, and
             // leaving them out is what makes `short b = 0;` inside a function look
             // like a statement: a statement cannot begin with `short`, so this
@@ -565,6 +564,25 @@ impl<'a> Parser<'a> {
             || self.is_keyword_at(0, "signed")
             || self.is_keyword_at(0, "unsigned")
             || self.is_typedef_name_at(0)
+    }
+
+    /// Whether a *keyword* base type starts here.
+    ///
+    /// A keyword type is a base type on its own and may follow a width keyword,
+    /// because `unsigned char` and `long int` are both C. A bare *name* is not,
+    /// because C does not let a second type specifier that is a typedef follow a
+    /// width keyword — and allowing it is how `typedef long number;` becomes a
+    /// declaration of something with no name at all.
+    fn is_keyword_base_type(&self) -> bool {
+        self.is_keyword_at(0, "void")
+            || self.is_keyword_at(0, "char")
+            || self.is_keyword_at(0, "int")
+            || self.is_keyword_at(0, "float")
+            || self.is_keyword_at(0, "double")
+            || self.is_keyword_at(0, "_Bool")
+            || self.is_keyword_at(0, "struct")
+            || self.is_keyword_at(0, "union")
+            || self.is_keyword_at(0, "enum")
     }
 
     fn base_type(&mut self) -> BaseType {
@@ -833,7 +851,7 @@ impl<'a> Parser<'a> {
             let (name, tail) = self.direct_declarator();
             derivation.extend(tail);
             self.expect_punctuator(")");
-            while let Some(suffix) = self.derivation_suffix() {
+            while let Some(suffix) = self.derivation_suffix(true) {
                 derivation.push(suffix);
             }
             return (name, derivation);
@@ -844,7 +862,7 @@ impl<'a> Parser<'a> {
             None
         };
         let mut tail = Vec::new();
-        while let Some(derivation) = self.derivation_suffix() {
+        while let Some(derivation) = self.derivation_suffix(false) {
             tail.push(derivation);
         }
         (name, tail)
@@ -864,7 +882,12 @@ impl<'a> Parser<'a> {
     }
 
     /// One `[...]` or `(...)` after a declarator's name.
-    fn derivation_suffix(&mut self) -> Option<Derivation> {
+    ///
+    /// `after_parens` says whether the suffix followed a *parenthesised
+    /// declarator*, which is the difference between `int *f(void)` and
+    /// `int (*f)(void)`. A function's own parameter list is not a parenthesised
+    /// declarator and passes `false`.
+    fn derivation_suffix(&mut self, after_parens: bool) -> Option<Derivation> {
         if self.eat_punctuator("[") {
             // `static`, `const`, `volatile` and `restrict` inside the brackets
             // describe the *parameter* an array type becomes, not the array
@@ -899,7 +922,9 @@ impl<'a> Parser<'a> {
                 // and `T` are the two names this language spells the same way.
                 self.advance();
                 self.advance();
-                return Some(Derivation::Function(parameters, false));
+                // `f(void)` — no parentheses were written, so the base type is the return
+                // type and everything to the left of these parentheses belongs there.
+                return Some(Derivation::Function(parameters, false, false));
             }
             if !self.is_punctuator(0, ")") {
                 if self.is_punctuator(0, "...") {
@@ -920,7 +945,9 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_punctuator(")");
-            return Some(Derivation::Function(parameters, variadic));
+            // The parentheses were written, so what came before them is a pointer to
+            // this function rather than a return type of it.
+            return Some(Derivation::Function(parameters, variadic, after_parens));
         }
         None
     }
@@ -1426,15 +1453,17 @@ impl<'a> Parser<'a> {
         if level >= LEVELS.len() {
             return self.unary_expression();
         }
+        // Level zero is `|`, and it sits *above* `&&` and `||` in C's table even
+        // though it is in this table: the logical operators are handled by their
+        // own functions because they short-circuit, so the operands of `|` are
+        // `logical_or` and the operands of `&&` are this level's successor. Every
+        // other level recurses in the ordinary way.
         let mut left = if level == 0 {
             self.logical_or()
         } else {
             self.binary_expression(level + 1)
         };
         loop {
-            if level == 0 {
-                return left;
-            }
             let mut matched = None;
             for (text, op) in LEVELS[level] {
                 if self.is_punctuator(0, text) {
@@ -1444,7 +1473,11 @@ impl<'a> Parser<'a> {
             }
             let Some(op) = matched else { return left };
             self.advance();
-            let right = self.binary_expression(level + 1);
+            let right = if level == 0 {
+                self.logical_or()
+            } else {
+                self.binary_expression(level + 1)
+            };
             left = Expression::Binary {
                 op,
                 left: Box::new(left),
@@ -1708,7 +1741,7 @@ impl<'a> Parser<'a> {
         let mut derivation = self.pointer_prefix();
         // An abstract declarator may still have an array or function suffix, and
         // those bind *outside* the pointers: `int *[3]` is an array of pointers.
-        while let Some(suffix) = self.derivation_suffix() {
+        while let Some(suffix) = self.derivation_suffix(false) {
             derivation.push(suffix);
         }
         let span = self.span_from(&start, self.at);

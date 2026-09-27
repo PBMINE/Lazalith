@@ -145,6 +145,14 @@ pub struct CheckedCProgram {
     /// all, so the emitter cannot find a type by walking back to a definition. It
     /// is recorded here, where every front-end stage can put it.
     pub function_types: BTreeMap<String, CType>,
+    /// Every cast's target type, keyed by where the cast starts.
+    ///
+    /// A cast is the one expression whose type the emitter cannot rebuild: `(T)` names
+    /// a *type*, and building one needs the typedef table and the tag table, which
+    /// are the checker's. A cast that is dropped is not a missed optimisation —
+    /// `(unsigned char)` on a signed load is a different value — so the type is
+    /// recorded where it is known and read back by byte offset.
+    pub cast_types: BTreeMap<u32, CType>,
     /// The function the runtime starts at, which is `main`.
     pub entry: String,
     /// Every failure.
@@ -161,6 +169,7 @@ pub fn check(source: SourceId, sources: &SourceManager, resolved: &Resolved) -> 
         typedefs: BTreeMap::new(),
         tags: BTreeMap::new(),
         function_types: BTreeMap::new(),
+        cast_types: BTreeMap::new(),
         program_globals: Vec::new(),
         functions: Vec::new(),
         globals: Vec::new(),
@@ -178,6 +187,7 @@ pub fn check(source: SourceId, sources: &SourceManager, resolved: &Resolved) -> 
         globals: core::mem::take(&mut checker.globals),
         typedefs: core::mem::take(&mut checker.typedefs),
         function_types: core::mem::take(&mut checker.function_types),
+        cast_types: core::mem::take(&mut checker.cast_types),
         tags: core::mem::take(&mut checker.tags),
         entry: String::from("main"),
         diagnostics: core::mem::take(&mut checker.errors),
@@ -198,6 +208,8 @@ struct Checker<'a> {
     /// is the table both look it up in.
     function_types: BTreeMap<String, CType>,
     /// Every file-scope object's type, for the same reason.
+    /// Every cast's target type, keyed by the cast's start offset.
+    cast_types: BTreeMap<u32, CType>,
     program_globals: Vec<(String, CType)>,
     functions: Vec<CheckedFunction>,
     globals: Vec<CheckedVariable>,
@@ -274,7 +286,7 @@ impl<'a> Checker<'a> {
             if declarator
                 .derivation
                 .last()
-                .is_some_and(|derivation| matches!(derivation, Derivation::Function(_, _)))
+                .is_some_and(|derivation| matches!(derivation, Derivation::Function(_, _, _)))
             {
                 continue;
             }
@@ -301,7 +313,7 @@ impl<'a> Checker<'a> {
             if !declarator
                 .derivation
                 .last()
-                .is_some_and(|derivation| matches!(derivation, Derivation::Function(_, _)))
+                .is_some_and(|derivation| matches!(derivation, Derivation::Function(_, _, _)))
             {
                 continue;
             }
@@ -508,54 +520,116 @@ impl<'a> Checker<'a> {
         self.tags.get(&key).cloned().unwrap_or(CType::int())
     }
 
-    /// The type a declarator builds from a base type.
     ///
-    /// The derivation list is in the order the source wrote it, and C's rule is
-    /// that the derivation *nearest the name* applies first. So the list is
-    /// folded from the end, and every type this produces is one derivation
-    /// applied to the next.
+    /// C's declarator rule is the opposite of what the list looks like, and this
+    /// is where it is stated once. The derivation list is in *source* order, so
+    /// `int *f(void)` is `[Pointer, Function]` and `int (*f)(void)` is
+    /// `[Pointer, Function]` as well — the same list meaning opposite things. The
+    /// difference is whether the function's parentheses were written, and that is
+    /// why [`Derivation::Function`] records it.
+    ///
+    /// - **Written parentheses** (`int (*f)(void)`): the derivations to the left
+    ///   are pointers *to* the function, so the function is built first and the
+    ///   prefix wraps it.
+    /// - **Unwritten** (`int *f(void)`): the derivations to the left belong to
+    ///   the function's *return* type, so they are folded into the return type and
+    ///   the function wraps that.
+    ///
+    /// Everything else is an array or another pointer, folded left to right.
     fn declarator_type(&mut self, base: &CType, declarator: &Declarator) -> CType {
-        let mut ty = base.clone();
-        for derivation in declarator.derivation.iter().rev() {
-            ty = match derivation {
-                Derivation::Pointer(_) => CType::Pointer(Box::new(ty)),
-                Derivation::Array(length) => {
-                    let count = match length {
-                        Some(expression) => self
-                            .constant_value(expression)
-                            .and_then(|value| u32::try_from(value).ok())
-                            .unwrap_or(1),
-                        None => 1,
-                    };
-                    CType::array_of(ty, count.max(1))
-                }
-                Derivation::Function(parameters, variadic) => {
-                    let mut params = Vec::new();
-                    for parameter in parameters {
-                        let parameter_base = self.specifier_type(&parameter.base);
-                        let parameter_ty = match &parameter.declarator {
-                            Some(inner) => self.declarator_type(&parameter_base, inner),
-                            None => parameter_base,
-                        };
-                        // C adjusts a parameter's type before the body sees it:
-                        // an array parameter is a pointer parameter, and a
-                        // function parameter is a pointer parameter. Without
-                        // this the body would be handed an array to subscript.
-                        params.push(parameter_ty.decayed());
-                    }
-                    if params.len() == 1 && matches!(params[0], CType::Void) {
-                        params.clear();
-                    }
-                    CType::Function(Box::new(FunctionType {
-                        result: ty,
-                        params,
-                        variadic: *variadic,
-                        names: Vec::new(),
-                    }))
-                }
-            };
+        let derivation = &declarator.derivation;
+        let function = derivation
+            .iter()
+            .position(|entry| matches!(entry, Derivation::Function(..)));
+        let Some(at) = function else {
+            let mut ty = base.clone();
+            for entry in derivation {
+                ty = self.derived(ty, entry);
+            }
+            return ty;
+        };
+        let signature = self.signature(base, &derivation[at]);
+        let Derivation::Function(_, _, parenthesised) = &derivation[at] else {
+            unreachable!("the position came from this very match");
+        };
+        if *parenthesised {
+            let mut ty = signature;
+            for entry in &derivation[..at] {
+                ty = self.derived(ty, entry);
+            }
+            return ty;
         }
-        ty
+        let mut result = base.clone();
+        for entry in &derivation[..at] {
+            result = self.derived(result, entry);
+        }
+        self.with_result(signature, result)
+    }
+
+    /// One derivation applied to a type.
+    fn derived(&mut self, ty: CType, derivation: &Derivation) -> CType {
+        match derivation {
+            Derivation::Pointer(_) => CType::Pointer(Box::new(ty)),
+            Derivation::Array(length) => {
+                let count = match length {
+                    Some(expression) => self
+                        .constant_value(expression)
+                        .and_then(|value| u32::try_from(value).ok())
+                        .unwrap_or(1),
+                    None => 1,
+                };
+                CType::array_of(ty, count.max(1))
+            }
+            // A second function derivation in one declarator is a function
+            // returning a function, which C does not have a type for. Reaching
+            // here means the parser produced something the grammar forbids, and
+            // `ty` is the honest fallback: the compiler reports the parse.
+            Derivation::Function(..) => ty,
+        }
+    }
+
+    /// A function type with `result` as its return type.
+    fn with_result(&mut self, signature: CType, result: CType) -> CType {
+        match signature {
+            CType::Function(mut function) => {
+                function.result = result;
+                CType::Function(function)
+            }
+            other => other,
+        }
+    }
+
+    /// The function type a `Function` derivation describes, with the base as its
+    /// return type.
+    fn signature(&mut self, base: &CType, derivation: &Derivation) -> CType {
+        let Derivation::Function(parameters, variadic, _) = derivation else {
+            return base.clone();
+        };
+        let mut params = Vec::new();
+        for parameter in parameters {
+            let parameter_base = self.specifier_type(&parameter.base);
+            let parameter_ty = match &parameter.declarator {
+                Some(inner) => self.declarator_type(&parameter_base, inner),
+                None => parameter_base,
+            };
+            // C adjusts a parameter's type before the body sees it: an array
+            // parameter is a pointer parameter, and a function parameter is a
+            // pointer parameter. Without this the body would be handed an array
+            // to subscript and a function to call.
+            params.push(parameter_ty.decayed());
+        }
+        // `f(void)` names no parameters. `f()` in a *definition* also names none,
+        // and the distinction only matters in a declaration, where a lone `void`
+        // parameter is the only way to say it.
+        if params.len() == 1 && matches!(params[0], CType::Void) {
+            params.clear();
+        }
+        CType::Function(Box::new(FunctionType {
+            result: base.clone(),
+            params,
+            variadic: *variadic,
+            names: Vec::new(),
+        }))
     }
 
     fn type_name_type(&mut self, name: &TypeName) -> CType {
@@ -583,7 +657,7 @@ impl<'a> Checker<'a> {
             if declarator
                 .derivation
                 .last()
-                .is_some_and(|derivation| matches!(derivation, Derivation::Function(_, _)))
+                .is_some_and(|derivation| matches!(derivation, Derivation::Function(_, _, _)))
             {
                 // A prototype is a function with no body, and a function with no
                 // body has no storage and no code. Its type is in
@@ -651,7 +725,7 @@ impl<'a> Checker<'a> {
             if declarator
                 .derivation
                 .last()
-                .is_some_and(|derivation| matches!(derivation, Derivation::Function(_, _)))
+                .is_some_and(|derivation| matches!(derivation, Derivation::Function(_, _, _)))
             {
                 // A prototype is a function with no body, and a function with no
                 // body has no storage and no code. Its type is in
@@ -709,7 +783,11 @@ impl<'a> Checker<'a> {
                  be called",
             );
         }
-        if signature.result.size_in_bytes().is_none_or(|size| size > 8) {
+        if signature
+            .result
+            .size_in_bytes()
+            .is_some_and(|size| size > 8)
+        {
             self.error(
                 definition.span.clone(),
                 codes::UNSUPPORTED,
@@ -740,7 +818,8 @@ impl<'a> Checker<'a> {
         self.return_type = Some(signature.result.clone());
         self.scopes.push(BTreeMap::new());
         let mut parameters = Vec::new();
-        if let Some(Derivation::Function(declarations, _)) = definition.declarator.derivation.last()
+        if let Some(Derivation::Function(declarations, _, _)) =
+            definition.declarator.derivation.last()
         {
             for parameter in declarations {
                 let parameter_base = self.specifier_type(&parameter.base);
@@ -978,7 +1057,8 @@ impl<'a> Checker<'a> {
                             return;
                         }
                         let actual = self.expression(value);
-                        self.convertible(&actual, &expected, span.clone());
+                        let zero = self.is_null_constant(value);
+                        self.convertible(&actual, &expected, span.clone(), zero);
                     }
                 }
             }
@@ -1011,7 +1091,10 @@ impl<'a> Checker<'a> {
         match initial {
             Initializer::Scalar(expression) => {
                 let actual = self.expression(expression);
-                self.convertible(&actual, &ty.decayed(), span);
+                {
+                    let zero = self.is_null_constant(expression);
+                    self.convertible(&actual, &ty.decayed(), span, zero);
+                }
             }
             Initializer::List {
                 items,
@@ -1405,7 +1488,8 @@ impl<'a> Checker<'a> {
                         );
                     }
                     _ => {
-                        self.convertible(&value_ty, &target_ty, expression_span(target));
+                        let zero = self.is_null_constant(value);
+                        self.convertible(&value_ty, &target_ty, expression_span(target), zero);
                     }
                 }
                 target_ty
@@ -1416,6 +1500,13 @@ impl<'a> Checker<'a> {
             }
             Expression::Cast { ty, operand } => {
                 let to = self.type_name_type(ty);
+                // The target is recorded so the emitter can apply it. A cast that is
+                // dropped is not a missed optimisation: `(unsigned char)` on a signed
+                // load is a *different value*, and `(int)` on a pointer-sized value is
+                // a different width.
+                let _ = self
+                    .cast_types
+                    .insert(expression_span(expression).start().as_u32(), to.clone());
                 let from = self.expression(operand);
                 if to.is_void() {
                     return CType::Void;
@@ -1457,6 +1548,9 @@ impl<'a> Checker<'a> {
         }
         if let Some(ty) = self.function_types.get(name) {
             return ty.clone();
+        }
+        if let Some(ty) = library_signature(name) {
+            return ty;
         }
         if let Some(ty) = abi_signature(name) {
             return ty;
@@ -1631,7 +1725,11 @@ impl<'a> Checker<'a> {
             .take(signature.params.len())
         {
             let expected = &signature.params[index];
-            self.convertible(actual, expected, expression_span(&arguments[index]));
+            // A zero argument is a null pointer constant and is allowed wherever
+            // a pointer is expected, which is why the check asks about the *value*
+            // and not only the type.
+            let zero = self.is_null_constant(&arguments[index]);
+            self.convertible(actual, expected, expression_span(&arguments[index]), zero);
         }
         signature.result.clone()
     }
@@ -1681,16 +1779,26 @@ impl<'a> Checker<'a> {
                     );
                 }
             } else if !left.is_integer() || !right.is_integer() {
-                self.error(
-                    expression_span(left_expr),
-                    codes::WRONG_OPERAND,
-                    alloc::format!(
-                        "`<` and `>` need integers, and these are `{}` and `{}`",
-                        left.name(),
-                        right.name()
-                    ),
-                    "there is no floating point on this machine, and pointers have no order",
-                );
+                // `<` and `>` on two pointers is real C and a library needs it: a
+                // `memmove` decides its copy direction by asking which region
+                // starts lower. C requires the result to be meaningful only
+                // within one array, and comparing unrelated pointers is undefined
+                // — so this accepts the comparison and says what it means, rather
+                // than refusing a line every C string routine is written with.
+                let both_pointers = left.is_pointer() && right.is_pointer();
+                if !both_pointers {
+                    self.error(
+                        expression_span(left_expr),
+                        codes::WRONG_OPERAND,
+                        alloc::format!(
+                            "`<` and `>` need integers, and these are `{}` and `{}`",
+                            left.name(),
+                            right.name()
+                        ),
+                        "there is no floating point on this machine; two pointers may also be \
+                         compared, and the result is meaningful only within one array",
+                    );
+                }
             }
             // A comparison produces an `int` in C, not a `_Bool`, and the
             // difference is visible in `printf("%d", a < b)`.
@@ -1834,7 +1942,7 @@ impl<'a> Checker<'a> {
     /// purpose, and `c = 300` for a `char` is a documented truncation. A
     /// conversion to a *wider signed* type from a value that does not fit is
     /// not truncation but a wrong number, and that is reported.
-    fn convertible(&mut self, from: &CType, to: &CType, span: SourceSpan) {
+    fn convertible(&mut self, from: &CType, to: &CType, span: SourceSpan, zero: bool) {
         if to.is_void() {
             return;
         }
@@ -1846,6 +1954,13 @@ impl<'a> Checker<'a> {
                 return;
             }
             if from.is_integer() {
+                // A null pointer constant is a way of *writing* a null pointer,
+                // and `return 0;` from a function returning a pointer is the most
+                // ordinary line in C. Anything else is refused, because a
+                // pointer is an address and a number is not one.
+                if zero {
+                    return;
+                }
                 self.error(
                     span,
                     codes::WRONG_OPERAND,
@@ -2249,4 +2364,151 @@ fn unchecked_abi_signature(name: &str) -> Option<CType> {
         variadic: true,
         names: Vec::new(),
     })))
+}
+
+/// The C signature of a function the standard library provides.
+///
+/// A C library function is not a syscall. `write` is a syscall and `printf` is
+/// not, and a compiler that lowered both the same way would be claiming the
+/// kernel has a `printf`. So the two are separate tables, and a call resolves
+/// through the library first and the ABI second.
+///
+/// The signatures here are the runtime's, from `lazalith-c-runtime`, and they are
+/// C's own: `size_t` is `unsigned long`, a null pointer is written as `0`, and a
+/// function that can fail returns a null pointer or `-1` rather than a status
+/// the caller has to check twice.
+pub fn library_signature(name: &str) -> Option<CType> {
+    let byte_pointer = CType::pointer_to(CType::Int {
+        bits: 8,
+        signed: true,
+    });
+    let void_pointer = CType::Pointer(Box::new(CType::Void));
+    let string = |params: Vec<CType>| {
+        Some(CType::Function(Box::new(FunctionType {
+            result: CType::long(),
+            params,
+            variadic: false,
+            names: Vec::new(),
+        })))
+    };
+    let returns = |result: CType, params: Vec<CType>, variadic: bool| {
+        Some(CType::Function(Box::new(FunctionType {
+            result,
+            params,
+            variadic,
+            names: Vec::new(),
+        })))
+    };
+    match name {
+        // <string.h>
+        "strlen" => string(vec![byte_pointer.clone()]),
+        // `memcmp`'s third argument is a *length* in C, not an end pointer, and
+        // the string functions' third argument is a length too — so all three
+        // have the same shape here. `memcmp` takes `const void *` and the string
+        // functions `const char *`; the ABI is a word either way.
+        "strcmp" | "strncmp" | "memcmp" => {
+            string(vec![byte_pointer.clone(), byte_pointer.clone(), CType::ulong()])
+        }
+        "strcpy" | "strcat" | "strchr" | "strrchr" | "strstr" => {
+            string(vec![byte_pointer.clone(), byte_pointer.clone()])
+        }
+        "strncpy" | "strncat" => string(vec![
+            byte_pointer.clone(),
+            byte_pointer.clone(),
+            CType::ulong(),
+        ]),
+        "memcpy" | "memmove" => string(vec![
+            void_pointer.clone(),
+            void_pointer.clone(),
+            CType::ulong(),
+        ]),
+        "memset" => string(vec![void_pointer.clone(), CType::int(), CType::ulong()]),
+        // <stdlib.h>
+        "malloc" => returns(byte_pointer.clone(), vec![CType::ulong()], false),
+        "calloc" => returns(
+            byte_pointer.clone(),
+            vec![CType::ulong(), CType::ulong()],
+            false,
+        ),
+        "realloc" => returns(
+            byte_pointer.clone(),
+            vec![void_pointer.clone(), CType::ulong()],
+            false,
+        ),
+        "free" => returns(CType::Void, vec![void_pointer.clone()], false),
+        "exit" | "abort" => returns(CType::Void, vec![CType::int()], false),
+        "atoi" => returns(CType::int(), vec![byte_pointer.clone()], false),
+        "abs" | "labs" => returns(
+            if name == "abs" {
+                CType::int()
+            } else {
+                CType::long()
+            },
+            vec![if name == "abs" {
+                CType::int()
+            } else {
+                CType::long()
+            }],
+            false,
+        ),
+        // <stdio.h>
+        "puts" => returns(CType::int(), vec![byte_pointer.clone()], false),
+        "putchar" => returns(CType::int(), vec![CType::int()], false),
+        "fputs" => returns(
+            CType::int(),
+            vec![byte_pointer.clone(), void_pointer.clone()],
+            false,
+        ),
+        "fwrite" => returns(
+            CType::ulong(),
+            vec![
+                void_pointer.clone(),
+                CType::ulong(),
+                CType::ulong(),
+                void_pointer.clone(),
+            ],
+            false,
+        ),
+        "fread" => returns(
+            CType::ulong(),
+            vec![
+                void_pointer.clone(),
+                CType::ulong(),
+                CType::ulong(),
+                void_pointer.clone(),
+            ],
+            false,
+        ),
+        "fseek" => returns(
+            CType::int(),
+            vec![void_pointer.clone(), CType::long(), CType::int()],
+            false,
+        ),
+        "ftell" => returns(CType::long(), vec![void_pointer.clone()], false),
+        "fclose" => returns(CType::int(), vec![void_pointer.clone()], false),
+        "fflush" => returns(CType::int(), vec![void_pointer.clone()], false),
+        // The three variadic formatters. They are declared here so a call
+        // *checks*, and they are *defined* by the runtime in Lazen, because a
+        // variadic function's body is the one thing this C cannot write.
+        "printf" | "fprintf" | "sprintf" | "snprintf" => {
+            let count = match name {
+                "printf" => 1,
+                "fprintf" => 2,
+                "sprintf" => 2,
+                _ => 3,
+            };
+            let mut params = Vec::new();
+            for _ in 0..count {
+                params.push(byte_pointer.clone());
+            }
+            if name == "snprintf" {
+                params.push(CType::ulong());
+            }
+            if name == "sprintf" {
+                params.push(void_pointer.clone());
+            }
+            returns(CType::int(), params, true)
+        }
+        _ => None,
+    }
 }
