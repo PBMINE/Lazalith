@@ -121,6 +121,9 @@ pub struct DebugController<D: Device> {
     debug: Option<DebugBlock>,
     word_size: u64,
     pause_requested: bool,
+    /// Whether the current run should ignore breakpoints, which is what
+    /// `continue_` sets for the length of one run.
+    suspended_breakpoints: bool,
     step_limit: u64,
 }
 
@@ -174,6 +177,7 @@ impl<D: Device> DebugController<D> {
             debug: None,
             word_size: u64::from(config.word_width().bytes()),
             pause_requested: false,
+            suspended_breakpoints: false,
             step_limit: 1_000_000,
         })
     }
@@ -376,9 +380,12 @@ impl<D: Device> DebugController<D> {
         let mut retired: u64 = 0;
         let reason = loop {
             let pc = self.machine.architectural_state().pc().as_u64();
-            let hit = self
-                .session(process)
-                .is_some_and(|session| session.is_breakpoint(pc));
+            // A suspended breakpoint is one the user asked to ignore for this run, which
+            // is what `continue_` means. Everything else still stops the program.
+            let hit = !self.suspended_breakpoints
+                && self
+                    .session(process)
+                    .is_some_and(|session| session.is_breakpoint(pc));
             if hit {
                 break StopReason::Breakpoint { address: pc };
             }
@@ -456,9 +463,26 @@ impl<D: Device> DebugController<D> {
         }
     }
 
-    /// Runs the process again, which is what a user means by "continue".
+    /// Runs the process again, ignoring its breakpoints.
+    ///
+    /// This is what a user means by "continue": keep going, and do not stop at the
+    /// places I marked earlier. It is *not* the same as `run`, and the difference
+    /// is the whole reason the two exist.
+    ///
+    /// The breakpoints are not cleared and are still there afterwards. A Continue
+    /// that deleted them would leave the user with a debugger that had forgotten
+    /// where they were, and the next `run` would stop somewhere they had chosen
+    /// to skip. They are *suspended* for the length of this one run and restored
+    /// the moment it ends, so the program is unaffected either way.
+    ///
+    /// A watchpoint still stops it, and so does a pause or the step limit: only
+    /// breakpoints are suspended, because they are the one kind of stop the user
+    /// is explicitly saying to ignore.
     pub fn continue_(&mut self, process: ProcessId) -> Result<RunOutcome, DebugError> {
-        self.run(process)
+        self.suspended_breakpoints = true;
+        let result = self.run(process);
+        self.suspended_breakpoints = false;
+        result
     }
 
     /// The loaded image's source-level debug information, if it has any.

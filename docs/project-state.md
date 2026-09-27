@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-27 (Steps 1–77 complete and verified)
+Last updated: 2026-09-27 (Steps 1–78 complete and verified)
 
 ## Where the roadmap stands
 
@@ -24,14 +24,17 @@ Step  73      complete: the first-party GUI library (ffef9c8)
 Step  74      complete: the Lazalith debug API (575841c)
 Step  75      complete: machine snapshots (1caf29e)
 Step  76      complete: source-level debug information (7c0dd70)
-Step  77      complete: the SDL3 frontend
+Step  77      complete: the SDL3 frontend (063dd76)
+Step  78      complete: the GUI controls
 ```
 
-The 830 workspace tests all pass, including the 4 in
+The 847 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
-programs on real machines and check every panel the frontend draws.
+programs on real machines and check every panel the frontend draws, and the 15 in
+`crates/lazalith-gui/tests/controls.rs` that press every control against a real
+machine and check what the program did.
 
 ## Step 77 — the SDL3 frontend
 
@@ -71,10 +74,43 @@ able to run without a display:
 
 ### What deliberately did not land
 
-- The frontend has no controls yet. That is Step 78.
 - The window layer is not tested with a real window. The view model is tested
   against real machines, which is where every decision is made; opening a window
   in CI needs a display, and a test that needs a display does not get run.
+
+## Step 78 — the GUI controls
+
+Run, Continue, Step, Pause, Breakpoint and Reset live in `control.rs`, not in the
+window. A key press is an event, a debugger's action is a decision, and the layer
+between them is where the interesting mistakes are — so it is headless and every
+control is tested against a real machine with no window and no synthesised key
+events. The window only turns a scancode into a `Control`, and draws the
+bindings along the top so a control a person cannot find is not a control they
+will press.
+
+Every outcome is a value, and a refusal is a `Refusal` variant with a stable
+diagnostic code rather than a message a caller has to read back.
+
+### Two gaps the tests found in what came before
+
+- **`continue` did not continue.** `DebugController::continue_` was an alias for
+  `run`, so it stopped at the breakpoints the user was explicitly asking it to
+  ignore. It now runs with them suspended and restores them when the run ends.
+  A Continue implemented by clearing and re-setting them would be wrong in a way
+  nobody would notice until a program set its own breakpoint mid-run, and one
+  that *deleted* them would leave the user with a debugger that had forgotten
+  where they were.
+- **Reset went to the wrong place.** The reset point was taken before the
+  supervisor handoff, so a reset returned the program counter to the kernel's
+  `RFE` and needed another step before the user was back where they were.
+  Loading a program in the debugger now includes the handoff, and the reset point
+  is the program's entry point — which is where a person means by "the start".
+
+The first version of the pause control claimed to stop a program it had not
+stopped. The controller steps synchronously, so there is no moment between two
+instructions to interrupt, and the outcome is now named `PauseRequested` for
+what it is: the next run or step takes it at its first instruction boundary.
+
 
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and

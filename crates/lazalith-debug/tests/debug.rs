@@ -585,3 +585,60 @@ fn a_finished_process_can_have_its_session_restored() {
          not restoring a machine"
     );
 }
+
+/// `continue` runs past the breakpoints without deleting them.
+#[test]
+fn continue_ignores_breakpoints_and_keeps_them() {
+    let mut controller = controller();
+    let entry = after_handoff(&mut controller);
+    let session = controller.session_mut(PID).expect("the session");
+    let address = session
+        .set_breakpoint(entry)
+        .expect("a breakpoint at the entry");
+    assert!(address, "the breakpoint was set");
+
+    // `run` stops at the breakpoint, which is the whole point of it.
+    let stopped = controller.run(PID).expect("the program runs");
+    assert_eq!(stopped.reason, StopReason::Breakpoint { address: entry });
+
+    // `continue` does not, and the breakpoint is still there afterwards. A
+    // continue that cleared it would leave the user with a debugger that had
+    // forgotten where they had chosen to stop.
+    let outcome = controller.continue_(PID).expect("the program continues");
+    assert_ne!(
+        outcome.reason,
+        StopReason::Breakpoint { address: entry },
+        "continue ran past the breakpoint: {:?}",
+        outcome.reason
+    );
+    let session = controller.session(PID).expect("the session");
+    assert!(
+        session.is_breakpoint(entry),
+        "and the breakpoint is still set afterwards"
+    );
+
+    // The process that ran on has finished, and a finished process refuses to be
+    // run again rather than silently restarting — which is what a debugger that
+    // quietly reset a program would be.
+    assert!(
+        controller.run(PID).is_err(),
+        "a program that has exited cannot be run again without a reset"
+    );
+}
+
+/// A `continue` still ends for the program.s own reason.
+#[test]
+fn continue_still_reports_the_programs_own_end() {
+    let mut controller = controller();
+    after_handoff(&mut controller);
+    let outcome = controller.continue_(PID).expect("the program continues");
+    // Suspending breakpoints suspends only breakpoints. A run that ignored
+    // everything would report the instruction limit instead of the exit, and a
+    // debugger that did that would be unable to tell a paused program from a
+    // finished one.
+    assert!(
+        matches!(outcome.reason, StopReason::Exit { .. }),
+        "the run ended for the program's own reason: {:?}",
+        outcome.reason
+    );
+}

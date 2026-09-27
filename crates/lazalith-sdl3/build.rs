@@ -41,7 +41,9 @@ int main(void) {
         sizeof(SDL_Event) <= LAZALITH_EVENT_BUFFER_SIZE ? 1 : -1
     ];
     printf("event=%lu key_event=%lu key_offset=%lu key_field=%lu "
-           "scancode=%lu repeat=%lu bool_size=%lu keycode=%lu keymod=%lu\n",
+           "scancode=%lu repeat=%lu bool_size=%lu keycode=%lu keymod=%lu "
+           "scancode_f4=%lu scancode_f5=%lu scancode_f6=%lu scancode_f7=%lu "
+           "scancode_f8=%lu scancode_f9=%lu scancode_f10=%lu scancode_f11=%lu\n",
            (unsigned long) sizeof(SDL_Event),
            (unsigned long) sizeof(SDL_KeyboardEvent),
            (unsigned long) offsetof(SDL_Event, key),
@@ -50,7 +52,15 @@ int main(void) {
            (unsigned long) offsetof(SDL_KeyboardEvent, repeat),
            (unsigned long) sizeof(bool),
            (unsigned long) sizeof(SDL_Keycode),
-           (unsigned long) sizeof(SDL_Keymod));
+           (unsigned long) sizeof(SDL_Keymod),
+           (unsigned long) SDL_SCANCODE_F4,
+           (unsigned long) SDL_SCANCODE_F5,
+           (unsigned long) SDL_SCANCODE_F6,
+           (unsigned long) SDL_SCANCODE_F7,
+           (unsigned long) SDL_SCANCODE_F8,
+           (unsigned long) SDL_SCANCODE_F9,
+           (unsigned long) SDL_SCANCODE_F10,
+           (unsigned long) SDL_SCANCODE_F11);
     return 0;
 }
 "#;
@@ -125,7 +135,7 @@ fn main() {
         // generated file carries an `allow` for the doc comment a public constant
         // in an included file would otherwise need written twice.
         generated.push_str(&format!(
-            "#[allow(non_upper_case_globals, missing_docs)]\n\
+            "#[allow(non_upper_case_globals, missing_docs, dead_code)]\n\
              pub const {name}: usize = {value};\n"
         ));
     }

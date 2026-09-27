@@ -48,3 +48,6 @@ pub use view::{
     View, ViewOptions,
 };
 pub use window::Windowed;
+
+pub mod control;
+pub use control::{Control, Controls, Outcome, Refusal};

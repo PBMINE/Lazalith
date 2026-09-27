@@ -118,17 +118,27 @@ impl Windowed {
         self.renderer
             .fill(SdlRect::new(0.0, 0.0, width_f, height_f))?;
 
+        // The bindings strip, along the top. A control a person cannot find is a
+        // control they will not press, so the keys are shown rather than written
+        // down somewhere else.
+        let strip = ROW + PADDING;
+        self.draw_bindings(strip)?;
+        let top = strip + GAP;
+
+        // Both columns start below the bindings strip, so a control is never
+        // hidden behind the thing it controls.
+        let column_height = height_f - top - PADDING;
         let left = SdlRect::new(
             PADDING,
-            PADDING,
+            top,
             width_f / 2.0 - PADDING - GAP / 2.0,
-            height_f - PADDING * 2.0,
+            column_height,
         );
         let right = SdlRect::new(
             width_f / 2.0 + GAP / 2.0,
-            PADDING,
+            top,
             width_f / 2.0 - PADDING - GAP / 2.0,
-            height_f - PADDING * 2.0,
+            column_height,
         );
         // The screen is the one panel whose aspect ratio is not the panel's, so it
         // takes a square and the disassembly takes what is left under it.
@@ -150,6 +160,22 @@ impl Windowed {
 
         self.draw_column(view, right)?;
         self.renderer.present()
+    }
+
+    /// Draws the key bindings along the top of the window.
+    ///
+    /// Every control with a key, with the key first, because the person looking
+    /// for "how do I step" is looking for a key and not for a word.
+    fn draw_bindings(&mut self, y: f32) -> Result<(), lazalith_sdl3::SdlError> {
+        let mut x = PADDING;
+        for (key, label) in Self::bindings() {
+            self.draw_text(key, x, y, Color::AMBER)?;
+            x += (font::GLYPH_WIDTH + font::GLYPH_SPACING) as f32 * key.len() as f32;
+            self.draw_text(label, x + 4.0, y, Color::WHITE)?;
+            x += (font::GLYPH_WIDTH + font::GLYPH_SPACING) as f32 * label.len() as f32;
+            x += font::GLYPH_SPACING as f32 * 4.0;
+        }
+        Ok(())
     }
 
     /// Draws the right-hand column's panels in the order given.
@@ -317,6 +343,30 @@ impl Windowed {
         lazalith_sdl3::poll_event()
     }
 
+    /// The controls the window's function keys are bound to.
+    ///
+    /// Drawn as a strip along the top of the window, with the key beside each
+    /// one. A control a person cannot find is a control they will not press, so
+    /// the bindings are shown rather than documented somewhere else.
+    pub fn bindings() -> Vec<(&'static str, &'static str)> {
+        use crate::control::Control;
+        [
+            Control::Run,
+            Control::ContinueRun,
+            Control::Step,
+            Control::Pause,
+            Control::ToggleBreakpoint,
+            Control::Reset,
+            Control::ClearBreakpoints,
+        ]
+        .iter()
+        .filter_map(|control| {
+            let key = control.scancode()?;
+            Some((key_name(key), control.label()))
+        })
+        .collect()
+    }
+
     /// Keeps SDL's own video reference alive for as long as the window is.
     ///
     /// SDL is shut down when this value drops, which must be after the window and
@@ -358,5 +408,24 @@ impl View {
                     lines: Vec::new(),
                 })
             })
+    }
+}
+
+/// The name of a function key, for the bindings strip.
+///
+/// Written out rather than derived, because the scancodes are SDL's and the names
+/// are the ones a person reads. An unknown scancode is shown as its number, which
+/// is honest: a binding to a key this frontend has no name for should look odd on
+/// screen rather than be silently dropped from the list.
+fn key_name(scancode: u32) -> &'static str {
+    match scancode {
+        lazalith_sdl3::SCANCODE_F4 => "F4",
+        lazalith_sdl3::SCANCODE_F5 => "F5",
+        lazalith_sdl3::SCANCODE_F6 => "F6",
+        lazalith_sdl3::SCANCODE_F8 => "F8",
+        lazalith_sdl3::SCANCODE_F9 => "F9",
+        lazalith_sdl3::SCANCODE_F10 => "F10",
+        lazalith_sdl3::SCANCODE_F11 => "F11",
+        _ => "key",
     }
 }

@@ -48,9 +48,10 @@ mod layout {
     include!(concat!(env!("OUT_DIR"), "/layout.rs"));
 }
 
-use layout::{
-    bool_size, event, key_event, key_field, key_offset, keycode, keymod, repeat, scancode,
-};
+// Imported under a name rather than glob-imported, because the measured names
+// are the C field names themselves — `scancode`, `repeat` — and a bare import would
+// shadow every local binding of the same name in this file.
+use layout as measured;
 
 /// An SDL error, with SDL's own words for it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,10 +166,17 @@ impl Rect {
 pub enum Input {
     /// The window was closed, or the platform asked the application to stop.
     Quit,
-    /// A key went down. The value is SDL's keycode.
+    /// A key went down. SDL reports many more events than this; a debugger needs a
+    /// key press and a request to close, and reducing the rest here means the
+    /// frontend cannot depend on a field whose layout it would be guessing at.
     KeyDown {
-        /// SDL's virtual keycode for the key.
+        /// SDL's scancode for the key: which physical key it is, independent
+        /// of the layout someone is typing in.
+        scancode: u32,
+        /// SDL's keycode for the key: which character it would produce.
         key: u32,
+        /// Whether this is the keyboard's own auto-repeat rather than a new press.
+        repeat: bool,
     },
 }
 
@@ -345,45 +353,45 @@ pub const EVENT_BUFFER_SIZE: usize = 256;
 const _: () = {
     // The buffer must hold the largest event, or SDL can write past it.
     assert!(
-        EVENT_BUFFER_SIZE >= event,
+        EVENT_BUFFER_SIZE >= measured::event,
         "SDL3's SDL_Event is larger than this crate's event buffer, so an \
          event could be written past the end of it. Raise EVENT_BUFFER_SIZE."
     );
     // The C and Rust sizes of the struct this crate mirrors must agree, or every
     // field after the first disagreement is at the wrong offset.
     assert!(
-        core::mem::size_of::<sys::SdlKeyboardEvent>() == key_event,
+        core::mem::size_of::<sys::SdlKeyboardEvent>() == measured::key_event,
         "the Rust SDL_KeyboardEvent is a different size from the C one, so its \
          fields are at different offsets than SDL writes them"
     );
     assert!(
-        core::mem::offset_of!(sys::SdlKeyboardEvent, key) == key_field,
+        core::mem::offset_of!(sys::SdlKeyboardEvent, key) == measured::key_field,
         "the keycode is at a different offset than SDL writes it"
     );
     assert!(
-        core::mem::offset_of!(sys::SdlKeyboardEvent, scancode) == scancode,
+        core::mem::offset_of!(sys::SdlKeyboardEvent, scancode) == measured::scancode,
         "the scancode is at a different offset than SDL writes it"
     );
     assert!(
-        core::mem::offset_of!(sys::SdlKeyboardEvent, repeat) == repeat,
+        core::mem::offset_of!(sys::SdlKeyboardEvent, repeat) == measured::repeat,
         "the repeat flag is at a different offset than SDL writes it"
     );
     // The union's key arm is where the keyboard event lands.
     assert!(
-        core::mem::offset_of!(sys::SdlEvent, key) == key_offset,
+        core::mem::offset_of!(sys::SdlEvent, key) == measured::key_offset,
         "the keyboard event is at a different offset within SDL_Event than it is here"
     );
     // The widths the field types assume.
     assert!(
-        bool_size == 1,
+        measured::bool_size == 1,
         "C's bool is not one byte, and the Rust `bool` this mirrors is one"
     );
     assert!(
-        keycode == 4,
+        measured::keycode == 4,
         "SDL3's SDL_Keycode is not four bytes, and this mirrors it as a u32"
     );
     assert!(
-        keymod == 2,
+        measured::keymod == 2,
         "SDL3's SDL_Keymod is not two bytes, and this mirrors it as a u16"
     );
 };
@@ -396,18 +404,27 @@ const PIXELFORMAT_XRGB8888: u32 = 0x1616_1804;
 const EVENT_QUIT: u32 = 0x100;
 const EVENT_KEY_DOWN: u32 = 0x300;
 
-/// SDL's keycode for the return key.
-pub const KEY_RETURN: u64 = 0x0d;
-/// SDL's keycode for escape.
-pub const KEY_ESCAPE: u64 = 0x1b;
-/// SDL's keycode for space.
-pub const KEY_SPACE: u64 = 0x20;
-/// SDL's keycode for F5.
-pub const KEY_F5: u64 = 0x74;
-/// SDL's keycode for F10.
-pub const KEY_F10: u64 = 0x77;
-/// SDL's keycode for F11.
-pub const KEY_F11: u64 = 0x78;
+/// SDL's scancode for F4, as the headers declare it.
+///
+/// Bindings are by *scancode* rather than by keycode on purpose. A scancode is a
+/// physical key and a keycode is a character, so a binding on a keycode would
+/// move when someone changed their keyboard layout — and a debugger's function-key
+/// bindings are about physical keys. These are measured from the headers by the
+/// build script rather than written down, because a debugger that binds F9 to the
+/// wrong key is a debugger that is wrong in a way nobody would trace back here.
+pub const SCANCODE_F4: u32 = measured::scancode_f4 as u32;
+/// SDL's scancode for F5.
+pub const SCANCODE_F5: u32 = measured::scancode_f5 as u32;
+/// SDL's scancode for F6.
+pub const SCANCODE_F6: u32 = measured::scancode_f6 as u32;
+/// SDL's scancode for F8.
+pub const SCANCODE_F8: u32 = measured::scancode_f8 as u32;
+/// SDL's scancode for F9.
+pub const SCANCODE_F9: u32 = measured::scancode_f9 as u32;
+/// SDL's scancode for F10.
+pub const SCANCODE_F10: u32 = measured::scancode_f10 as u32;
+/// SDL's scancode for F11.
+pub const SCANCODE_F11: u32 = measured::scancode_f11 as u32;
 
 /// SDL's last error, as a `String`.
 ///
@@ -845,8 +862,17 @@ pub fn poll_event() -> SdlResult<Option<Input>> {
         EVENT_KEY_DOWN => {
             // SAFETY: the type says this is a keyboard event, so the union's `key`
             // arm is the live one and reading it is reading the event SDL wrote.
+            // Each field is read separately because they are separate fields.
+            let scancode = unsafe { slot.key.scancode };
+            // SAFETY: as above, for the keycode.
             let key = unsafe { slot.key.key };
-            Some(Input::KeyDown { key })
+            // SAFETY: as above, for the repeat flag.
+            let repeat = unsafe { slot.key.repeat };
+            Some(Input::KeyDown {
+                scancode,
+                key,
+                repeat,
+            })
         }
         _ => None,
     };

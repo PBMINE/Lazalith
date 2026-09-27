@@ -88,6 +88,100 @@ mistake for frames. Step 76's source information makes those words *readable* �
 each resolves to the line it passed through — which is not the same as being
 frames.
 
+## Controls
+
+The roadmap asks for Run, Pause, Step, Reset, Continue and Breakpoint, and they
+live in `control.rs` rather than in the window. A key press is an event; a
+debugger's action is a decision; the layer between them is where the interesting
+mistakes are — is the program running, is this breakpoint already set, what does
+the user see afterwards. So it is headless, and the window only turns a key into
+a `Control`.
+
+That is also what makes the controls testable. Every one is exercised against a
+real machine in the test suite, with no window and no synthesised key events: a
+test presses "step" by calling `dispatch` and checks what the program did. A
+frontend whose controls could only be tested by synthesising key events would
+have its controls untested.
+
+| Control | Key | What it does |
+| --- | --- | --- |
+| Run | F5 | Runs until a breakpoint, a watchpoint, a pause, or the end |
+| Continue | F6 | The same, ignoring the breakpoints for that one run |
+| Step | F10 | Retires exactly one instruction |
+| Pause | F8 | Asks for the next run to stop at its first instruction boundary |
+| Breakpoint | F9 | Sets a breakpoint at the program counter, or clears the one there |
+| Reset | F4 | Puts the machine back where it was before the first step |
+
+The keys are function keys because a debugger's other keys belong to the
+program. A person is often typing into the guest's own input, and a frontend that
+swallowed letters would take them away from it.
+
+### Bindings are by scancode, not keycode
+
+A scancode is a physical key and a keycode is a character, so a binding on a
+keycode would move when someone changed their keyboard layout. The scancodes come
+from SDL3's headers, measured by the boundary crate's build script rather than
+written down: a debugger that binds F9 to the wrong key is wrong in a way nobody
+would trace back to a number in a source file.
+
+The bindings are also *drawn*, along the top of the window, with the key beside
+each control's name. A control a person cannot find is a control they will not
+press.
+
+### Every outcome is a value
+
+`Outcome` is a closed set of facts: it ran and here is why it stopped, it stepped
+to here, a breakpoint was set at here, a pause was asked for, the machine was
+reset, or nothing happened for a stated `Refusal`. A frontend that got back a
+string would have to read it back to decide whether to un-grey a button, which is
+a frontend that will get it wrong the day the wording changes.
+
+A refusal is a `Refusal` variant, so it can be matched on, and it is recorded as
+a diagnostic with a stable code. A user who pressed a breakpoint key on a line
+with no code in it sees *why* nothing happened instead of watching a button that
+appears to do nothing.
+
+### Continue suspends breakpoints; it does not delete them
+
+`DebugController::continue_` runs with the breakpoints ignored and restores them
+when the run ends. That is the difference between Continue and Run, and it is the
+whole reason both exist.
+
+A Continue implemented by clearing the breakpoints, running, and setting them
+again would be wrong in a way nobody would notice until a program set its own
+breakpoint in the middle of the run. And a Continue that *deleted* them would
+leave the user with a debugger that had forgotten where they were: the next Run
+would stop somewhere they had chosen to skip.
+
+Only breakpoints are suspended. A watchpoint still stops the program, and so does
+a pause or the step limit, because those are not things the user asked to ignore.
+
+### Pause is a request, and it is named honestly
+
+`Outcome::PauseRequested` is what the control returns, not `Paused`. The
+controller steps a program synchronously, so there is no moment between two
+instructions for a pause to interrupt; a pause is a request, and the next run or
+step takes it at its first instruction boundary — which is where a frontend's
+event loop gets to notice.
+
+Calling it `Paused` would claim a stop that has not happened, and a frontend that
+showed the program as stopped while it was still running would be lying about the
+one thing a debugger is for.
+
+### Reset means the program's entry point
+
+Loading a program in the debugger includes the supervisor handoff, and the reset
+point is taken after it. The machine boots in supervisor mode with the kernel's
+own first instruction at the program counter; debugging starts after the handoff,
+so that is where a reset returns to.
+
+A reset that returned to the kernel's `RFE` would need another step before the
+user was back where they were, which is a reset that does not reset. The reset
+point is a `MachineSnapshot` taken before anything else runs, so it is the state
+the person started debugging in rather than an arbitrary point in the middle of a
+run — and a program that has exited can be reset and run again, because a reset
+really is a reset.
+
 ## Text
 
 A debugger's output is mostly words, so the frontend carries a 5×7 bitmap font
@@ -156,9 +250,6 @@ cannot write past it. The buffer's size is asserted to be at least
   that cannot draw says why instead of showing a black window.
 
 ## What the frontend does not do yet
-
-- **It has no controls.** Step 77 is the display; Step 78 adds Run, Pause, Step,
-  Reset, Continue and Breakpoint.
 - **It does not render guest diagnostics structurally from the machine.** The
   diagnostic type is structured from the start, and the frontend records what it
   finds itself; Step 79 connects the guest's own diagnostics and Step 80
