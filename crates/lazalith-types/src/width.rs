@@ -141,8 +141,16 @@ impl WordWidth {
 
     pub fn sign_extend(self, value: u64, source_bits: u8) -> Result<u64, WidthError> {
         let low = self.zero_extend(value, source_bits)?;
-        let sign = 1u64 << (source_bits - 1);
-        Ok(self.truncate((low ^ sign).wrapping_sub(sign)))
+        // A shift pair rather than the usual `(x ^ sign) - sign` identity, and the
+        // reason is that the identity is wrong for a 64-bit source: its `sign` is
+        // `1 << 63`, and `(0xffff_ffff_0000_0000 ^ 1 << 63) - (1 << 63)` is
+        // `0xffff_ffff_ffff_ffff` rather than the value it started as. Sign
+        // extension from a 64-bit source is the identity, and the shift pair says
+        // so in one line: at 64 bits both shifts are zero and the value passes
+        // through untouched.
+        let shift = 64 - u32::from(source_bits);
+        let extended = ((low as i64) << shift) >> shift;
+        Ok(self.truncate(extended as u64))
     }
 
     pub const fn mask_address_bits(self, value: u64) -> u64 {

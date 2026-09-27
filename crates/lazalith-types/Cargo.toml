@@ -6,3 +6,6 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+lazalith-properties = { path = "../lazalith-properties" }

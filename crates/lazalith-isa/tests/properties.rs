@@ -151,7 +151,7 @@ fn encoding_then_decoding_is_the_instruction() {
             Ok(bytes) => bytes,
             Err(_) => return true,
         };
-        if decode(case.config, &bytes) != Ok(case.instruction.clone()) {
+        if decode(case.config, &bytes) != Ok(case.instruction) {
             return false;
         }
         encode(

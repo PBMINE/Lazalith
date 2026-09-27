@@ -169,7 +169,7 @@ impl Gen {
     /// A `bool`, with a one-in-four chance of being `true` because a property
     /// that only ever sees `false` is not a property test.
     pub fn bool(&mut self) -> bool {
-        self.next_u8() % 4 == 0
+        self.next_u8().is_multiple_of(4)
     }
 
     /// A value in `low..=high`, or `low` when the range is empty.

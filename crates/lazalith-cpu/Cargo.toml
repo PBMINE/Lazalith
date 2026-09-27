@@ -10,3 +10,6 @@ lazalith-isa = { path = "../lazalith-isa" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+lazalith-properties = { path = "../lazalith-properties" }

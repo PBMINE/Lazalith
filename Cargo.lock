@@ -101,6 +101,7 @@ name = "lazalith-cpu"
 version = "0.1.0"
 dependencies = [
  "lazalith-isa",
+ "lazalith-properties",
  "lazalith-types",
 ]
 
@@ -269,6 +270,9 @@ dependencies = [
 [[package]]
 name = "lazalith-types"
 version = "0.1.0"
+dependencies = [
+ "lazalith-properties",
+]
 
 [[package]]
 name = "lazalith-ui"
