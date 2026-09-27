@@ -15,6 +15,9 @@ workspace = true
 
 [dev-dependencies]
 lazalith-boot = { path = "../lazalith-boot" }
+# Step 83: the three front ends have to converge on one object, and the test that
+# says so has to build all three.
+lazalith-compiler = { path = "../lazalith-compiler" }
 lazalith-codegen = { path = "../lazalith-codegen" }
 lazalith-cpu = { path = "../lazalith-cpu" }
 lazalith-devices = { path = "../lazalith-devices" }
