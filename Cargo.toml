@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lazalith-types", "crates/lazalith-diagnostics", "crates/lazalith-ir", "crates/lazalith-isa", "crates/lazalith-cpu", "crates/lazalith-memory", "crates/lazalith-devices", "crates/lazalith-machine", "crates/lazalith-boot", "crates/lazalith-os", "crates/lazalith-os-abi", "crates/lazalith-toolchain", "crates/lazalith-compiler", "crates/lazalith-codegen", "crates/lazalith-runtime", "crates/lazalith-ui", "crates/lazalith-debug", "crates/lazalith-sdl3", "crates/lazalith-gui", "crates/lazalith-cli"]
+members = ["crates/lazalith-types", "crates/lazalith-diagnostics", "crates/lazalith-ir", "crates/lazalith-isa", "crates/lazalith-cpu", "crates/lazalith-memory", "crates/lazalith-devices", "crates/lazalith-machine", "crates/lazalith-boot", "crates/lazalith-os", "crates/lazalith-os-abi", "crates/lazalith-toolchain", "crates/lazalith-compiler", "crates/lazalith-c-compiler", "crates/lazalith-codegen", "crates/lazalith-runtime", "crates/lazalith-ui", "crates/lazalith-debug", "crates/lazalith-sdl3", "crates/lazalith-gui", "crates/lazalith-cli"]
 resolver = "3"
 
 [workspace.package]

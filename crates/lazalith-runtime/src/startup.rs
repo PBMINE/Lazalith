@@ -44,14 +44,33 @@ use lazalith_types::{ArchitectureConfig, WordWidth};
 
 /// The assembler source of the entry sequence.
 pub fn startup_source(architecture: ArchitectureConfig) -> String {
+    startup_source_for(architecture, ENTRY_SYMBOL)
+}
+
+/// The symbol a Lazen program.s `main` reaches the object file as.
+///
+/// Code generation prefixes every function with `fn.`, so a Lazen `main` is
+/// `fn.main` in the object. It is named here because the entry sequence needs it
+/// and a literal in two places is a literal that will eventually disagree with
+/// itself.
+pub const ENTRY_SYMBOL: &str = "fn.main";
+
+/// The entry sequence for a program whose entry has a stated symbol.
+///
+/// The sequence itself is language-neutral: call the program's entry, then exit with
+/// its result. Only the *name* differs, because a C program's `main` is `c.main`
+/// in the IR and `fn.c.main` in the object, and a sequence that hardcoded one
+// language's name would need a second sequence for the other. One sequence with a
+/// name is the difference between a parameter and a fork.
+pub fn startup_source_for(architecture: ArchitectureConfig, entry: &str) -> String {
     let mut source = String::from(".arch ");
     source.push_str(isa_name(architecture));
     source.push_str("\n.entry entry\n");
     // The program's entry point. Code generation makes this symbol global even
-    // when the Lazen declaration is private, because the loader is not a module.
-    source.push_str(".extern fn.main\n");
+    // when the source declared it private, because the loader is not a module.
+    source.push_str(&alloc::format!(".extern {entry}\n"));
     source.push_str("entry:\n");
-    source.push_str("         CALL fn.main\n");
+    source.push_str(&alloc::format!("         CALL {entry}\n"));
     source.push_str("         MOV r1, r0\n");
     source.push_str("         LI r0, 1\n");
     source.push_str("         LI r7, 0\n");
@@ -71,6 +90,15 @@ fn isa_name(architecture: ArchitectureConfig) -> &'static str {
 pub fn startup_object(architecture: ArchitectureConfig) -> Result<ObjectFile, StartupError> {
     let source = startup_source(architecture);
     assemble_named("lazen.startup", &source).map_err(StartupError::Assembly)
+}
+
+/// The entry sequence for a program whose entry has a stated symbol.
+pub fn startup_object_for(
+    architecture: ArchitectureConfig,
+    entry: &str,
+) -> Result<ObjectFile, StartupError> {
+    let source = startup_source_for(architecture, entry);
+    assemble_named("c.startup", &source).map_err(StartupError::Assembly)
 }
 
 /// Why the entry sequence could not be built.

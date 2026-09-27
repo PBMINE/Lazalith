@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-27 (Steps 1–80 complete and verified)
+Last updated: 2026-09-27 (Steps 1–81 complete and verified)
 
 ## Where the roadmap stands
 
@@ -27,10 +27,11 @@ Step  76      complete: source-level debug information (7c0dd70)
 Step  77      complete: the SDL3 frontend (063dd76)
 Step  78      complete: the GUI controls (c42d57f)
 Step  79      complete: structured diagnostics (e04118a)
-Step  80      complete: internal emulator error reporting
+Step  80      complete: internal emulator error reporting (cb84333)
+Step  81      complete: the C compiler
 ```
 
-The 878 workspace tests all pass, including the 4 in
+The 919 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -148,6 +149,104 @@ the frontend copies. It started as a match on code strings in the GUI, which is
 the same mistake Step 79 removed everywhere else: a frontend whose correctness
 depends on the spelling of every code. The kind is a value now, and a new code
 cannot be shown as the wrong sort of thing.
+
+## Step 81 — the C compiler
+
+`lazalith-c-compiler` compiles C to the *same* Lazalith IR the Lazen compiler
+produces and hands it to the *same* native backend. Nothing here is new
+infrastructure: the ISA, the ABI, the IR, the object format, the diagnostics and
+the linker are all the existing ones, and a C program and a Lazen program are two
+front ends over one machine. Nine of its tests run a C program on the real
+interpreter, through the real linker and the real kernel, and check its exit
+status.
+
+### The sizes, decided here because nothing had decided them
+
+`docs/lz64.md` left C's `int` and `long` open, pending "a dedicated ABI design".
+This is that decision: `char` is one byte, `short` two, `int` four, `long` and
+`long long` eight, and a pointer eight. That is LP64 and it matches the machine —
+sixteen 64-bit registers and no register pairs. A program compiled here is *not*
+portable to an ILP32 host, and `docs/c-compiler.md` says so rather than implying
+it.
+
+### What is refused, and why
+
+- **`float` and `double`.** The ISA has no floating-point instruction, so a
+  software implementation and an integer wearing a float's name are both
+  different projects. A floating *literal* is refused by the lexer and a floating
+  *type* by the parser, each by name.
+- **A `struct` or `union` larger than a word passed or returned by value.** The
+  ABI has one return register and no aggregate argument passing. The type is
+  still fine to declare, to hold, to point to, and to read a member of.
+- **A variadic function *definition*.** A variadic *declaration* is accepted,
+  because `printf` has to be callable, and a definition is refused because its
+  body has no way to learn how many arguments it was given.
+- **`goto`.** The IR's blocks are built in the order a body is walked, and a
+  backwards jump needs a second pass. A loop is a jump the IR can express
+  directly.
+- **A call through a function pointer.** `CALL` takes a displacement and `CALLR`
+  takes one register, and neither reaches a function whose address is only known
+  at run time.
+- **A call needing more than six argument words.** Four arguments go in registers
+  and two on the stack; a wider type uses more than one word.
+
+Every one of those diagnostics names the C construct *and* the machine limit,
+because "unsupported" on its own tells the reader nothing about what to change.
+
+### Three bugs the tests found, and what they were
+
+- **A `==` between two integers was refused.** The pointer rules for `==` and
+  `!=` were applied to *every* equality, so `c == 0` and `i == 3` — the two
+  comparisons a C program writes most — were both errors. The pointer rules now
+  apply only when a pointer is on one side, which is the only time a comparison
+  is about addresses.
+- **A local's initialiser was never written.** The slot was reserved and the
+  declaration was otherwise complete, so `int a = 20;` compiled to a slot holding
+  whatever the frame held before. A test that checked an *addition* passed and a
+  test that checked a *local* returned zero, which is why the end-to-end file
+  exists and asserts the values themselves.
+- **An eight-byte slot could land four-aligned.** Slots were packed at each
+  type's own alignment, so a `char` between two pointers left the next pointer
+  four-aligned, and a word-sized access to a four-aligned address is an alignment
+  fault. Every slot is now a whole number of words. The padding is a few bytes of
+  frame; the fault would have been the whole program.
+
+### Two things that had to move, and why
+
+- **The native backend no longer depends on the Lazen front end.** It was handed
+  `lazalith_compiler::lower::Lowered`, so producing code for the backend meant
+  importing Lazen's types, and a C program could not be compiled without them.
+  `FrameSlot`, `FrameLayout` and `SlotPurpose` moved to `lazalith_ir` — they are
+  the agreement between the stage that decides where a value lives and the stage
+  that emits its address — and `generate` now takes `(module, frames, entry)`.
+- **`ABI_SYSCALLS` moved to `lazalith_os_abi`.** The name-to-number table is the
+  ABI's knowledge, and a table only one front end can see is a table the other
+  gets wrong. C lowers a call to a library function by name to a syscall, and it
+  needs the same table Lazen does.
+
+### Two namespaces, and why they are not one
+
+A lowered C function is `c.<name>` and a lowered syscall is `syscall.<name>`. The
+IR has one flat symbol namespace, so without the prefixes a C function called
+`write` and the ABI's `write` would be two definitions of one name and the linker
+would refuse the object. Both prefixes exist for that reason alone, and a test
+asserts they are different.
+
+### A conversion, and where it lives
+
+The IR requires a store's width and its value's width to agree, so a four-byte
+value cannot be written to a `char` in one instruction. Every conversion here is
+therefore the same two instructions: store the whole word, then read back only the
+bytes the target has. Reading back the low bytes *is* the truncation C defines,
+and a sign-extending load for a signed target is the sign extension C defines. An
+argument conversion goes through the same path as an assignment, so there is one
+way to convert rather than two that could disagree.
+
+### What the docs say
+
+`docs/c-compiler.md` states the sizes, the supported subset, every refusal and the
+reason for it. A reader who hits a refusal should be able to find the sentence
+that explains it.
 
 
 ## Step 77 — the SDL3 frontend

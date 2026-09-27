@@ -43,7 +43,10 @@ mod source;
 mod startup;
 
 pub use source::PRELUDE;
-pub use startup::{StartupError, startup_object, startup_source};
+pub use startup::{
+    ENTRY_SYMBOL, StartupError, startup_object, startup_object_for, startup_source,
+    startup_source_for,
+};
 
 /// The whole of what a program is compiled against: the runtime's own text, then
 /// the standard library's, then the GUI library's.

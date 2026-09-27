@@ -18,6 +18,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazalith-c-compiler"
+version = "0.1.0"
+dependencies = [
+ "lazalith-boot",
+ "lazalith-codegen",
+ "lazalith-cpu",
+ "lazalith-devices",
+ "lazalith-diagnostics",
+ "lazalith-ir",
+ "lazalith-isa",
+ "lazalith-machine",
+ "lazalith-memory",
+ "lazalith-os",
+ "lazalith-os-abi",
+ "lazalith-runtime",
+ "lazalith-toolchain",
+ "lazalith-types",
+]
+
+[[package]]
 name = "lazalith-cli"
 version = "0.1.0"
 dependencies = [

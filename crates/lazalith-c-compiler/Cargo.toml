@@ -1,0 +1,26 @@
+[package]
+name = "lazalith-c-compiler"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lazalith-types = { path = "../lazalith-types" }
+lazalith-diagnostics = { path = "../lazalith-diagnostics" }
+lazalith-ir = { path = "../lazalith-ir" }
+lazalith-os-abi = { path = "../lazalith-os-abi" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+lazalith-boot = { path = "../lazalith-boot" }
+lazalith-codegen = { path = "../lazalith-codegen" }
+lazalith-cpu = { path = "../lazalith-cpu" }
+lazalith-devices = { path = "../lazalith-devices" }
+lazalith-isa = { path = "../lazalith-isa" }
+lazalith-machine = { path = "../lazalith-machine" }
+lazalith-memory = { path = "../lazalith-memory" }
+lazalith-os = { path = "../lazalith-os" }
+lazalith-runtime = { path = "../lazalith-runtime" }
+lazalith-toolchain = { path = "../lazalith-toolchain" }

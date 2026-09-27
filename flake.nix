@@ -16,7 +16,7 @@
           version = "0.1.0";
           src = pkgs.lib.fileset.toSource {
             root = ./.;
-            fileset = pkgs.lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./crates ./examples ./docs/isa.md ./docs/boot.md ./docs/lzx.md ./docs/lzo.md ./docs/os-design.md ./docs/os-memory.md ./docs/os-abi.md ./docs/lazen-design.md ./docs/lazen-rationale.md ./docs/lazen-purpose.md ./docs/lazen-syntax.md ./docs/lazen-memory-model.md ./docs/lazen-types.md ./docs/lazen-modules.md ./docs/lazen-applications.md ./docs/lazen-sdk.md ./docs/lazen-graphics.md ./docs/lazen-input.md ];
+            fileset = pkgs.lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./crates ./examples ./docs/isa.md ./docs/boot.md ./docs/lzx.md ./docs/lzo.md ./docs/os-design.md ./docs/os-memory.md ./docs/os-abi.md ./docs/lazen-design.md ./docs/lazen-rationale.md ./docs/lazen-purpose.md ./docs/lazen-syntax.md ./docs/lazen-memory-model.md ./docs/lazen-types.md ./docs/lazen-modules.md ./docs/lazen-applications.md ./docs/lazen-sdk.md ./docs/lazen-graphics.md ./docs/lazen-input.md ./docs/c-compiler.md ];
           };
           cargoLock.lockFile = ./Cargo.lock;
           cargoBuildFlags = [ "--workspace" ];
