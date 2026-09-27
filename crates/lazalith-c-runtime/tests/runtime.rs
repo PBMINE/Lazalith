@@ -52,6 +52,15 @@ struct Finished {
 
 /// Compiles a C program with the runtime, links it, runs it, and reports.
 fn run(source: &str) -> Finished {
+    run_with_files(source, &[])
+}
+
+/// The same, with files already in the filesystem.
+///
+/// The step asks for file operations, and a file operation that is only ever run
+/// against a filesystem with nothing in it proves only that `fopen` of a missing
+/// name fails. A program needs something to read.
+fn run_with_files(source: &str, files: &[(&str, &[u8])]) -> Finished {
     let config = ArchitectureConfig::lz64();
     // The C runtime is one translation unit in front of the program, exactly as
     // the Lazen standard library is. A program may therefore define a name the
@@ -103,10 +112,16 @@ fn run(source: &str) -> Finished {
     );
     machine.step().expect("the kernel's first step");
 
+    let mut filesystem = VirtualFileSystem::with_defaults().expect("a filesystem");
+    for (path, data) in files {
+        filesystem
+            .insert_file(path.as_bytes(), data)
+            .unwrap_or_else(|error| panic!("`{path}` should be in the filesystem: {error}"));
+    }
     let mut kernel = LazalithKernel::new(
         STEP_BUDGET,
         VirtualTerminal::new(b"").expect("a terminal"),
-        VirtualFileSystem::with_defaults().expect("a filesystem"),
+        filesystem,
     )
     .expect("the kernel starts");
     kernel
@@ -378,4 +393,66 @@ fn the_two_halves_share_no_names() {
              both would get one of them at random"
         );
     }
+}
+
+/// The file half of `<stdio.h>`, on the handles a C program can actually have.
+///
+/// There is no `fopen` to test, and that is not a gap in the tests: the ABI
+/// reports a new file's handle in a return register no calling convention hands a
+/// caller, so a C program cannot be given one. Handles 0, 1 and 2 are the
+/// console, and these are the functions that work on a handle the program already
+/// has. `docs/c-runtime.md` explains the `fopen` gap and what would close it.
+#[test]
+fn stdio_writes_to_a_handle() {
+    let finished = run(r#"
+        int main(void) {
+            if (fwrite("abc", 1, 3, 1) != 3) { return 1; }
+            if (fputs("de", 1) != 0) { return 2; }
+            if (fflush(1) != 0) { return 3; }
+            return 0;
+        }
+        "#);
+    assert_eq!(String::from_utf8_lossy(&finished.output), "abcde");
+    assert_eq!(finished.exit_code, 0);
+}
+
+/// The count and the bytes are checked separately. A `fwrite` that reported three
+/// and wrote nothing would pass a test that only read the console back, and one
+/// that wrote three and reported a count of four would pass a test that only
+/// compared bytes.
+#[test]
+fn stdio_writes_a_whole_count() {
+    let finished = run(r#"
+        int main(void) {
+            unsigned long wrote = fwrite("xy", 1, 2, 1);
+            print_decimal((long)wrote);
+            print_line("");
+            return wrote == 2 ? 0 : 1;
+        }
+        "#);
+    // The two bytes went to the console as well as being counted, so the output is
+    // what was written followed by what was counted.
+    assert_eq!(String::from_utf8_lossy(&finished.output), "xy2\n");
+    assert_eq!(finished.exit_code, 0, "two bytes, counted as two");
+}
+
+/// A rejected call has to be visible. `fwrite` to a handle the process does not
+/// own is refused by the ABI, and the runtime has to pass that refusal on rather
+/// than reporting a count of bytes nobody wrote.
+#[test]
+fn a_bad_handle_is_refused() {
+    let finished = run(r#"
+        int main(void) {
+            if (fwrite("x", 1, 1, 999) != 0) { return 1; }
+            return 0;
+        }
+        "#);
+    assert_eq!(
+        finished.output, b"",
+        "nothing was written to a handle that is not open"
+    );
+    assert_eq!(
+        finished.exit_code, 0,
+        "and the call reported a count of zero"
+    );
 }

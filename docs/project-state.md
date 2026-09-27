@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-27 (Steps 1–81 complete and verified)
+Last updated: 2026-09-28 (Steps 1–82 complete and verified)
 
 ## Where the roadmap stands
 
@@ -29,9 +29,10 @@ Step  78      complete: the GUI controls (c42d57f)
 Step  79      complete: structured diagnostics (e04118a)
 Step  80      complete: internal emulator error reporting (cb84333)
 Step  81      complete: the C compiler
+Step  82      complete: the C runtime
 ```
 
-The 919 workspace tests all pass, including the 4 in
+The 937 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -375,6 +376,148 @@ hand to agree with what the compiler would have said.
   conventional first-statement breakpoint takes the lowest of them.
 - Debug information is only as good as the spans the frontend produced. A span
   covering a whole function maps a whole function.
+
+## Step 82 — the C runtime
+
+A C program reaches the machine's facilities through the same objects the Lazen
+standard library is built from: the compiler, the OS ABI's syscalls by name, the
+object writer and the linker. The runtime is one C translation unit,
+`lazalith_c_runtime::C_RUNTIME`, that a program compiles in front of itself.
+
+Sixteen tests in `crates/lazalith-c-runtime/tests/runtime.rs` run real programs
+on the real machine and check their output and their exit status. A library
+whose functions *compile* but return nothing is worse than no library, so
+nothing in the runtime is checked by inspection. `docs/c-runtime.md` is the
+reference.
+
+### The kernel had no allocator
+
+`allocate_memory` was numbered, validated, and then reached no service, so it
+answered `NotSupported` — a `malloc` that compiled, linked, called the ABI, and
+got back 12. There is now a `MemoryService` in `lazalith-os`, routed to by the
+same composite that routes the terminal, the display and the input: a service
+that answers questions about a world and a service that *makes* memory are
+different kinds of thing, and lumping them together would hide which one a call
+reached.
+
+It is a bump pool, and that is the ABI's doing. `free` and `realloc` are not
+syscalls, so a program has no way to describe a region it no longer wants.
+Exhaustion is `ResourceExhausted` rather than `Internal`: the call was well
+formed and the machine simply has no more room, which is the one answer a
+program can act on.
+
+### A process could not exit with a negative status
+
+`Syscall::Exit` read argument zero as a `u32`, which is what the ABI says, and a
+`u32` read out of a 64-bit register is `0xffffffffffffffd6` when the program put
+a negative number there. So `return -42` from `main` was *rejected by the
+kernel* — a machine on which reporting a negative number was impossible, for a
+program that did nothing else. The status is a bit pattern and its sign is not
+information: it is the low 32 bits whatever the register's sign bit says, which
+is what a host does with `exit(-1)` too. Reading the argument as a word and
+keeping 32 bits keeps the width check as well.
+
+### Nine compiler bugs, and the theme
+
+Writing a standard library is a far better test of a compiler than writing
+`return 42`. Every one of these was invisible to step 81's suite, and each is a
+commit of its own with the reasoning:
+
+- **`|` did not parse.** The precedence walk applied every operator *except* the
+  lowest, because `&&` and `||` have their own functions and level zero returned
+  before applying anything. `a + b` and `a < b` worked, which is why a suite of
+  small programs missed it.
+- **`int *f(void)` was built as a pointer to a function.** `int *f(void)` and
+  `int (*f)(void)` produce the same list of derivations in the same order and
+  mean opposite things; the difference is whether the parentheses were written.
+  This is the most common declarator in C and it was wrong.
+- **A cast was dropped.** `(unsigned char)` on a signed load is a *different
+  value* and `(int)` on a pointer-sized value is a different width, so an
+  ignored cast made both mean something the program did not write. A cast is the
+  one expression whose type the emitter cannot rebuild — `(T)` names a type, and
+  building one needs the typedef and tag tables — so the checker records each
+  cast's target and the emitter reads it back by where the cast starts.
+- **`char` was signed whatever the program said.** The type checker wrote
+  `signed: *signed || true`, and the parser dropped the signedness keyword before
+  `char` reached it, so `unsigned char` was the same type as `char`. The
+  standard library does not care except through `strcmp`, which casts both
+  operands to `unsigned char` *precisely* so a byte above 127 sorts above `'a'`.
+- **A widening conversion read bytes the value never had.** An `int` widened from
+  a `char` stored one byte into an eight-byte scratch and read four back, three
+  of which were whatever the frame last held. It clears the scratch now. And the
+  extension kind and the result type are separate decisions: how far to extend
+  follows the source, what the result *is* follows the target. Getting that
+  backwards typed `(int)(unsigned char)c` as unsigned, so `(int)'c' - (int)'d'`
+  was a subtraction of two unsigned values, wrapped, and compared `>= 0`.
+- **`a && b` answered for `a` alone.** The lowering branched around the right
+  side and stored a constant, so the right side was evaluated for its side
+  effects and its value discarded: `1 && 0` was `1`. That is the loop guard of
+  every C string routine in the library.
+- **`||` branched the wrong way.** It stored the answer for "the left side was
+  enough" and then sent a *true* left side to the right side — `&&`'s rule. So
+  `a || b` evaluated `b` exactly when `a` had already settled it, and used `a`'s
+  truth negated. `malloc`'s first line of real work is
+  `if (heap_block == 0 || heap_used + wanted + 8 > heap_size)`, so with a null
+  heap pointer the guard was skipped and the allocator wrote its block header to
+  address zero.
+- **`sizeof` was a machine word.** Not "a word on this target" — a hardcoded `8`
+  standing in for the size of whatever was being measured, so `sizeof buffer` for
+  a `char[16]` said sixteen bytes were eight. The size is measured in the
+  *checker*, because a `sizeof` operand names a type and the emitter has no
+  typedef table to build one with. That also exposed the next one.
+- **A subscript stepped by four bytes into a `char` array.** `element_of` knew
+  about pointers and not arrays, asked for the element of a pointer, found none,
+  and defaulted to `int`. C treats `a[i]` as `*(a + i)` whether `a` is a pointer
+  or an array, so an array has an element type now too.
+- **`return expr;` did not convert.** C converts a returned expression to the
+  function's declared result type, and it did not, so a `long` expression
+  returned from an `int` function arrived as a full 64-bit register.
+- **A local array's initialiser was never written.** `char buffer[16] = "abc";`
+  is a *copy* — the literal is in program space and the buffer is in the frame,
+  and a program that wrote to its own buffer would have been writing to the
+  string table. The null is written too, and left off when the array is exactly
+  the literal's length, which is what C says.
+
+### An unknown name was an `int`
+
+The checker's `name` asked every source of a name in turn and, finding none,
+returned `CType::int()` — the same thing as assuming the program was right about
+a declaration nobody wrote. So `printf("hi")` type-checked as *calling an `int`*
+and the program was told ``int` cannot be called`, which names the wrong thing in
+the wrong place. Every stage past the resolver now says the name is not declared,
+and returns an `int` only so the rest of the program is still checked and still
+gets its other diagnostics.
+
+### A status is zero or it is not
+
+The C runtime compared `status < 0` after every syscall, which is a check that
+can never fire: an ABI status is a `u32`, `InvalidHandle` is 9, and a signed
+comparison calls it a success. A `fwrite` to a handle the process does not own
+reported a count of bytes nobody had written. There is a test that a refused call
+is visible.
+
+### Two absences, and neither is an oversight
+
+- **No `printf`.** A variadic body is the one thing this C cannot write, because
+  a variadic definition is refused. Printing is a call per piece: `print`,
+  `print_line`, `print_decimal`. Declaring `printf` so a call would *check* was
+  tried and is worse — the program compiled and the failure came back from the
+  linker as an undefined symbol, naming neither the reason nor the file.
+- **No `fopen`,** and this one is an ABI gap rather than a compiler limit.
+  `write` and `read` report into an `IoResult` the caller supplies, `seek`
+  reports through a pointer, `stat` fills a record — and `open` reports the new
+  file's handle in the *outcome payload*, which is the second register of the
+  return. No calling convention in this machine hands a caller the second
+  register, so the handle reaches hand-written assembly and nothing else. The
+  native-shell fixture reads it correctly; `fs::open` in Lazen and a C `fopen`
+  would both read a slot the kernel never wrote.
+
+  The fix is one argument — the handle as an out-parameter, like its siblings.
+  It touches a documented ABI, a fixture that reads the payload, and the index
+  conventions the validation errors use, and it is worth doing as its own piece
+  of work rather than at the end of another step. A C program can use the handles
+  it already has: 0, 1 and 2 are the console, and `fread`, `fwrite`, `fputs`,
+  `fseek`, `ftell`, `fclose` and `fflush` all work on those.
 
 
 ## Earlier milestones

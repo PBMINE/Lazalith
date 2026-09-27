@@ -2358,11 +2358,13 @@ pub fn abi_signature(name: &str) -> Option<CType> {
             io_result.clone(),
             CType::uint(),
         ],
+        // The fourth argument is where the handle goes, not a mode. A `u32 *`
+        // out-parameter, like every other call that has something to report.
         "open" => vec![
             byte_pointer.clone(),
             CType::ulong(),
             CType::uint(),
-            CType::uint(),
+            CType::pointer_to(CType::uint()),
         ],
         "close" => vec![CType::int()],
         "seek" => vec![
@@ -2517,9 +2519,12 @@ pub fn library_signature(name: &str) -> Option<CType> {
         // <stdio.h>
         "puts" => returns(CType::int(), vec![byte_pointer.clone()], false),
         "putchar" => returns(CType::int(), vec![CType::int()], false),
+        // A file handle is an `int` throughout, not a `FILE *`, and there is no `fopen`
+        // at all: the ABI reports a new file's handle in a return register no
+        // calling convention hands a caller. `docs/c-runtime.md` says so in full.
         "fputs" => returns(
             CType::int(),
-            vec![byte_pointer.clone(), void_pointer.clone()],
+            vec![byte_pointer.clone(), CType::int()],
             false,
         ),
         "fwrite" => returns(
@@ -2528,7 +2533,7 @@ pub fn library_signature(name: &str) -> Option<CType> {
                 void_pointer.clone(),
                 CType::ulong(),
                 CType::ulong(),
-                void_pointer.clone(),
+                CType::int(),
             ],
             false,
         ),
@@ -2538,18 +2543,18 @@ pub fn library_signature(name: &str) -> Option<CType> {
                 void_pointer.clone(),
                 CType::ulong(),
                 CType::ulong(),
-                void_pointer.clone(),
+                CType::int(),
             ],
             false,
         ),
         "fseek" => returns(
             CType::int(),
-            vec![void_pointer.clone(), CType::long(), CType::int()],
+            vec![CType::int(), CType::long(), CType::int()],
             false,
         ),
-        "ftell" => returns(CType::long(), vec![void_pointer.clone()], false),
-        "fclose" => returns(CType::int(), vec![void_pointer.clone()], false),
-        "fflush" => returns(CType::int(), vec![void_pointer.clone()], false),
+        "ftell" => returns(CType::long(), vec![CType::int()], false),
+        "fclose" => returns(CType::int(), vec![CType::int()], false),
+        "fflush" => returns(CType::int(), vec![CType::int()], false),
         _ => None,
     }
 }

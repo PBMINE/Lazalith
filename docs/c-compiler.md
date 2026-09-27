@@ -76,7 +76,7 @@ refusal that only says "unsupported" tells the reader nothing they can act on.
 |---|---|---|
 | `float`, `double` | the ISA has no floating-point instruction, and a software implementation is a different project | an integer |
 | a `struct` or `union` wider than a word passed or returned **by value** | the ABI has one return register and no aggregate argument passing | pass a pointer |
-| a variadic function **definition** | its body has no way to learn how many arguments it was given | a variadic *declaration* is fine, so `printf` is callable |
+| a variadic function **definition** | its body has no way to learn how many arguments it was given | print with a call per piece — see `docs/c-runtime.md` |
 | `goto` | the IR's blocks are built in the order a body is walked, and a backwards jump needs a second pass | a loop |
 | a call through a function pointer | `CALL` takes a displacement and `CALLR` takes one register; neither reaches a function whose address is only known at run time | a call by name, or a `switch` |
 | a call needing more than six argument words | four arguments are in registers and two on the stack, and a wider type uses more than one word | fewer or narrower arguments |
@@ -157,6 +157,13 @@ A name the ABI has numbered but whose signature it has not stated is accepted
 with any arguments and a `long` result. That is the one place this compiler
 declines to check rather than refuses, and it is deliberate: refusing would make a
 facility unavailable, and inventing a signature would be worse than declining.
+
+The standard library is a separate matter, and `docs/c-runtime.md` is its
+reference. A name the runtime *defines* is a definition the program's own calls
+reach, because the runtime is compiled in front of the program as one translation
+unit. A name it does not define is not declared: `printf` and `fopen` are both
+absent, and both absences are explained there rather than left to be found at a
+linker.
 
 ## Building one
 

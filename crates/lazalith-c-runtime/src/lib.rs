@@ -222,7 +222,10 @@ static int adopt_chunk(unsigned long wanted) {
     allocation_record[0] = 0;
     allocation_record[1] = 0;
     long status = allocate_memory(chunk, 8, (char *)allocation_record);
-    if (status < 0) { return 0; }
+    /* Zero is the only success. An ABI status is a `u32`, so a failure is a small
+     * positive number and `status < 0` is never true — a check that can never fire
+     * is how a refused allocation reads as a successful one. */
+    if (status != 0) { return 0; }
     if (allocation_record[0] == 0) { return 0; }
     heap_block = (char *)allocation_record[0];
     heap_size = (unsigned long)allocation_record[1];
@@ -307,7 +310,6 @@ static unsigned long io_count = 0;
  */
 long write_to(int handle, const char *bytes, unsigned long length) {
     long status = write(handle, bytes, length, &io_status, 0);
-    if (status < 0) { io_count = 0; return status; }
     io_count = 0;
     return status;
 }
@@ -386,26 +388,60 @@ int puts(const char *text) {
     return 0;
 }
 
-int fputs(const char *text, void *stream) {
-    long status = write_to((int)stream, text, strlen(text));
-    if (status < 0) { return -1; }
+/* A file handle is an `int` here, and not a `FILE *`.
+ *
+ * The ABI's `open` reports a `u32` handle and a C `FILE *` is an opaque pointer,
+ * so the two could be dressed up as each other by casting. Dressing a small
+ * integer up as a pointer is how a program ends up printing one and comparing
+ * the other: an opener returning a handle as a pointer, a closer taking it back
+ * as an `int`, and every other function taking a `void *` and casting
+ * internally. The number is the number, so the number is the type.
+ *
+ * There is no `fopen`, and that is the one part of `<stdio.h>` missing here.
+ *
+ * The ABI reports a new file's handle in the *outcome payload*, which is the
+ * second register of the return. A calling convention hands a caller the first.
+ * `write` and `read` report into an `IoResult` the caller supplies, `seek`
+ * reports the new offset through a pointer, and `stat` fills a record — every
+ * one of them an argument, which is the only shape a program can read. `open` is
+ * the one call that answers in a register instead, and so its handle reaches
+ * hand-written assembly and nothing else: Lazen's `fs::open` and a C `fopen`
+ * would both read a slot the kernel never wrote, find a zero handle, and report
+ * that a file which was open could not be.
+ *
+ * The fix is one argument — the handle as an out-parameter, like its siblings —
+ * and it touches a documented ABI, a test fixture that reads the payload, and
+ * the index conventions in the validation errors, which is a piece of work of
+ * its own rather than a line to change at the end of another step. Until then a C
+ * program can use the handles it already has — 0, 1 and 2 are the console — and
+ * `fread`, `fwrite`, `fputs`, `fseek`, `ftell`, `fclose` and `fflush` all work on
+ * those. An unknown `fopen` is a compile error that names `fopen`, which is the
+ * only thing a C programmer can be told here that is true.
+ */
+int fputs(const char *text, int stream) {
+    /* `!= 0`, not `< 0`: an ABI status is a `u32`, so `InvalidHandle` is 9 and a
+     * signed comparison would call it a success. */
+    if (write_to(stream, text, strlen(text)) != 0) { return -1; }
     return 0;
 }
 
-unsigned long fwrite(const void *bytes, unsigned long size, unsigned long count, void *stream) {
+unsigned long fwrite(const void *bytes, unsigned long size, unsigned long count, int stream) {
     unsigned long length = size * count;
-    if (write_to((int)stream, (const char *)bytes, length) < 0) { return 0; }
+    if (write_to(stream, (const char *)bytes, length) != 0) { return 0; }
     return count;
 }
 
-unsigned long fread(void *bytes, unsigned long size, unsigned long count, void *stream) {
+unsigned long fread(void *bytes, unsigned long size, unsigned long count, int stream) {
     unsigned long length = size * count;
-    long status = read((int)stream, bytes, length, &io_status, 0);
-    if (status <= 0) { return 0; }
+    long status = read(stream, bytes, length, &io_status, 0);
+    /* `!= 0` and not `< 0`: the status is a `u32`, so a refused read is a small
+     * positive number. Below that, the count in the `IoResult` is the answer, and
+     * a refused read has none. */
+    if (status != 0) { return 0; }
     return (unsigned long)status / size;
 }
 
-int fflush(void *stream) {
+int fflush(int stream) {
     /* Every write above is already unbuffered, because the ABI's `write` is
      * unbuffered. There is nothing to push, and saying so is better than
      * pretending a buffer exists. */
@@ -413,54 +449,20 @@ int fflush(void *stream) {
     return 0;
 }
 
-/* The ABI's open flags, as numbers.
- *
- * Spelled out rather than `#define`d, because this compiler does not expand
- * macros: a `#define` here would be a name with no declaration, and the failure
- * would be in the runtime rather than where the feature is missing. The values are
- * `OPEN_READ`, `OPEN_WRITE`, `OPEN_CREATE` and `OPEN_TRUNCATE` in
- * `lazalith-os-abi`; a test checks that they are still these numbers, so a change
- * to the ABI fails here rather than opening the wrong file.
- */
-static unsigned int OPEN_READ_C   = 1u;
-static unsigned int OPEN_WRITE_C  = 2u;
-static unsigned int OPEN_CREATE_C = 4u;
-static unsigned int OPEN_TRUNC_C  = 8u;
-
-int fopen(const char *path, const char *mode) {
-    unsigned long flags = 0;
-    unsigned long at = 0;
-    while (mode[at] != 0) {
-        if (mode[at] == 114) { flags = flags | OPEN_READ_C; }
-        if (mode[at] == 119) {
-            flags = flags | OPEN_WRITE_C | OPEN_CREATE_C | OPEN_TRUNC_C;
-        }
-        if (mode[at] == 97) { flags = flags | OPEN_WRITE_C | OPEN_CREATE_C; }
-        at = at + 1;
-    }
-    int handle = 0;
-    long status = open(path, strlen(path), (unsigned int)flags, &handle);
-    if (status < 0) { return 0; }
-    return handle;
-}
-
-int fclose(void *stream) {
-    long status = close((int)stream);
-    if (status < 0) { return -1; }
+int fclose(int stream) {
+    if (close(stream) != 0) { return -1; }
     return 0;
 }
 
-int fseek(void *stream, long offset, int origin) {
+int fseek(int stream, long offset, int origin) {
     long at = 0;
-    long status = seek((int)stream, offset, origin, &at);
-    if (status < 0) { return -1; }
+    if (seek(stream, offset, origin, &at) != 0) { return -1; }
     return 0;
 }
 
-long ftell(void *stream) {
+long ftell(int stream) {
     long at = 0;
-    long status = seek((int)stream, 0, 1, &at);
-    if (status < 0) { return -1; }
+    if (seek(stream, 0, 1, &at) != 0) { return -1; }
     return at;
 }
 "#;
