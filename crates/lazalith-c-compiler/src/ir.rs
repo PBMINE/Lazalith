@@ -342,6 +342,25 @@ impl<'a> Lowerer<'a> {
     ) -> Result<(), LowerError> {
         match initial {
             Initializer::Scalar(expression) => {
+                // A string literal may initialise a `char` array at file scope too,
+                // and there it is not a copy at run time but the *bytes of the
+                // segment itself*. `char g[4] = "abc";` is a static four bytes
+                // holding `a`, `b`, `c`, and a null that does not fit — the same
+                // rule as a local's, applied to the segment instead of a frame.
+                if let (CType::Array { element, length }, Expression::String { value, .. }) =
+                    (ty, expression)
+                    && matches!(**element, CType::Int { bits: 8, .. })
+                {
+                    let capacity = *length as usize;
+                    let room = value.len().min(capacity.saturating_sub(1));
+                    for (offset, byte) in value.bytes().take(room).enumerate() {
+                        write_integer(bytes, at + offset, element, i64::from(byte));
+                    }
+                    if capacity > 0 {
+                        write_integer(bytes, at + room, element, 0);
+                    }
+                    return Ok(());
+                }
                 if let Some(value) = constant(expression) {
                     write_integer(bytes, at, ty, value);
                 }
@@ -1011,10 +1030,8 @@ impl<'a> Emitter<'a> {
                 // result a string — and if the array is exactly the literal's
                 // length, C leaves off the null, so it is only written when there
                 // is room for it.
-                if let (
-                    CType::Array { element, length },
-                    Expression::String { value, .. },
-                ) = (ty, expression)
+                if let (CType::Array { element, length }, Expression::String { value, .. }) =
+                    (ty, expression)
                     && matches!(**element, CType::Int { bits: 8, .. })
                 {
                     // The bytes to write: the literal's own, then the null that
@@ -1848,11 +1865,23 @@ impl<'a> Emitter<'a> {
         // so; `a || b` starts at true. Either way the left side decides whether
         // the right side runs at all.
         self.store(result, if and { zero } else { one }, &CType::int())?;
+        // Which way round the test branches is the whole difference between `&&`
+        // and `||`, and getting it backwards is not a subtle wrong answer: it
+        // evaluates the right side exactly when the left side has already decided
+        // the answer. For `&&` a true left side means *carry on* to the right
+        // side; for `||` it means *stop*, because the result is already stored.
+        // So `||` whose left side is true jumped past its own body and used a heap
+        // pointer that was still null.
         let test = self.test(left)?;
+        let (then_block, otherwise) = if and {
+            (right_block.id, join.id)
+        } else {
+            (join.id, right_block.id)
+        };
         self.terminate(Terminator::Branch {
             condition: test,
-            then_block: right_block.id,
-            otherwise: join.id,
+            then_block,
+            otherwise,
         })?;
         self.switch_to(&right_block)?;
         // The right side's *value* decides the answer, not merely its arrival. A

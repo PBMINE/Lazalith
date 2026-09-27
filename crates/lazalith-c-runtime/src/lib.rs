@@ -170,14 +170,6 @@ void *memset(void *destination, int value, unsigned long length) {
 
 /* ---- <stdlib.h> --------------------------------------------------------- */
 
-/* The result of the last allocation, and how much of it is used.
- *
- * One block at a time, because the ABI has no `free` and no way to return memory
- * to the kernel. A program that allocates in a loop runs out, and it runs out
- * *visibly*: `malloc` returns a null pointer rather than silently reusing a
- * block, so a program that ignored the result would write to address zero and
- * trap rather than corrupt a neighbour.
- */
 /* The record the ABI.s `allocate_memory` writes into: the address at word
  * zero and the length at word one. The syscall reports a *status*, not an
  * address, so a caller that ignored this would allocate successfully and get a
@@ -185,27 +177,62 @@ void *memset(void *destination, int value, unsigned long length) {
  */
 static long allocation_record[2];
 
+/* How much the runtime asks the kernel for at a time.
+ *
+ * A chunk rather than a byte, because the kernel's own pool is a bump allocator
+ * with no way to give memory back, so a runtime that asked for exactly what each
+ * `malloc` wanted would spend one kernel allocation per C allocation and run the
+ * process out of its data region a few hundred times sooner. Sixty-four
+ * thousand bytes is a deliberate middle: enough that an ordinary program never
+ * asks twice, small enough that a program which allocates one block still has
+ * most of its 1 MiB of data region left.
+ */
+static const unsigned long ARENA_BYTES = 65536;
+
+/* The chunk being handed out, and how much of it is used.
+ *
+ * One chunk at a time, because the ABI has no `free` and no way to return memory
+ * to the kernel. A program that allocates in a loop eventually runs out, and it
+ * runs out *visibly*: `malloc` returns a null pointer rather than silently
+ * reusing a block, so a program that ignored the result would write to address
+ * zero and trap rather than corrupt a neighbour.
+ */
 static char *heap_block = 0;
 static unsigned long heap_size = 0;
 static unsigned long heap_used = 0;
 
+/* Asks the kernel for a fresh chunk and adopts it.
+ *
+ * A chunk already in use is *abandoned* rather than extended: the kernel's pool
+ * cannot be told the tail of a chunk is free, so growing in place is not
+ * available, and pretending otherwise would be a comment that lied. What is lost
+ * is at most one chunk's remainder, and the tests below ask for two blocks
+ * rather than enough to fill one, so the behaviour a program can observe is that
+ * memory comes back in chunks and stops when the process's data region is gone.
+ */
+static int adopt_chunk(unsigned long wanted) {
+    unsigned long chunk = ARENA_BYTES;
+    if (chunk < wanted + 8) { chunk = wanted + 8; }
+    allocation_record[0] = 0;
+    allocation_record[1] = 0;
+    long status = allocate_memory(chunk, 8, (char *)allocation_record);
+    if (status < 0) { return 0; }
+    if (allocation_record[0] == 0) { return 0; }
+    heap_block = (char *)allocation_record[0];
+    heap_size = (unsigned long)allocation_record[1];
+    heap_used = 0;
+    if (heap_size < wanted + 8) { return 0; }
+    return 1;
+}
+
 void *malloc(unsigned long length) {
+    if (length == 0) { length = 1; }
     unsigned long wanted = (length + 7) / 8 * 8;
-    if (wanted == 0) { wanted = 8; }
-    if (heap_block == 0) {
-        allocation_record[0] = 0;
-        allocation_record[1] = 0;
-        long status = allocate_memory(wanted, 8, (char *)allocation_record);
-        if (status < 0) { return 0; }
-        if (allocation_record[0] == 0) { return 0; }
-        heap_block = (char *)allocation_record[0];
-        heap_size = (unsigned long)allocation_record[1];
-        if (heap_size < wanted) { return 0; }
+    /* Eight more for the length this allocator keeps in front of every block, so
+     * that the address handed back is eight-byte aligned. */
+    if (heap_block == 0 || heap_used + wanted + 8 > heap_size) {
+        if (adopt_chunk(wanted) == 0) { return 0; }
     }
-    /* The allocation record is written into the caller's block, so the heap
-     * needs no table and a table cannot be corrupted by a program that writes
-     * past its own allocation. */
-    if (heap_used + wanted + 8 > heap_size) { return 0; }
     char *result = heap_block + heap_used;
     *(unsigned long *)result = wanted;
     heap_used = heap_used + wanted + 8;

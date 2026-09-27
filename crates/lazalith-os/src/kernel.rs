@@ -1,3 +1,4 @@
+use crate::allocator::MemoryService;
 use crate::display::DisplayService;
 use crate::input::InputService;
 use crate::{
@@ -90,6 +91,7 @@ pub struct KernelServices {
     terminal: TerminalService,
     display: DisplayService,
     input: InputService,
+    memory: MemoryService,
 }
 
 impl KernelServices {
@@ -134,6 +136,7 @@ impl KernelService for KernelServices {
             ValidatedSyscallKind::DisplayOpen { .. }
             | ValidatedSyscallKind::DisplayPresent { .. } => self.display.invoke(syscall, memory),
             ValidatedSyscallKind::InputPoll { .. } => self.input.invoke(syscall, memory),
+            ValidatedSyscallKind::AllocateMemory { .. } => self.memory.invoke(syscall, memory),
             _ => self.terminal.invoke(syscall, memory),
         }
     }
@@ -173,6 +176,7 @@ impl LazalithKernel {
                 terminal: TerminalService::new(terminal, FileSystemService::new(filesystem)),
                 display: DisplayService::new(architecture),
                 input: InputService::new(),
+                memory: MemoryService::new(),
             },
         })
     }

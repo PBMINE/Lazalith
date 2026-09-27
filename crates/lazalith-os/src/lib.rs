@@ -4,6 +4,7 @@ extern crate alloc;
 
 pub use lazalith_os_abi as abi;
 
+pub mod allocator;
 pub mod debug;
 pub mod display;
 mod error;
@@ -21,6 +22,7 @@ mod shell;
 mod syscall;
 mod terminal;
 
+pub use allocator::MemoryService;
 pub use error::MemoryError;
 pub use filesystem::{
     DEFAULT_MAX_DIRECTORY_ENTRIES, DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_NODES, DirectoryEntry,
