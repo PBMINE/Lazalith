@@ -355,7 +355,13 @@ impl<'a> Checker<'a> {
             BaseType::Bool => CType::Bool,
             BaseType::Char { signed } => CType::Int {
                 bits: 8,
-                signed: *signed || true,
+                // The signedness the parser recorded, which is the written one.
+                // A plain `char` is signed on this target, and `unsigned char` is
+                // not — and it has to be honoured, because every `strcmp` in the C
+                // standard library casts both operands to `unsigned char` before
+                // comparing them, precisely so that a byte above 127 compares
+                // *above* `'a'` and not below it.
+                signed: *signed,
             },
             BaseType::Short { unsigned } => CType::Int {
                 bits: 16,
@@ -2406,9 +2412,11 @@ pub fn library_signature(name: &str) -> Option<CType> {
         // the string functions' third argument is a length too — so all three
         // have the same shape here. `memcmp` takes `const void *` and the string
         // functions `const char *`; the ABI is a word either way.
-        "strcmp" | "strncmp" | "memcmp" => {
-            string(vec![byte_pointer.clone(), byte_pointer.clone(), CType::ulong()])
-        }
+        "strcmp" | "strncmp" | "memcmp" => string(vec![
+            byte_pointer.clone(),
+            byte_pointer.clone(),
+            CType::ulong(),
+        ]),
         "strcpy" | "strcat" | "strchr" | "strrchr" | "strstr" => {
             string(vec![byte_pointer.clone(), byte_pointer.clone()])
         }

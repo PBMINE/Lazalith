@@ -527,13 +527,27 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let base = base.or_else(|| {
-            if signed || unsigned || longs > 0 || shorts > 0 {
-                Some(integer_base(signed, unsigned, longs, shorts))
-            } else {
-                None
-            }
-        });
+        let base = base
+            .or_else(|| {
+                if signed || unsigned || longs > 0 || shorts > 0 {
+                    Some(integer_base(signed, unsigned, longs, shorts))
+                } else {
+                    None
+                }
+            })
+            .map(|base| {
+                // `char` is the one base type a signedness keyword may reach, because
+                // `signed char` and `unsigned char` are both C and are *different
+                // types*. Applying the flags here rather than inside `base_type` is
+                // what keeps `unsigned char` from being a plain `char` — and a plain
+                // `char` is signed, so a `strcmp` that skips its `unsigned char`
+                // comparison sees a high bit as a negative and calls `'c'` less than
+                // `'a'`.
+                match base {
+                    BaseType::Char { .. } => BaseType::Char { signed: !unsigned },
+                    other => other,
+                }
+            });
         let span = self.span_from(&start, self.at);
         let qualifiers = storage;
         (
@@ -602,7 +616,9 @@ impl<'a> Parser<'a> {
             return BaseType::Int;
         }
         if self.eat_keyword("char") {
-            return BaseType::Char { signed: false };
+            // The signedness is applied by the caller, which is the only place
+            // that knows whether `signed` or `unsigned` was written.
+            return BaseType::Char { signed: true };
         }
         if self.eat_keyword("int") {
             return BaseType::Int;

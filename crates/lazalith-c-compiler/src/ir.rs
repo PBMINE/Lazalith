@@ -546,14 +546,15 @@ struct Emitter<'a> {
     /// Every block-scope local's type, taken from the type checker.
     local_types: BTreeMap<String, CType>,
     program: &'a CheckedCProgram,
-    /// How many bytes every value this function has produced occupies.
+    /// How wide every value this function produced is, and whether it is signed.
     ///
     /// The IR's own `value_type` can answer this, but only from a *finished*
     /// function, and a backend needs the answer while the function is being built.
-    /// So the emitter records the width as it goes. Without it a store cannot choose
-    /// between a plain store and a conversion, and a call cannot convert an argument
-    /// to its parameter's type — which is C's rule and the IR verifier's too.
-    produced: BTreeMap<u32, u32>,
+    /// So the emitter records it as it goes. Without the *width* a store cannot choose
+    /// between a plain store and a conversion; without the *signedness* a widening
+    /// conversion cannot sign-extend, which is the difference between `(int)a`
+    /// where `a` is a `char` and where it is an `unsigned char`.
+    produced: BTreeMap<u32, Shape>,
 
     /// ABI syscalls this function called.
     ///
@@ -579,9 +580,9 @@ impl<'a> Emitter<'a> {
     /// The IR's error is the right one to report — it names a function, a block and
     /// a value — so it is wrapped rather than flattened into a string here.
     fn emit(&mut self, instruction: Instruction) -> Result<ValueId, LowerError> {
-        let width = ir_width(&instruction);
+        let shape = ir_shape(&instruction);
         let value = self.builder.emit(instruction).map_err(LowerError::from)?;
-        let _ = self.produced.insert(value.get(), width);
+        let _ = self.produced.insert(value.get(), shape);
         Ok(value)
     }
 
@@ -590,8 +591,12 @@ impl<'a> Emitter<'a> {
     /// A value this emitter did not record is assumed to be a whole word, which is
     /// the widest thing the machine holds: a store from a whole word into anything
     /// narrower converts, and a value wider than a word cannot exist.
-    fn width_of(&self, value: ValueId) -> u32 {
-        self.produced.get(&value.get()).copied().unwrap_or(8)
+    /// A value's width and signedness, as recorded when it was produced.
+    fn shape_of(&self, value: ValueId) -> Shape {
+        self.produced
+            .get(&value.get())
+            .copied()
+            .unwrap_or(Shape::WORD)
     }
 
     /// Emits an instruction that produces no value.
@@ -822,23 +827,29 @@ impl<'a> Emitter<'a> {
             ty: ir,
         })
     }
-
-    /// Writes a value of a type to an address.
     /// Writes a value of a type to an address, converting it on the way.
     ///
     /// A store's width and its value's width have to agree, because the IR
-    /// verifier requires it — and a store of a four-byte value into a `char`
-    /// would otherwise write bytes the value does not have. When they differ the
-    /// value is spilled to a whole word and read back at the target's width:
-    /// reading back the low bytes *is* the truncation C defines, and a
-    /// sign-extending load for a signed target is the sign extension C defines.
-    /// When they already agree a direct store is right, and a round trip would
-    /// cost two instructions for nothing.
+    /// verifier requires it — and a store of a one-byte value into a four-byte
+    /// `int` would otherwise write bytes the value does not have. The two
+    /// directions need different instructions, which is why this is not one round
+    /// trip:
+    ///
+    /// - **Narrowing** (`int` into a `char`): store the value whole, then read back
+    ///   only the bytes the target has. Reading back the low bytes *is* the
+    ///   truncation C defines.
+    /// - **Widening** (`char` into an `int`): the target is *bigger*, so reading it
+    ///   back would read bytes the value never had. The scratch is cleared first,
+    ///   the value is stored at its own width, and the target is read back with the
+    ///   **source's** signedness — which is exactly C's integer promotion. A signed
+    ///   `char` of -1 becomes -1 and an `unsigned char` of 255 becomes 255, and
+    ///   both are right for the same reason: the load extends what is there.
     fn store(&mut self, address: ValueId, value: ValueId, ty: &CType) -> Result<(), LowerError> {
         let width = store_width(ty).ok_or_else(|| LowerError::UnsupportedType { ty: ty.name() })?;
         let target = ty.size_in_bytes().unwrap_or(8);
-        let source = self.width_of(value);
-        if target == source {
+        let shape = self.shape_of(value);
+        let ty_signed = matches!(ty, CType::Int { signed: true, .. } | CType::Enum(_));
+        if target == shape.width && ty_signed == shape.signed {
             return self.emit_effect(Instruction::Store {
                 address,
                 value,
@@ -846,25 +857,51 @@ impl<'a> Emitter<'a> {
                 space: MemorySpace::Program,
             });
         }
-        // The scratch is as wide as the *wider* of the two, and the value is
-        // stored into it at its own width. A scratch narrower than the value
-        // would store the low bytes of a value whose high bytes are elsewhere —
-        // which is how a `char` assignment ends up storing eight bytes of a
-        // four-byte value, and the IR verifier is right to refuse it.
-        let wide = target.max(source);
-        let scratch = CType::Int {
-            bits: u16::try_from(wide * 8).unwrap_or(64),
-            signed: false,
-        };
+        let scratch = scratch_for(target.max(shape.width));
         let whole_offset = self.reserve_slot(&scratch, SlotPurpose::CastScratch, None, false)?;
         let whole = self.frame_address(whole_offset)?;
+        if target > shape.width {
+            // A widening read would read bytes the value never had, so the scratch
+            // is cleared first. One extra store buys a defined answer.
+            let zero = self.constant(0, &scratch)?;
+            self.emit_effect(Instruction::Store {
+                address: whole,
+                value: zero,
+                width: store_width(&scratch).unwrap_or(StoreWidth::Double),
+                space: MemorySpace::Program,
+            })?;
+        }
         self.emit_effect(Instruction::Store {
             address: whole,
             value,
-            width: store_width(&scratch_for(source)).unwrap_or(StoreWidth::Double),
+            width: store_width(&scratch_for(shape.width)).unwrap_or(StoreWidth::Double),
             space: MemorySpace::Program,
         })?;
-        let load = load_width(ty).ok_or_else(|| LowerError::UnsupportedType { ty: ty.name() })?;
+        // A conversion is two decisions, and they are not the same decision:
+        //
+        // - *How far to extend* follows the **source**, because the extension has
+        //   to read the bytes that are there. A signed `char` of -1 must
+        //   sign-extend to -1; an `unsigned char` of 255 must zero-extend to 255.
+        // - *What the result is* follows the **target**, because that is the type
+        //   the program wrote. `(int)(unsigned char)c` is a signed `int`, and
+        //   typing it as the source left `(int)'c' - (int)'d'` as a subtraction of
+        //   two *unsigned* values, which wraps to 4294967295 and compares `>= 0`.
+        //
+        // So the load's width and signedness come from the source, and the type it
+        // reports is the target's. Narrowing and reinterpretation read back as the
+        // target in both senses, because the value after the store *is* a value of
+        // the target type — and a `size_t` argument has to arrive as a `u64` or the
+        // IR verifier, correctly, refuses it.
+        let read_as = if target > shape.width {
+            CType::Int {
+                bits: u16::try_from(target * 8).unwrap_or(64),
+                signed: shape.signed,
+            }
+        } else {
+            ty.clone()
+        };
+        let load = load_width(&read_as)
+            .ok_or_else(|| LowerError::UnsupportedType { ty: read_as.name() })?;
         let converted = self.emit(Instruction::Load {
             address: whole,
             width: load,
@@ -1709,6 +1746,29 @@ impl<'a> Emitter<'a> {
     /// The result is written by whichever side decided it, so an eager
     /// evaluation — which would run the right side even when the left side
     /// already answers the question, and that side can trap — never happens.
+    /// Turns a value's truth into a `0` or `1` integer.
+    fn truth(&mut self, value: ValueId) -> Result<ValueId, LowerError> {
+        let zero = self.constant(0, &CType::int())?;
+        let compared = self.emit(Instruction::Compare {
+            op: IrComparisonOp::NotEqual,
+            left: value,
+            right: zero,
+        })?;
+        let boolean = self.emit(Instruction::Unary {
+            op: UnaryOp::IntToBool,
+            operand: compared,
+            ty: IrType::Bool,
+        })?;
+        self.emit(Instruction::Unary {
+            op: UnaryOp::BoolToInt,
+            operand: boolean,
+            ty: IrType::Int {
+                bits: 32,
+                signed: true,
+            },
+        })
+    }
+
     fn logical(
         &mut self,
         and: bool,
@@ -1733,10 +1793,30 @@ impl<'a> Emitter<'a> {
             otherwise: join.id,
         })?;
         self.switch_to(&right_block)?;
-        self.store(result, if and { one } else { zero }, &CType::int())?;
+        // The right side's *value* decides the answer, not merely its arrival. A
+        // `&&` that stored a constant here would answer `1` for every pair whose
+        // left side was true, and `1 && 0` is the most ordinary short-circuit
+        // there is — it is the loop guard of every C string routine in the
+        // standard library. For `||` the answer is the right side's truth the
+        // other way round, so `1 - truth` is `!truth` without a branch.
+        let right_value = self.value(right)?;
+        let right_truth = self.truth(right_value)?;
+        let answer = if and {
+            right_truth
+        } else {
+            self.emit(Instruction::Binary {
+                op: IrBinaryOp::Sub,
+                left: one,
+                right: right_truth,
+                ty: IrType::Int {
+                    bits: 32,
+                    signed: true,
+                },
+            })?
+        };
+        self.store(result, answer, &CType::int())?;
         self.terminate(Terminator::Jump(join.id))?;
         self.switch_to(&join)?;
-        let _ = self.value(right);
         self.load(result, &CType::int())
     }
 
@@ -2188,15 +2268,38 @@ pub fn ir_type(ty: &CType) -> Option<IrType> {
     }
 }
 
-/// How wide the result of an instruction is, in bytes.
+/// A value's width in bytes and whether it is signed.
 ///
-/// A `void` has no width, and the machine holds nothing wider than a word, so
-/// both are clamped to the word rather than being special cases at every use.
-fn ir_width(instruction: &Instruction) -> u32 {
-    instruction_result_type(instruction)
-        .size_in_bytes()
-        .unwrap_or(8)
-        .clamp(1, 8)
+/// This is the pair a conversion needs. The width says whether the two sides of a
+/// store agree; the signedness says how a *widening* one extends. A `char` and an
+/// `unsigned char` are both one byte, and `(int)` of them is the difference between
+/// -1 and 255, so a width alone is not enough.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Shape {
+    width: u32,
+    signed: bool,
+}
+
+impl Shape {
+    /// A whole word, which is the widest thing the machine holds and the safe
+    /// default for a value this emitter did not record.
+    const WORD: Self = Self {
+        width: 8,
+        signed: true,
+    };
+
+}
+
+/// The shape of an instruction's result.
+///
+/// A `void` has no width and the machine holds nothing wider than a word, so both
+/// are clamped to the word rather than being special cases at every use.
+fn ir_shape(instruction: &Instruction) -> Shape {
+    let ty = instruction_result_type(instruction);
+    Shape {
+        width: ty.size_in_bytes().unwrap_or(8).clamp(1, 8),
+        signed: matches!(ty, IrType::Int { signed: true, .. }),
+    }
 }
 
 /// The IR load width for a C type, with its signedness.
