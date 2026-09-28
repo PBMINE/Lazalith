@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–87 complete and verified)
+Last updated: 2026-09-28 (Steps 1–88 complete and verified)
 
 ## Where the roadmap stands
 
@@ -35,9 +35,10 @@ Step  84      complete: property testing
 Step  85      complete: differential testing
 Step  86      complete: fuzzing
 Step  87      complete: deterministic replay
+Step  88      complete: application packaging design
 ```
 
-The 1019 workspace tests all pass, including the 4 in
+The 1023 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -810,6 +811,53 @@ trap vector, and every region's bytes and permissions.
 A by-product of writing it: `DeviceManager` gained `device_mut`. A manager whose
 devices could only be reached through a full-state restore had a gap in it — a host
 feeding an input device had to reconstruct a queue in order to append to it.
+
+## Step 88 — application packaging
+
+`docs/lazen-packages.md` defines the third unit, the one a person shares:
+
+```text
+application   lazen.toml + src/     what a person authors   (step 56)
+executable    .lzx                  what LazOS loads        (existing)
+package       .lza                  what a person shares     (this step)
+```
+
+The roadmap says not to finalize the format before understanding the requirements, so
+the requirements were read out of the tree rather than invented, and the design
+cites the code for each one. Three findings drove it:
+
+- **`SpawnProcess` names a path, and nothing turns a path into an executable.**
+  `syscall.rs:853` validates a path and a length; `LazalithKernel::start_image`
+  takes an `LzxImage` by value. The middle is missing, and it is the reason the
+  design specifies a *resolution rule* and not just a container.
+- **A bare `.lzx` has nowhere to put a name or a version**, so it cannot answer
+  "which application is this, and may I start it" — which is all an installer, a
+  package manager, and a capability check need. That is what the package header is.
+- **A package must never say anything about execution that the `.lzx` does not
+  also say**, because that is a second source of truth. So the container stores one
+  complete `.lzx` verbatim, stores the manifest verbatim rather than re-serializing
+  it, and resolves by *content* rather than by file name — which is also what a VFS
+  with no executable flag on a node can actually do.
+
+Two constants currently contradict each other — `LZX_MAX_FILE_SIZE` is 4 MiB and
+`DEFAULT_MAX_FILE_BYTES` is 1 MiB — so a large application cannot be installed as a
+single VFS file today. The design leaves that open rather than guessing, and records
+it as a gap with the three reasonable answers and none of them chosen, because which
+one is right depends on what real applications weigh and no application has been
+published yet. The same applies to version *compatibility*: `major.minor.patch` is
+fixed by step 56, but nothing has been promised to a user of an application, so there
+is nothing to be compatible with.
+
+### What the step owes its reader
+
+`crates/lazalith-os/tests/package_premises.rs` asserts the four design claims that can
+be checked, so the document cannot go stale silently: an image is self-describing and
+round-trips (rule 1's assumption), two identically built images are the same file
+(the central gap, which stops being true the moment someone adds identity to `.lzx`),
+the only way into the scheduler is an image (the first driver), and the size
+contradiction still points where the design says it does. A test for "this does not
+exist" is a comment, so the missing path→image step is recorded as a gap rather than
+asserted.
 
 
 ## Earlier milestones
