@@ -161,6 +161,7 @@ name = "lazalith-ir"
 version = "0.1.0"
 dependencies = [
  "lazalith-diagnostics",
+ "lazalith-properties",
  "lazalith-types",
 ]
 

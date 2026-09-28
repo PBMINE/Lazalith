@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–83 complete and verified)
+Last updated: 2026-09-28 (Steps 1–84 complete and verified)
 
 ## Where the roadmap stands
 
@@ -31,9 +31,10 @@ Step  80      complete: internal emulator error reporting (cb84333)
 Step  81      complete: the C compiler
 Step  82      complete: the C runtime
 Step  83      complete: assembly, C and Lazen convergence
+Step  84      complete: property testing
 ```
 
-The 941 workspace tests all pass, including the 4 in
+The 989 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -566,6 +567,79 @@ The *name* of `main`, and only because the IR has a single flat symbol namespace
 so a C function and a Lazen function of the same name cannot collide. Those two
 prefixes are the whole of the per-language difference in the object, and they are
 namespace hygiene rather than a dialect.
+
+## Step 84 — property testing
+
+The step asks for property tests over seven areas: instruction encode and decode,
+register behaviour, width conversions, memory, the object format, the parser, and
+the IR. All seven have them, and the example it gives —
+`decode(encode(instruction)) == instruction` — is the ISA's first one.
+
+### The generator, and why it is not a framework
+
+`crates/lazalith-properties` is about two hundred lines and has no dependencies.
+Property testing is a habit rather than a dependency, and this repository has no
+third-party Rust dependencies at all: every crate is `no_std`, `unsafe`-free, and
+built by a Nix expression that vendors nothing. A framework would have been the
+fast route and the wrong one.
+
+What a property test needs from a framework is four things, and this has all four:
+generation, repetition, reproducibility, and a seed corpus. The corpus is a *fixed*
+list — a suite that draws a different 500 cases every run finds a different bug
+every time and is never the same test twice, while a fixed list means a failure
+found today is still found tomorrow and a fix shows up as a test that stopped
+failing rather than as a quiet change of inputs. The seeds are the Fibonacci
+numbers, which has no meaning beyond being a sequence nobody would choose twice.
+
+It does not shrink, and says so. What it does instead is report the whole failing
+case and the seed that made it, with a one-line re-run. A bad shrink is worse than
+none, because it reports a case that does not fail.
+
+### Two bugs, and what they say about the rest of the suite
+
+- **The C lexer panicked on a non-ASCII character.** `at` is a byte offset and
+  every span is built from one, and the lexer's "make progress" step advanced it by
+  one *byte*. On a three-byte character that leaves `at` in the middle of it, and
+  the next token's span is not a character boundary, so `slice` panicked. A C file
+  with an `é` in a comment is not exotic; it is a file somebody's editor produced.
+- **Sign extension from a 64-bit source was not the identity.**
+  `WordWidth::sign_extend` used the standard `(x ^ sign) - sign`, and that identity
+  is wrong at the full width: its `sign` is `1 << 63`, and
+  `(0xffff_ffff_0000_0000 ^ 1 << 63) - (1 << 63)` is all ones. The existing table
+  test missed it because it tries six values per width and none of the six for 64
+  bits is the one that breaks. Which is the argument for this step in one line.
+
+Neither was in an area that had no tests. Both were in areas with *exhaustive*
+tests, which is the point: a hand-written list is the list somebody imagined, and
+step 82's compiler bugs came from exactly the same place — `a + b` and `a < b` were
+the only comparisons anyone wrote, and `|` did not parse.
+
+### What each area gets
+
+| Area | File | Properties |
+|---|---|---|
+| Instruction codec | `lazalith-isa/tests/properties.rs` | the round trip both ways, a length that does not depend on its operands, a refusal that says why, arbitrary bytes decoded or refused |
+| Width conversions | `lazalith-types/tests/properties.rs` | a zero extension is the low bits, a sign extension fills from the source's sign bit, the two differ exactly when the source is narrow and negative, truncation is idempotent, addition commutes, subtraction undoes addition, multiplication distributes, every result fits, an impossible width is refused |
+| Registers | `lazalith-cpu/tests/properties.rs` | a register holds what was written at the machine's width, the last write wins, writing one disturbs no other, every register starts at zero, the two accessors agree, a refused write reaches nothing |
+| Memory | `lazalith-memory/tests/properties.rs` | a write reads back as what the machine can hold, a byte write leaves its neighbours alone, unmapped faults *and* mapped does not, a read-only region refuses without changing anything, regions that overlap are refused while regions that abut are not |
+| Object format | `lazalith-toolchain/tests/properties.rs` | the round trip, encoding is a function of the object, the bytes begin with the magic, arbitrary bytes are an object or a refusal, every proper prefix of a valid object is refused |
+| Parsers | `lazalith-compiler` and `lazalith-c-compiler` | random text is a program or a refusal and never a panic, a refusal says something, compiling twice gives the same answer, every diagnostic is reported |
+| IR | `lazalith-ir/tests/properties.rs` | what the builder accepts the verifier accepts, each refusal actually refuses with the right kind, building twice gives the same module, every block a terminator names exists |
+
+### Three properties that were wrong before they were right
+
+Left in the files as they are, because being wrong about them is how two of the
+bugs above were found.
+
+- "The two extensions differ iff the value is negative" is false for a 64-bit
+  source, which sign-extends to itself. Stating the rule rather than the summary is
+  what turned up the real bug.
+- "Every prefix of a program is refused" is false of the prefix that stops one byte
+  short of the final newline, which is a perfectly good program.
+- An empty file is a translation unit rather than a mistake: the front end answers
+  "is this C", the lowering answers "is this a program". Asserting otherwise would
+  have asserted the wrong layering — and it did, until the test failed and the
+  layering turned out to be right.
 
 
 ## Earlier milestones
