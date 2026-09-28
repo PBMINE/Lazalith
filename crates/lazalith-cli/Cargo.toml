@@ -21,5 +21,9 @@ lazalith-runtime = { path = "../lazalith-runtime" }
 lazalith-toolchain = { path = "../lazalith-toolchain" }
 lazalith-types = { path = "../lazalith-types" }
 
+[dev-dependencies]
+lazalith-debug = { path = "../lazalith-debug" }
+lazalith-os-abi = { path = "../lazalith-os-abi" }
+
 [lints]
 workspace = true

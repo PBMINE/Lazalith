@@ -62,9 +62,11 @@ dependencies = [
  "lazalith-boot",
  "lazalith-compiler",
  "lazalith-cpu",
+ "lazalith-debug",
  "lazalith-devices",
  "lazalith-isa",
  "lazalith-os",
+ "lazalith-os-abi",
  "lazalith-runtime",
  "lazalith-toolchain",
  "lazalith-types",
@@ -164,7 +166,6 @@ name = "lazalith-gui"
 version = "0.1.0"
 dependencies = [
  "lazalith-boot",
- "lazalith-cpu",
  "lazalith-debug",
  "lazalith-devices",
  "lazalith-diagnostics",

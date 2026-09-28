@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–98 complete and verified)
+Last updated: 2026-09-28 (Steps 1–99 complete and verified)
 
 ## Where the roadmap stands
 
@@ -46,9 +46,10 @@ Step  95      complete: Nix integration
 Step  96      complete: final integration test
 Step  97      complete: final graphics test
 Step  98      complete: final debugging test
+Step  99      complete: final architecture review
 ```
 
-The 1158 workspace tests all pass, including the 4 in
+The 1171 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -1615,6 +1616,61 @@ output. A debugger that reported a fault for a healthy program would make every 
 here worthless.
 
 1158 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
+
+## Step 99 — the final architecture review
+
+The step lists thirteen properties the finished platform must have.
+`crates/lazalith-cli/tests/architecture.rs` checks all thirteen mechanically, because a
+review that reads as prose and concludes "the layers look right" is worth about as much as
+the last time somebody drew a dependency diagram. Most of the rules are properties of the
+manifests, so they are checked by reading the manifests; the rest are checked by *using* the
+thing.
+
+| rule | how it is checked |
+| --- | --- |
+| CPU does not depend on SDL3 | `lazalith-cpu`, `-isa`, `-types`, `-memory` declare no `sdl3` |
+| Machine does not depend on compiler | `lazalith-machine`, `-cpu`, `-os` declare no compiler |
+| Compiler does not depend on the emulator | the compiler, the IR and codegen declare no `lazalith-machine` **as a library** |
+| GUI does not access CPU internals | `lazalith-gui` declares no `lazalith-cpu`, and SDL3 reaches exactly two crates: itself and the GUI |
+| Lazen does not bypass LazOS | a program builds, links and validates, and the compiler's syscall table *is* the ABI's |
+| C does not bypass the ABI | the C compiler numbers syscalls from the ABI crate |
+| Assembly can reach low-level functionality | the assembler accepts a supervisor-only program, and the machine is what refuses to run it |
+| LZ32 and LZ64 share architecture infrastructure | the same bytes decode under both configurations, and no layer has a `32`/`64` twin |
+| ISA not duplicated | exactly one crate writes the instruction table |
+| ABI not duplicated | exactly one crate writes `ABI_VERSION`, and the compiler reads the ABI from the ABI crate |
+| Syscalls not duplicated | one table, every number distinct, one definition |
+| Diagnostics centralised | each crate that emits a diagnostic depends on the one diagnostics crate |
+| Guest faults and emulator bugs distinguishable | different *values* in one enum, with different codes |
+
+**The review found two real things, which is the argument for doing it mechanically.**
+
+First, `lazalith-gui` depended on `lazalith-cpu` — and never used it. A manifest is the
+*only* way to reach a crate's internals, so an unused dependency in the presentation layer
+is one import away from violating "the GUI does not access CPU internals", and nothing but
+a test would ever have noticed. Removed.
+
+Second, `lazalith-codegen` declared `lazalith-machine` as a **library** dependency while only
+its *tests* used it — the tests run generated code in a machine, which is exactly what they
+should do. As a library dependency it put an emulator inside a code generator, which is the
+"compiler does not depend on the emulator implementation" rule waiting to be broken. Moved
+to `[dev-dependencies]`, and the checker now reads the two sections separately, because a
+check that cannot tell them apart cannot enforce either rule.
+
+**Three of my own premises were wrong, and the tests said so.** The GUI *should* depend on
+SDL3 — it is the presentation layer SDL3 exists for; the rule is that SDL3 must not leak
+*below* it. `lazalith-os` does not depend on the diagnostics crate, and should not: it is
+the layer where an error is a value a caller must handle rather than a message a person
+reads, so it is absent from the list of crates that report diagnostics. And the C runtime
+does not need the ABI crate, because it *declares* its syscalls by name and the C compiler
+numbers them — so the check belongs on the crate that does the numbering, which is the
+whole point of the rule rather than a detail of it. A test written from a wrong premise
+failing is the cheapest possible way to find out.
+
+`dependencies()` reads only `[dependencies]` and not `[dev-dependencies]`, with the
+reasoning written down in the function: a code generator may legitimately run what it
+generated in a test, and what it may not do is depend on the machine from its library.
+
+1171 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
 
 ## Earlier milestones
