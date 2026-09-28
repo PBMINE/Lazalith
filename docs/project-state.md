@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–85 complete and verified)
+Last updated: 2026-09-28 (Steps 1–86 complete and verified)
 
 ## Where the roadmap stands
 
@@ -33,9 +33,10 @@ Step  82      complete: the C runtime
 Step  83      complete: assembly, C and Lazen convergence
 Step  84      complete: property testing
 Step  85      complete: differential testing
+Step  86      complete: fuzzing
 ```
 
-The 994 workspace tests all pass, including the 4 in
+The 1001 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -716,6 +717,45 @@ The operand lists in the curated corpus are written out rather than generated. A
 corpus built by asking the format what it wants is a corpus of the *builder's*
 opinion rather than of a program somebody meant — and the first version of this file
 had `Addi` with two operands, which is not an instruction this ISA has.
+
+## Step 86 — fuzzing
+
+`lazalith-fuzz` asks one question of the ten things in this repository that read
+bytes they did not write: *what happens when the bytes are wrong?* `docs/fuzzing.md`
+has the target list and the reasoning; the short version is that the step's
+requirement — "malformed data must not silently corrupt state" — is a statement about
+*answers*, so every target states the answers it will accept and a target that
+refused everything would fail a second test rather than pass quietly.
+
+No `cargo-fuzz` and no coverage instrumentation, for the same reason step 84 wrote its
+own property generator: this repository has no third-party Rust dependencies. A
+coverage-guided fuzzer finds deeper bugs in less time on one target; a deterministic
+campaign finds the same class every time, runs on every commit, and never flakes, and
+`--iterations N --seed S` makes a failure a command line. For a repository whose
+central claim is reproducibility, that is the better trade, and it is a trade rather
+than a free win.
+
+### What it found
+
+The object reader, on the first campaign, through a check that was itself wrong.
+
+The target demanded that a file re-encode to itself byte for byte. The fuzzer
+produced a file that read cleanly and re-encoded to eight bytes *more*. It was a
+perfectly valid object: one byte in a string table had changed from a NUL to
+something else, which merged the adjacent names `text` and `_start` into the single
+name `text\x01_start`. The file is legal, the reader was right to accept it, and the
+writer is right to spend eight more bytes on a seven-byte-longer name.
+
+So the check was the bug, and the property worth stating is **idempotence**: one
+pass through read-then-write reaches a fixed point, so a linker that rewrites a file
+twice produces one file. A valid object in a non-canonical spelling is still accepted,
+which byte-identity would have rejected.
+
+Two smaller things the harness got wrong the same way, both now fixed and both worth
+recording: a parser target counted a refusal as a failure when refusing malformed
+source is the correct answer, and an empty string table was treated as malformed
+input rather than as "there is no program", which has to produce a machine that
+stops at the start rather than a refusal to build one.
 
 
 ## Earlier milestones

@@ -1,0 +1,24 @@
+[package]
+name = "lazalith-fuzz"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Fuzz targets for everything that reads bytes it did not write"
+
+[dependencies]
+lazalith-boot = { path = "../lazalith-boot" }
+lazalith-c-compiler = { path = "../lazalith-c-compiler" }
+lazalith-compiler = { path = "../lazalith-compiler" }
+lazalith-cpu = { path = "../lazalith-cpu" }
+lazalith-debug = { path = "../lazalith-debug" }
+lazalith-devices = { path = "../lazalith-devices" }
+lazalith-gui = { path = "../lazalith-gui" }
+lazalith-isa = { path = "../lazalith-isa" }
+lazalith-machine = { path = "../lazalith-machine" }
+lazalith-memory = { path = "../lazalith-memory" }
+lazalith-os = { path = "../lazalith-os" }
+lazalith-toolchain = { path = "../lazalith-toolchain" }
+lazalith-types = { path = "../lazalith-types" }
+
+[lints]
+workspace = true

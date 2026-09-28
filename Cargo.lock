@@ -140,6 +140,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazalith-fuzz"
+version = "0.1.0"
+dependencies = [
+ "lazalith-boot",
+ "lazalith-c-compiler",
+ "lazalith-compiler",
+ "lazalith-cpu",
+ "lazalith-debug",
+ "lazalith-devices",
+ "lazalith-gui",
+ "lazalith-isa",
+ "lazalith-machine",
+ "lazalith-memory",
+ "lazalith-os",
+ "lazalith-toolchain",
+ "lazalith-types",
+]
+
+[[package]]
 name = "lazalith-gui"
 version = "0.1.0"
 dependencies = [
