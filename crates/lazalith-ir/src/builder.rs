@@ -308,6 +308,20 @@ impl FunctionBuilder {
         Ok(())
     }
 
+    /// Whether the selected block already has its terminator.
+    ///
+    /// A lowering that appends a jump to a block which has already been terminated —
+    /// because a statement in it returned, or broke — would be a second terminator in
+    /// one block, which is a malformed function rather than a redundant instruction.
+    /// The builder refuses that, correctly, and a caller assembling several blocks
+    /// back to back needs to ask.
+    pub fn current_is_terminated(&self) -> bool {
+        match self.current {
+            Some(index) => self.blocks[index].terminator.is_some(),
+            None => true,
+        }
+    }
+
     /// Finishes the function, checking that every block is terminated.
     pub fn finish(self) -> Result<Function, IrError> {
         if self.blocks.is_empty() {

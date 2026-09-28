@@ -563,11 +563,7 @@ impl<'a> Checker<'a> {
             .iter()
             .position(|entry| matches!(entry, Derivation::Function(..)));
         let Some(at) = function else {
-            let mut ty = base.clone();
-            for entry in derivation {
-                ty = self.derived(ty, entry);
-            }
-            return ty;
+            return self.with_reversed_arrays(base.clone(), derivation);
         };
         let signature = self.signature(base, &derivation[at]);
         let Derivation::Function(_, _, parenthesised) = &derivation[at] else {
@@ -585,6 +581,28 @@ impl<'a> Checker<'a> {
             result = self.derived(result, entry);
         }
         self.with_result(signature, result)
+    }
+
+    /// Applies a declarator's derivations with the array ones in reverse.
+    ///
+    /// C's postfix derivations associate right to left, so `T a[N][M]` is an array of
+    /// N of an array of M — the dimensions are read outermost-first in the source and
+    /// therefore have to be *applied* innermost-first. A `*` is a prefix operator and
+    /// binds looser than every suffix, so the pointers are applied in source order at
+    /// the front and only the arrays are reversed.
+    fn with_reversed_arrays(&mut self, base: CType, derivation: &[Derivation]) -> CType {
+        let mut ty = base;
+        for entry in derivation {
+            if !matches!(entry, Derivation::Array(_)) {
+                ty = self.derived(ty, entry);
+            }
+        }
+        for entry in derivation.iter().rev() {
+            if matches!(entry, Derivation::Array(_)) {
+                ty = self.derived(ty, entry);
+            }
+        }
+        ty
     }
 
     /// One derivation applied to a type.

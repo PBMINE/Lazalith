@@ -268,3 +268,76 @@ fn a_wide_decimal_constant_becomes_a_long_and_a_wide_hex_one_an_unsigned() {
         );
     }
 }
+
+/// A multi-dimensional array's **initialiser** is checked against the wrong dimension.
+///
+/// `int grid[2][3]` is an array of two rows of three. The check that a list's length
+/// matches the declaration was applying the *outer* length to the *inner* list, so
+/// `{{1, 2, 3}, {4, 5, 6}}` was refused with "this list has 3 values for an array of
+/// 2" and `{{1, 2}, {3, 4}}` was accepted.
+///
+/// What makes it so well hidden is worth recording, because both hiding places are
+/// instructive:
+///
+/// - `sizeof` cannot see it. The size is the *product* of the dimensions, and a
+///   product does not care what order it is multiplied in, so `sizeof` was right
+///   before the fix and is right after it. Every measurement that was tried first was
+///   blind to the defect by arithmetic, not by accident.
+/// - A *square* array cannot see it. `int g[2][2]` has two equal dimensions, so the
+///   wrong one gives the right answer, and a test that happened to use one would pass
+///   a frontend that was wrong about every other shape.
+///
+/// So the test has to use unequal dimensions *and* check the initialiser rather than
+/// the size, and it has to check both directions: a check that only rejects the wrong
+/// shape would also pass a frontend that rejected everything.
+#[test]
+fn a_multi_dimensional_initialiser_is_checked_against_the_right_dimension() {
+    // Accepted, and these are the shapes C accepts.
+    for declaration in [
+        "int g[2][3] = {{1, 2, 3}, {4, 5, 6}};",
+        "int g[3][2] = {{1, 2}, {3, 4}, {5, 6}};",
+        // A short initialiser is legal: the rest is zero.
+        "int g[2][3] = {{1, 2}, {3, 4}};",
+        "int g[2][2][2] = {{{1, 2}, {3, 4}}, {{5, 6}, {7, 8}}};",
+    ] {
+        assert!(
+            accepts(&format!("int main() {{ {declaration} return 0; }}")).is_ok(),
+            "`{declaration}` is legal C and was refused"
+        );
+    }
+    // Refused, and these are the shapes C refuses: a *long* row.
+    for declaration in [
+        "int g[2][3] = {{1, 2, 3, 9}, {4, 5, 6, 9}};",
+        "int g[3][2] = {{1, 2, 3}, {4, 5, 6}};",
+        "int g[2][2][2] = {{1, 2, 3}, {3, 4}};",
+    ] {
+        assert!(
+            accepts(&format!("int main() {{ {declaration} return 0; }}")).is_err(),
+            "`{declaration}` has a row longer than the array and must be refused"
+        );
+    }
+}
+
+#[test]
+fn the_size_of_a_multi_dimensional_array_is_the_product_of_its_dimensions() {
+    // Included because it is the measurement that *cannot* catch the defect above, and
+    // saying so is what stops somebody adding it as the only test later.
+    for (declaration, expected) in [
+        ("int g[2][3];", 24),
+        ("int g[3][2];", 24),
+        ("int g[2][2];", 16),
+        ("int g[1][5];", 20),
+        ("int g[3][1][2];", 24),
+        ("int g[2][2][2];", 32),
+    ] {
+        let (_, status) = run_c(&format!(
+            "int main() {{ {declaration} return (int) sizeof(g); }}"
+        ));
+        assert_eq!(
+            status, expected as u32,
+            "sizeof({declaration}) is {expected} in C. Note that this measurement is \
+             the *product* of the dimensions, so it was correct before the fix and \
+             could never have found it."
+        );
+    }
+}

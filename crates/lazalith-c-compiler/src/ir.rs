@@ -1373,6 +1373,15 @@ impl<'a> Emitter<'a> {
         self.scopes.pop();
     }
 
+    /// A run of statements in one scope, for a `switch` arm that holds several.
+    fn scoped_statements(&mut self, statements: &[Statement]) {
+        self.scopes.push(Scope::default());
+        for statement in statements {
+            self.statement(statement);
+        }
+        self.scopes.pop();
+    }
+
     fn while_statement(
         &mut self,
         condition: &Expression,
@@ -1483,24 +1492,156 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    /// A `switch`, lowered as a chain of comparisons.
+    /// C's `switch`, lowered as a chain of comparisons.
     ///
-    /// The ISA has no jump table and the IR has no `switch`, so a chain is the
-    /// only lowering that is correct on a machine with no jump-table
-    /// instruction. It is slower than a table and it does not guess.
+    /// The ISA has no jump table and the IR has no `switch`, so a chain is the only
+    /// lowering that is correct on a machine with no jump-table instruction. It is
+    /// slower than a table and it does not guess.
+    ///
+    /// This used to be `let _ = self.value(condition);` followed by lowering the body
+    /// as an ordinary block — which *discarded the value being switched on*. Every
+    /// program with a `switch` in it ran the first case body whatever the value was,
+    /// with no diagnostic and with a suite of passing tests, because a test whose
+    /// expected value happened to be the first arm's could not tell the difference.
+    ///
+    /// Both halves of C's shape matter:
+    ///
+    /// - **Dispatch** is a chain of equality tests in source order, landing on the
+    ///   `default` arm if there is one and on the end of the switch if there is not.
+    /// - **Fall-through** is a jump from an arm's end to the **next** arm, not to the
+    ///   end of the switch. A case body without a `break` continues into the one below
+    ///   it, which is why `break_blocks` is pushed here: a `break` leaves, and falling
+    ///   through does not.
+    ///
+    /// A declaration between two cases is a statement in its own right and stays in
+    /// order, so `case 1: int x = 2;` initialises `x` in the arm it was written in and
+    /// in no other.
     fn switch_statement(
         &mut self,
         condition: &Expression,
         body: &Statement,
     ) -> Result<(), LowerError> {
-        let _ = self.value(condition);
+        // The arms in source order, and the statements that came before the first
+        // label. C's grammar wants every item in a switch body to be a labelled
+        // statement, so the leading run is empty in practice; it is kept and run
+        // before the dispatch rather than dropped, because dropping a statement is
+        // worse than the approximation of running it for every value.
+        //
+        // The walk is recursive rather than a pass over a flat list, because the
+        // parser builds `case 1:` with nothing after it as a *nested* statement — the
+        // outer case's statement is the inner one — and how deep that nests depends on
+        // how the labels were written. A walk that recurses through labels and blocks
+        // does not care, and a flat one that has to be told the nesting is a flat one
+        // that will be wrong for the next spelling.
+        let mut arms: Vec<SwitchArm> = Vec::new();
+        let mut leading: Vec<Statement> = Vec::new();
+        match body {
+            Statement::Block(block) => {
+                collect_switch_arms(&block.items, &mut arms, &mut leading);
+            }
+            other => {
+                // A `switch` whose body is one statement has no arms, so it is a
+                // single unlabelled arm — which always runs, and which is what C says.
+                leading.push(other.clone());
+            }
+        }
+        // A switch with no labels at all runs its body whatever the value is.
+        if arms.is_empty() && !leading.is_empty() {
+            arms.push(SwitchArm {
+                value: None,
+                body: leading.clone(),
+            });
+        }
+
+        let value = self.value(condition)?;
         let end_name = self.block_name("switchEnd");
         let end = self.reserve(&end_name)?;
         self.break_blocks.push(end.clone());
-        self.scoped_statement(body);
-        self.break_blocks.pop();
-        self.builder.terminate(Terminator::Jump(end.id))?;
+        for statement in &leading {
+            self.statement(statement);
+        }
+
+        // One block per arm, in source order, because fall-through is a jump to the
+        // next arm and the next arm is the next block.
+        let mut blocks = Vec::new();
+        for index in 0..arms.len() {
+            let name = self.block_name(&format!("case{index}"));
+            blocks.push(self.reserve(&name)?);
+        }
+        let labelled: Vec<usize> = (0..arms.len())
+            .filter(|index| arms[*index].value.is_some())
+            .collect();
+        let default_at = (0..arms.len()).find(|index| arms[*index].value.is_none());
+        // One block per test, because a chain of tests is a chain of *blocks*: two
+        // comparisons and two branches cannot go in one block, and the builder
+        // refuses an instruction after a terminator — correctly. The first test goes
+        // in the block the switch is already in; each later one gets its own, and the
+        // last one's `otherwise` is the `default` arm or the end.
+        let mut test_blocks = Vec::new();
+        for index in 1..labelled.len() {
+            let name = self.block_name(&format!("test{index}"));
+            test_blocks.push(self.reserve(&name)?);
+        }
+        for (position, index) in labelled.iter().enumerate() {
+            // A test block is only *entered* at the point the previous test branched
+            // to it, so the current block is right for every test in turn.
+            if position > 0 {
+                self.switch_to(&test_blocks[position - 1])?;
+            }
+            let case = self.value(arms[*index].value.as_ref().expect("a labelled arm"))?;
+            let equal = self.emit(Instruction::Compare {
+                op: IrComparisonOp::Equal,
+                left: value,
+                right: case,
+            })?;
+            let otherwise = match test_blocks.get(position) {
+                Some(next) => next.id,
+                None => match default_at {
+                    Some(at) => blocks[at].id,
+                    None => end.id,
+                },
+            };
+            self.builder
+                .terminate(Terminator::Branch {
+                    condition: equal,
+                    then_block: blocks[*index].id,
+                    otherwise,
+                })
+                .map_err(LowerError::from)?;
+        }
+        // Nothing matched. The chain above already ends at the right place — the last
+        // test's `otherwise` is the `default` arm, or the end — so a separate jump
+        // would be a second terminator in a block that has one, which the builder
+        // rightly refuses. It is only needed when there are no tests at all.
+        if labelled.is_empty() {
+            let unmatched = match default_at {
+                Some(at) => blocks[at].id,
+                None => end.id,
+            };
+            self.builder
+                .terminate(Terminator::Jump(unmatched))
+                .map_err(LowerError::from)?;
+        }
+
+        for (index, arm) in arms.iter().enumerate() {
+            self.switch_to(&blocks[index])?;
+            self.scoped_statements(&arm.body);
+            // Falling through goes to the *next arm*, and out of the last one. An arm
+            // that already ended — a `return` or a `break` — has no fall-through, and
+            // emitting one anyway would be a second terminator in a block that has
+            // one, which is a malformed function rather than a redundant jump.
+            if !self.builder.current_is_terminated() {
+                let following = match blocks.get(index + 1) {
+                    Some(next) => next.id,
+                    None => end.id,
+                };
+                self.builder
+                    .terminate(Terminator::Jump(following))
+                    .map_err(LowerError::from)?;
+            }
+        }
         self.switch_to(&end)?;
+        self.break_blocks.pop();
         Ok(())
     }
 
@@ -1777,6 +1918,106 @@ impl<'a> Emitter<'a> {
         self.load(address, &field.ty)
     }
 
+    /// The scaled address for `pointer + count` or `pointer - count`, or `None` for
+    /// every other shape of `+` and `-`.
+    ///
+    /// C's pointer arithmetic is in **units of the pointee**, not in bytes. `at + 1`
+    /// on an `int *` advances four bytes; adding one byte is a different address, and
+    /// dereferencing it faults on the alignment check rather than reading the wrong
+    /// element — which is a loud failure, and the only reason this was not a wrong
+    /// answer on every dereference with an offset.
+    ///
+    /// The subscript form was already right: `element_address` multiplies the index
+    /// by the element's size. So `at[1]` and `*(at + 1)` named the same element for
+    /// every program anyone had written, and the two spellings drifting apart is
+    /// exactly what a test that only ever uses one of them cannot see.
+    fn pointer_offset(
+        &mut self,
+        op: BinaryOp,
+        left: &Expression,
+        right: &Expression,
+        left_value: ValueId,
+        right_value: ValueId,
+    ) -> Result<Option<ValueId>, LowerError> {
+        if !matches!(op, BinaryOp::Add | BinaryOp::Subtract) {
+            return Ok(None);
+        }
+        let left_type = self.type_of(left);
+        let right_type = self.type_of(right);
+        let left_is_pointer = left_type.as_ref().is_some_and(|ty| ty.is_pointer());
+        let right_is_pointer = right_type.as_ref().is_some_and(|ty| ty.is_pointer());
+        // `pointer - pointer` is a count of elements, which is the one shape that
+        // needs the inverse of the scaling.
+        if left_is_pointer && right_is_pointer {
+            if op != BinaryOp::Subtract {
+                return Ok(None);
+            }
+            let element = element_of(&left_type.unwrap_or(CType::void()));
+            let difference = self.emit(Instruction::Binary {
+                op: IrBinaryOp::Sub,
+                left: left_value,
+                right: right_value,
+                ty: IrType::Int {
+                    bits: 64,
+                    signed: true,
+                },
+            })?;
+            let size = element.map_or(1, |ty| ty.size_in_bytes().unwrap_or(1));
+            if size <= 1 {
+                return Ok(Some(difference));
+            }
+            let stride = self.constant(i64::from(size), &CType::long())?;
+            return Ok(Some(self.emit(Instruction::Binary {
+                op: IrBinaryOp::DivSigned,
+                left: difference,
+                right: stride,
+                ty: IrType::Int {
+                    bits: 64,
+                    signed: true,
+                },
+            })?));
+        }
+        // The other three shapes: `pointer + count`, `count + pointer` and
+        // `pointer - count`.
+        let (pointer, count, signed) = if left_is_pointer {
+            (left_value, right_value, op == BinaryOp::Subtract)
+        } else if right_is_pointer {
+            (right_value, left_value, false)
+        } else {
+            return Ok(None);
+        };
+        let pointee = if left_is_pointer {
+            element_of(&left_type.unwrap_or(CType::void()))
+        } else {
+            element_of(&right_type.unwrap_or(CType::void()))
+        };
+        let size = pointee.map_or(1, |ty| ty.size_in_bytes().unwrap_or(1));
+        if size <= 1 {
+            return Ok(None);
+        }
+        let stride = self.constant(i64::from(size), &CType::ulong())?;
+        let scaled = self.emit(Instruction::Binary {
+            op: IrBinaryOp::Mul,
+            left: count,
+            right: stride,
+            ty: IrType::Int {
+                bits: 64,
+                signed: false,
+            },
+        })?;
+        Ok(Some(self.emit(Instruction::Binary {
+            op: if signed {
+                IrBinaryOp::Sub
+            } else {
+                // `count + pointer` is a sum, whichever order it was written in.
+                IrBinaryOp::Add
+            },
+            left: pointer,
+            right: scaled,
+            ty: IrType::Pointer,
+        })?))
+    }
+
     fn binary(
         &mut self,
         op: BinaryOp,
@@ -1807,6 +2048,9 @@ impl<'a> Emitter<'a> {
             });
         }
         let signed = self.is_signed(left);
+        if let Some(pointer) = self.pointer_offset(op, left, right, left_value, right_value)? {
+            return Ok(pointer);
+        }
         let (ir_op, result_signed) = match op {
             BinaryOp::Add => (IrBinaryOp::Add, true),
             BinaryOp::Subtract => (IrBinaryOp::Sub, true),
@@ -2237,6 +2481,81 @@ fn record_of(ty: &CType) -> RecordType {
             complete: false,
         },
     }
+}
+
+/// Collects a `switch` body's arms in source order, recursively.
+///
+/// A label whose statement is *another* label is C's "these two values share a body":
+/// the parser makes the outer label's statement the inner one, so the inner label
+/// becomes an arm of its own and the arm above it is left empty. That empty arm *is*
+/// fall-through, which is why an arm is allowed to have no statements at all.
+///
+/// The walk recurses through labels and through blocks rather than making one pass
+/// over a flat list, because how a run of labels nests depends on how they were
+/// written. A collector that has to be told the nesting is one that will be wrong for
+/// the next spelling — and a label left nested is not merely missed, it is lowered as
+/// an ordinary statement and runs unconditionally.
+fn collect_switch_arms(
+    items: &[BlockItem],
+    arms: &mut Vec<SwitchArm>,
+    leading: &mut Vec<Statement>,
+) {
+    for item in items {
+        let label = match item {
+            BlockItem::Statement(Statement::Case { value, statement }) => {
+                Some((Some(value.clone()), (**statement).clone()))
+            }
+            BlockItem::Statement(Statement::Default { statement }) => {
+                Some((None, (**statement).clone()))
+            }
+            _ => None,
+        };
+        if let Some((value, statement)) = label {
+            arms.push(SwitchArm {
+                value,
+                body: Vec::new(),
+            });
+            let open = arms.len() - 1;
+            match statement {
+                // Another label straight after this one: the arm stays empty and the
+                // label underneath becomes the arm that carries the shared body.
+                Statement::Case { .. } | Statement::Default { .. } => {
+                    collect_switch_arms(&[BlockItem::Statement(statement)], arms, leading);
+                }
+                // A block under the label belongs to *this* arm, so it is walked with
+                // the arm as the destination rather than with `leading`.
+                Statement::Block(block) => {
+                    let mut inner = Vec::new();
+                    collect_switch_arms(&block.items, arms, &mut inner);
+                    for statement in inner {
+                        arms[open].body.push(statement);
+                    }
+                }
+                other => arms[open].body.push(other),
+            }
+            continue;
+        }
+        let statement = match item {
+            BlockItem::Statement(statement) => statement.clone(),
+            // A declaration is a statement to the lowering, so it is carried into the
+            // arm it was written in rather than dropped.
+            BlockItem::Declaration(var) => Statement::Declaration(var.clone()),
+        };
+        match arms.last_mut() {
+            Some(arm) => arm.body.push(statement),
+            None => leading.push(statement),
+        }
+    }
+}
+
+/// One arm of a `switch`: an optional case value, and the statements under it.
+///
+/// `value` is `None` for a `default` arm, which is why the dispatch chain reads "no
+/// value" as "the arm to land on when nothing else matched" rather than as an arm to
+/// compare against anything.
+struct SwitchArm {
+    value: Option<Expression>,
+    body: Vec<Statement>,
 }
 
 /// A field of a record, by name.
