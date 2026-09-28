@@ -44,8 +44,9 @@ mod source;
 mod startup;
 
 pub use run::{
-    Finished, RunError, STEP_BUDGET, architecture_for, boot, run_image, run_image_on,
-    run_image_with, run_loaded, supervisor_kernel,
+    Finished, Presented, RunError, STEP_BUDGET, SeedEvent, architecture_for, boot, run_image,
+    run_image_on, run_image_seeded, run_image_seeded_on, run_image_with, run_loaded,
+    run_loaded_seeded, supervisor_kernel,
 };
 pub use source::PRELUDE;
 pub use startup::{

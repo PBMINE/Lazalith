@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–96 complete and verified)
+Last updated: 2026-09-28 (Steps 1–97 complete and verified)
 
 ## Where the roadmap stands
 
@@ -44,9 +44,10 @@ Step  93      complete: optimization
 Step  94      complete: optional LLVM backend
 Step  95      complete: Nix integration
 Step  96      complete: final integration test
+Step  97      complete: final graphics test
 ```
 
-The 1144 workspace tests all pass, including the 4 in
+The 1151 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -1495,6 +1496,74 @@ reason, and a number in a test is a number that fails on a busy machine.
 36 unchanged tests confirm.
 
 1144 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
+
+## Step 97 — the final graphics test
+
+`crates/lazalith-runtime/tests/graphics.rs` runs real Lazen graphical programs through
+a real kernel on a real machine, and `docs/graphics-test.md` records what it found —
+which is more useful than a passing test would have been.
+
+**The defect.** The first version asserted the *pixels*: a program drew a white block
+on a black window and the test read the framebuffer back out of the machine. Every
+frame came back as zeroes. The investigation: the device reported a plausible guest
+address (`0x40dd08` for a 16×8 window); six runs of one program produced six different
+address pairs, so nothing deterministic was involved; and a program made to print its
+own `as_ptr()` and read its own first pixel back reported
+
+```text
+program says its framebuffer is at 0x4250888   device recorded 0x40dd08
+program reads its own first pixel: 255
+```
+
+So the drawing is correct — the program wrote white and read white back through its
+own pointer — and the address the device was *given* is a different address from the
+one the program's array occupies. The recorded address reads back as zeroes even
+though the stack region starts at `USER_STACK_START = 0x0040_0000` and translation is
+identity, so it is the right page. Established: the device is handed an address that is
+not where the framebuffer lives, and it varies between runs of an identical program.
+Not established, and not guessed: which of the two is wrong — the compiler handing the
+SDK a view onto a frame slot, or the SDK passing a different `as_mut_slice()` result
+to `display_open` than the program uses. Both fit the evidence, and separating them
+needs a lower-level test than this step had budget for.
+
+**What the API does about it.** `Finished::presented` reports `pixels: Option<Vec<u8>>`,
+and the `None` is deliberate: a host-side read that fails is reported as "there was a
+frame and I could not read it" rather than as a page of zeroes. Those are different
+facts, and in this build they are genuinely different, because a frame of zeroes is
+exactly what a program which drew nothing produces — so returning zeroes for a read
+that never happened would make the failure invisible to the test written to catch it.
+
+**What the seven tests do assert**, each a claim the program can be held to: the
+repository's own `examples/window/main.lz` boots, opens a 48×32 window, presents at
+least two frames and exits zero; three programs with three geometries each get their
+own numbers back from the device; a program clears, fills, then reads its own canvas
+and finds white; a program with no keys never moves its block; three `d` keys over
+three passes make the program print `12`; three `x` keys — which it ignores — make it
+print `0`; and a program that never opens a window presents nothing, so the positive
+cases are not vacuous. The two input tests are the step's real claim and are built so
+neither can pass for the wrong reason: "responds to input" is checked by the program's
+*own output*, a number it computed from the keys it read, not by "the frame changed",
+which the example's block would satisfy by moving on its own; and the matching negative
+shows a device that fed the program any event at all would not be enough.
+
+**The SDL3 boundary, stated precisely.** SDL3 is not linked, and not because it was
+inconvenient: it needs a display server, and every machine this project's tests run on
+is headless, so a test needing one would fail everywhere the suite actually runs. This
+file pins the *contract* instead — a presented frame is four bytes per pixel in the
+guest's own memory at an address the device was given, not a copy and not a host
+allocation; the record's geometry is the geometry the program asked for; the present
+count is how many times the frame was shown. A frontend bug and a program bug show up
+in different places, and the tests assert the side this project owns. What is not
+covered is a window appearing on a display, and the document says so rather than
+implying otherwise.
+
+The one-line summary: the drawing path, the display syscall path, the input path, and
+the response to input are all demonstrated end to end from real Lazen source, and the
+address the display device records does not match the address the program's framebuffer
+lives at — recorded as an open defect with a reproduction rather than worked around in a
+test.
+
+1151 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
 
 ## Earlier milestones

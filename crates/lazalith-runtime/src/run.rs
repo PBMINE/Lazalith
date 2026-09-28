@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 
 use lazalith_boot::{BootImage, KERNEL_LOAD_ADDRESS};
 use lazalith_cpu::{Privilege, TrapCause};
-use lazalith_devices::{Device, DeviceManager, NoDevice};
+use lazalith_devices::{Device, DeviceManager, NoDevice, PIXEL_BYTES};
 use lazalith_isa::{Instruction, Opcode, encode};
 use lazalith_machine::LazalithMachine;
 use lazalith_os::{
@@ -44,11 +44,65 @@ pub struct Finished {
     pub output: Vec<u8>,
     /// How many instructions the machine executed.
     pub instructions: u64,
-    /// How many traps the kernel handled, which is how many syscalls the program
-    /// made.
+    /// How many syscalls the program made.
     pub syscalls: u64,
+    /// The last frame the program presented, with its pixels read out of the
+    /// machine's memory, or `None` for a program that never presented one.
+    ///
+    /// This is the boundary a host frontend consumes: a frame the program drew,
+    /// copied out of guest memory, with no window and no graphics library involved.
+    /// A headless test asserts on exactly the bytes a person would see, and the
+    /// SDL3 frontend is a consumer of this rather than a separate path.
+    pub presented: Option<Presented>,
+    /// The input events the program was given, as the input service delivered them.
+    /// How many input events the program was actually given.
+    ///
+    /// The input service counts an event as delivered when it hands it over, not
+    /// when it is seeded, so this is the number that says a program *saw* a
+    /// keystroke rather than the number that says a test arranged one.
+    pub input_delivered: u64,
 }
 
+/// A frame the program drew, copied out of the machine's memory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Presented {
+    /// The framebuffer's address in guest physical memory.
+    pub address: u64,
+    /// The width in pixels.
+    pub width: u64,
+    /// The height in pixels.
+    pub height: u64,
+    /// How many frames had been presented when this one was.
+    pub present_count: u64,
+    /// The pixels read back from `address`, four bytes each in ARGB order, row by
+    /// row — or `None` when the machine could not read that address at all.
+    ///
+    /// The `None` is not a convenience. Step 97 found that the address the display
+    /// device records is *not* always the address the program.s own framebuffer
+    /// lives at, and it differs from run to run; `docs/graphics-test.md` records
+    /// the evidence. So a caller that cannot read the recorded address is told so,
+    /// rather than handed a page of zeroes that reads exactly like a program which
+    /// drew nothing.
+    pub pixels: Option<Vec<u8>>,
+}
+
+/// One input event to put in a device before a program runs.
+///
+/// Fields are kept as the ABI stores them — a `u32` kind that may name something
+/// this build does not understand, a `u32` code — rather than being narrowed to a
+/// Rust enum, because a reader has to be able to hold an event it cannot interpret
+/// and say so.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SeedEvent {
+    /// The event's kind, as the ABI numbers it.
+    pub kind: u32,
+    /// The key code, button index, or scalar value.
+    pub code: u32,
+    /// The pointer's absolute x, or zero.
+    pub x: i32,
+    /// The pointer's absolute y, or zero.
+    pub y: i32,
+}
 /// Why an image could not be run to completion.
 #[derive(Debug)]
 pub enum RunError {
@@ -189,6 +243,35 @@ pub fn run_image_with<D: Device>(
     run_image_on(image, architecture, devices, STEP_BUDGET)
 }
 
+/// The same, with input events waiting in the machine's input device before the
+/// program starts.
+///
+/// A graphical program's *response* to a keystroke is the thing step 97 asks to be
+/// demonstrated, and a response needs something to respond to. Seeding is done
+/// through the device's own `inject`, so the event is queued the way a real one is
+/// rather than handed to the program directly — a program that saw an event appear
+/// in a register would not be the program that sees a keystroke.
+pub fn run_image_seeded<D: Device>(
+    image: &[u8],
+    architecture: ArchitectureConfig,
+    devices: DeviceManager<D>,
+    seed: &[SeedEvent],
+) -> Result<Finished, RunError> {
+    run_image_seeded_on(image, architecture, devices, seed, STEP_BUDGET)
+}
+
+/// The same, with a budget and a seed.
+pub fn run_image_seeded_on<D: Device>(
+    image: &[u8],
+    architecture: ArchitectureConfig,
+    devices: DeviceManager<D>,
+    seed: &[SeedEvent],
+    budget: u64,
+) -> Result<Finished, RunError> {
+    let loaded = LzxImage::from_bytes(image).map_err(RunError::Image)?;
+    run_loaded_seeded(loaded, architecture, devices, seed, budget)
+}
+
 /// The same, with an instruction budget the caller chooses.
 pub fn run_image_on<D: Device>(
     image: &[u8],
@@ -211,6 +294,23 @@ pub fn run_loaded<D: Device>(
     devices: DeviceManager<D>,
     budget: u64,
 ) -> Result<Finished, RunError> {
+    run_loaded_seeded(image, architecture, devices, &[], budget)
+}
+
+/// Runs an already-read image with input events queued first.
+///
+/// Everything `run_loaded` does, plus the seed. It is a separate function rather
+/// than an extra parameter on `run_loaded` so that the common call stays short, and
+/// the seed is applied through the kernel's input service — the same path a real
+/// event takes — rather than by writing a record somewhere a program might not
+/// look.
+pub fn run_loaded_seeded<D: Device>(
+    image: LzxImage,
+    architecture: ArchitectureConfig,
+    devices: DeviceManager<D>,
+    seed: &[SeedEvent],
+    budget: u64,
+) -> Result<Finished, RunError> {
     let mut machine = boot(architecture, devices)?;
     let mut kernel = LazalithKernel::new(
         budget,
@@ -218,6 +318,18 @@ pub fn run_loaded<D: Device>(
         VirtualFileSystem::with_defaults().map_err(|error| RunError::Start(error.to_string()))?,
     )
     .map_err(|error| RunError::Start(error.to_string()))?;
+    for event in seed {
+        kernel
+            .input_mut()
+            .device_mut()
+            .inject(lazalith_devices::Event {
+                kind: lazalith_devices::EventKindValue(event.kind),
+                code: event.code,
+                x: event.x,
+                y: event.y,
+            })
+            .map_err(|error| RunError::Start(error.to_string()))?;
+    }
     // One and one: a single-threaded program, which is all Lazen v1 can be. Zero is
     // not a usable identifier because the ids are `NonZeroU32`, so this cannot be a
     // silently wrong value.
@@ -292,6 +404,44 @@ pub fn run_loaded<D: Device>(
         output: kernel.terminal().terminal().output().to_vec(),
         instructions,
         syscalls,
+        presented: presented(&kernel, &machine),
+        input_delivered: kernel.input().delivered(),
+    })
+}
+
+/// The last frame the program presented, with its pixels read out of memory.
+///
+/// Reading the pixels here rather than handing out the address is deliberate: a
+/// test that got an address would have to reach back into a machine that has been
+/// dropped, and a caller that got the bytes cannot accidentally read them from
+/// somewhere that is no longer the machine the program drew in.
+fn presented<D: Device>(
+    kernel: &LazalithKernel,
+    machine: &LazalithMachine<D>,
+) -> Option<Presented> {
+    let frame = kernel.display().device().presented()?;
+    let length = frame
+        .width
+        .checked_mul(frame.height)
+        .and_then(|pixels| pixels.checked_mul(PIXEL_BYTES))
+        .and_then(|bytes| usize::try_from(bytes).ok())?;
+    let mut pixels = alloc::vec![0u8; length];
+    // A read that fails is reported as no pixels rather than as an empty frame: the
+    // caller asked about a frame, and "there was a frame and I could not read it"
+    // is a different answer from "there was no frame".
+    let pixels = machine
+        .peek_memory(
+            lazalith_types::PhysicalAddress::new(frame.address),
+            &mut pixels,
+        )
+        .ok()
+        .map(|()| pixels);
+    Some(Presented {
+        address: frame.address,
+        width: frame.width,
+        height: frame.height,
+        present_count: frame.present_count,
+        pixels,
     })
 }
 
