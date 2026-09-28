@@ -10,7 +10,7 @@ mod trap;
 
 pub use fault::{CpuFault, CpuFaultCause, FaultOrigin};
 pub use interpreter::ReferenceInterpreter;
-pub use memory::{CpuMemory, DataAccess, DataAccessError, DataAccessKind};
+pub use memory::{CpuMemory, DataAccess, DataAccessError, DataAccessKind, FetchedInstruction};
 mod registers;
 
 pub use outcome::{

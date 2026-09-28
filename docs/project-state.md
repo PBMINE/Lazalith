@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–92 complete and verified)
+Last updated: 2026-09-28 (Steps 1–93 complete and verified)
 
 ## Where the roadmap stands
 
@@ -40,9 +40,10 @@ Step  89      complete: Lazen package management
 Step  90      complete: lazen fmt
 Step  91      complete: expand LazOS
 Step  92      complete: expand Lazen
+Step  93      complete: optimization
 ```
 
-The 1119 workspace tests all pass, including the 4 in
+The 1132 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -1202,6 +1203,88 @@ old `P0102` stays defined and unused: it is a published code, and reusing it for
 something else would be worse than leaving it dead.
 
 1119 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
+
+## Step 93 — optimization
+
+`docs/optimization.md` is the step. The roadmap lists four possibilities — optimized
+interpreter, faster memory paths, instruction caching, JIT — and one rule: *every
+optimized implementation must preserve reference behavior*. The rule is the step.
+The four items are not four features, they are four answers to "where does the time
+go", and answering that honestly is most of the work.
+
+**Measured first.** `crates/lazalith-memory/examples/decode_speed.rs` runs the same
+straight-line program on a bus that caches decoded instructions and on one that does
+not, and reports instructions per second. Two decisions worth naming: no threshold is
+asserted (a timing assertion fails on a busy machine and teaches a team to ignore
+the test that matters), and no benchmarking framework is used (the project takes no
+third-party Rust dependencies, and a dependency is worse than a number printed by a
+program anyone can read). The result: **1.67x on lz32, 2.00x on lz64.** So decoding
+was about a third of the time — enough to be worth a cache, not so much that a cache
+substitutes for a better interpreter.
+
+**The cache, and the rule it is built around.** A cache may skip work, never a
+check. So the checks are not in the cache: `Bus::checked_fetch` does every check an
+instruction fetch owes, and the table is consulted only after they all pass. One
+copy of those checks, called by both paths, so they cannot drift apart. Two tests
+hold it up — one plants an entry at an *unaligned* program counter on purpose, since
+a test that only warms valid addresses proves nothing, and requires the fetch to
+fault; the other asks a 64-bit bus about a 32-bit fetch and requires the
+configuration fault. Move the lookup above the checks and both fail.
+
+**A bug the first version had.** `invalidate_range` originally scanned all 512 slots
+on every write. Correct, and a tax on exactly the programs a cache should help: 512
+comparisons to invalidate one instruction, per store, in a loop that stores. It now
+walks the addresses the store could have touched — `length / 8 + 2` steps, two for a
+byte store — which is exact rather than approximate. The tests check it by result,
+not by cost: a byte store inside the second of four cached instructions forgets
+exactly one and leaves three, and an eight-byte store starting four bytes into an
+instruction forgets two. A walk that visited the wrong addresses would either leave
+a stale instruction or clear a neighbour it had no business clearing.
+
+The overlap rule is about *ranges*, not addresses, so a store beginning in the middle
+of an instruction invalidates it — the case an equality test gets wrong, and the one
+a self-modifying program actually hits. `writing_an_instruction_makes_the_cached_copy_
+be_ignored` runs a program, lets the cache fill, overwrites a decoded instruction with
+a *different* one, and requires the new thing to happen.
+
+**Turning the optimization off.** `Bus::reference` is a bus with no cache — what the
+interpreter did before this step. It exists so the step's rule can be tested rather
+than asserted: one program on both buses, comparing the program counter and all
+eight registers after every instruction. A timing comparison cannot catch an
+optimization that changed behaviour; this can, because it compares everything a
+machine can be observed doing. It is also the pattern a future optimization should
+follow.
+
+**Faster memory paths: not done, and what blocked them.** `step` validated the fetch
+twice — `step` called `validate_fetch`, then handed the bytes to `step_bytes`, which
+called it again. Fixed, and a real win, but small. The architectural state is cloned
+per instruction, and that is almost certainly the largest cost left; it is also where
+a change is *observable*, because a program can fault and what the faulting
+instruction already wrote must not survive. The commit discipline is what makes a
+fault transactional and it is load-bearing for the trap behaviour in `docs/isa.md`. So
+the next entry in that direction is a register write barrier with a rollback journal,
+not a clone removal — a design with a real correctness argument, in its own step
+where the argument can be read.
+
+**JIT: no, and not because it is too big.** Because it would be optimizing the wrong
+thing, three times. The target is not the bottleneck yet: the interpreter spends its
+time in validation, cloning, and memory bookkeeping, and a JIT over an IR that does
+not carry the information to skip them produces unoptimized machine code. The ISA is
+the platform: a JIT needs a register allocator, a calling convention, and legal
+encodings, and step 94 is already showing what that costs — a second implementation
+of the semantics, trusted to agree. And there is no compilation story for the guest:
+a JIT would make guest execution time depend on how much host CPU it got, which makes
+an emulator non-deterministic, undoing the determinism steps 86 and 87 built so a
+failure can be reproduced from a log.
+
+Also untouched, deliberately: `AddressSpace` has no cache (only the bus caches, since
+the bus is what a machine runs on); `step_bytes` neither consults nor fills the cache,
+because it takes bytes from somewhere other than memory and a cache answering from a
+stale table when handed deliberate bytes would defeat the differential fuzzer; and no
+compiler change at all, so the compiler's output is the same object files as before —
+the testable form of "the cache does not change what runs".
+
+1132 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
 
 ## Earlier milestones

@@ -120,4 +120,50 @@ pub trait CpuMemory {
     fn read_data(&mut self, access: DataAccess) -> Result<u64, Self::Error>;
     fn write_data(&mut self, access: DataAccess, value: u64) -> Result<(), Self::Error>;
     fn peek_stack(&self, access: DataAccess) -> Result<u64, Self::Error>;
+
+    /// Fetches the instruction at `pc`, from a cache when the memory has one.
+    ///
+    /// The default implementation *is* the reference behaviour: it fetches the
+    /// bytes and hands them back undecoded, so a memory with no cache behaves
+    /// exactly as it did before this method existed. An implementation that adds
+    /// a decode cache overrides this, and the only thing it may skip is the work
+    /// of turning bytes into an instruction — never a check.
+    ///
+    /// That is why the return type carries the bytes on a miss rather than
+    /// `Option`: on a miss the caller has the bytes already, so a caching memory
+    /// does the fetch checks once and the caller does not do them again. A cache
+    /// that skipped the fetch checks would be faster and wrong in a way that only
+    /// shows up after a program does something the fast path did not expect.
+    fn fetch_instruction_cached(
+        &mut self,
+        config: ArchitectureConfig,
+        pc: InstructionAddress,
+        privilege: Privilege,
+    ) -> Result<FetchedInstruction, Self::Error> {
+        self.fetch_instruction(config, pc, privilege)
+            .map(FetchedInstruction::Bytes)
+    }
+
+    /// Remembers a decoded instruction, if this memory caches them.
+    ///
+    /// The default does nothing, which is correct for a memory that does not
+    /// cache: the caller has decoded the instruction and is about to execute it,
+    /// and there is nothing to remember it for.
+    fn cache_instruction(
+        &mut self,
+        _config: ArchitectureConfig,
+        _pc: InstructionAddress,
+        _instruction: lazalith_isa::Instruction,
+    ) {
+    }
+}
+
+/// What a fetch produced: an instruction the memory had already decoded, or the
+/// bytes the caller must decode itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FetchedInstruction {
+    /// Already decoded, by a memory that caches.
+    Decoded(lazalith_isa::Instruction),
+    /// The eight bytes at the address, not yet decoded.
+    Bytes([u8; 8]),
 }

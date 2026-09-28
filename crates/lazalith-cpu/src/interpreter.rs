@@ -1,9 +1,9 @@
 use crate::{
     ArchitecturalState, ControlStateError, ControlTarget, CpuFault, CpuFaultCause as Cause,
     CpuMemory, DataAccess, DataAccessKind, ExecutionOutcome as Outcome, ExecutionState,
-    OutcomeApplication, Privilege, StackEffect, TrapCause, TrapController, TrapRequest,
-    checked_next_pc, checked_return_sp, prepare_outcome, trap::prepare_entry_control, validate_pc,
-    validate_sp,
+    FetchedInstruction, OutcomeApplication, Privilege, StackEffect, TrapCause, TrapController,
+    TrapRequest, checked_next_pc, checked_return_sp, prepare_outcome, trap::prepare_entry_control,
+    validate_pc, validate_sp,
 };
 use lazalith_isa::{ControlRegister, DataSize, Instruction, Opcode, Operand, decode};
 use lazalith_types::{InstructionAddress, VirtualAddress, WordWidth};
@@ -287,14 +287,27 @@ impl ReferenceInterpreter {
         memory: &mut M,
     ) -> Result<OutcomeApplication, CpuFault<M::Error>> {
         self.validate_fetch()?;
-        let bytes = memory
-            .fetch_instruction(
-                self.architectural.config(),
-                self.architectural.pc(),
-                self.architectural.privilege(),
-            )
-            .map_err(|source| CpuFault::at(self.architectural.pc(), None, Cause::Fetch(source)))?;
-        self.step_bytes(&bytes, memory)
+        let config = self.architectural.config();
+        let pc = self.architectural.pc();
+        // A memory with a decode cache hands back an instruction it decoded
+        // earlier, and the only work left is executing it. A memory without one
+        // hands back the bytes, and the cost is exactly what it always was —
+        // which is what makes the cache an optimisation of this function and not
+        // a different function.
+        let instruction = match memory
+            .fetch_instruction_cached(config, pc, self.architectural.privilege())
+            .map_err(|source| CpuFault::at(pc, None, Cause::Fetch(source)))?
+        {
+            FetchedInstruction::Decoded(instruction) => instruction,
+            FetchedInstruction::Bytes(bytes) => {
+                let instruction = decode(config, &bytes).map_err(|source| {
+                    CpuFault::at(pc, bytes.first().copied(), Cause::Decode(source))
+                })?;
+                memory.cache_instruction(config, pc, instruction);
+                instruction
+            }
+        };
+        self.execute_checked(&instruction, memory)
     }
 
     pub fn step_bytes<M: CpuMemory>(
@@ -310,7 +323,21 @@ impl ReferenceInterpreter {
                 Cause::Decode(source),
             )
         })?;
-        self.execute(&instruction, memory)
+        self.execute_checked(&instruction, memory)
+    }
+
+    /// Executes an instruction that has already been validated as fetchable.
+    ///
+    /// `step` and `step_bytes` both validate before they get here, and validating
+    /// twice was not free: the check is a control-register test and an address
+    /// range test, and the second one bought nothing, because the state it checks
+    /// has not changed between them.
+    fn execute_checked<M: CpuMemory>(
+        &mut self,
+        instruction: &Instruction,
+        memory: &mut M,
+    ) -> Result<OutcomeApplication, CpuFault<M::Error>> {
+        self.execute(instruction, memory)
     }
 
     pub fn execute<M: CpuMemory>(

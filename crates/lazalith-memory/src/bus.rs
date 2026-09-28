@@ -1,6 +1,6 @@
 use crate::{
     AccessSize, AccessType, AddressSpace, AddressSpaceSwapError, DataAccess, DataAccessKind,
-    MemoryAddress, MemoryFault, MemoryFaultKind, RegionPermissions,
+    InstructionCache, MemoryAddress, MemoryFault, MemoryFaultKind, RegionPermissions,
 };
 use alloc::vec::Vec;
 use lazalith_devices::{Device, DeviceId, DeviceManager, DeviceOffset, NoDevice};
@@ -19,11 +19,31 @@ pub struct Bus<D: Device = NoDevice> {
     space: AddressSpace,
     devices: DeviceManager<D>,
     mappings: Vec<Mapping>,
+    /// `None` on a reference bus, which decodes every instruction every time.
+    cache: Option<InstructionCache>,
 }
 
 impl Bus<NoDevice> {
     pub const fn new(space: AddressSpace) -> Self {
         Self::with_devices(space, DeviceManager::new())
+    }
+
+    /// A bus that decodes every instruction every time.
+    ///
+    /// This is the reference path, and it exists so the promise step 93 makes —
+    /// *every optimized implementation must preserve reference behavior* — can be
+    /// checked rather than asserted. A test that runs one program through a
+    /// caching bus and the same program through this one, and compares every
+    /// register, has tested the optimization against the thing it is optimizing.
+    /// A time comparison alone would not: a program that got faster and wrong
+    /// passes it.
+    pub const fn reference(space: AddressSpace) -> Self {
+        Self {
+            space,
+            devices: DeviceManager::new(),
+            mappings: Vec::new(),
+            cache: None,
+        }
     }
 }
 
@@ -33,7 +53,28 @@ impl<D: Device> Bus<D> {
             space,
             devices,
             mappings: Vec::new(),
+            cache: Some(InstructionCache::new()),
         }
+    }
+
+    /// A device bus that decodes every instruction every time.
+    pub const fn reference_with_devices(space: AddressSpace, devices: DeviceManager<D>) -> Self {
+        Self {
+            space,
+            devices,
+            mappings: Vec::new(),
+            cache: None,
+        }
+    }
+
+    /// Whether this bus caches decoded instructions.
+    pub const fn caches_instructions(&self) -> bool {
+        self.cache.is_some()
+    }
+
+    /// The decode cache, for a test that wants to know whether it is being used.
+    pub const fn instruction_cache(&self) -> Option<&InstructionCache> {
+        self.cache.as_ref()
     }
 
     pub const fn address_space(&self) -> &AddressSpace {
@@ -283,6 +324,17 @@ impl<D: Device> Bus<D> {
                 .write(id, offset, access.size(), value)
                 .map_err(|e| Self::data_fault(access, MemoryFaultKind::Device(e)));
         }
+        // Forget any instruction the bytes being written are part of, *before*
+        // they are written. Doing it first means a store that faults leaves the
+        // cache merely colder rather than holding an instruction that disagrees
+        // with memory: forgetting too much costs one decode, and a stale entry
+        // costs correctness.
+        if let Some(cache) = self.cache.as_mut() {
+            cache.invalidate_range(
+                PhysicalAddress::new(access.address().as_u64()),
+                access.size().bytes() as u64,
+            );
+        }
         self.space.write_data(access, value)
     }
 
@@ -291,7 +343,45 @@ impl<D: Device> Bus<D> {
         self.space.peek_stack(access)
     }
 
+    /// The bytes of the instruction at `pc`, after every fetch check.
+    ///
+    /// This is the reference path and it is unchanged by the cache: it reads
+    /// memory and returns eight bytes. [`Bus::fetch_instruction_cached`] asks the
+    /// same question and is allowed to answer it from the cache.
     pub fn fetch_instruction(
+        &self,
+        config: lazalith_types::ArchitectureConfig,
+        pc: InstructionAddress,
+        privilege: crate::Privilege,
+    ) -> Result<[u8; 8], MemoryFault> {
+        self.checked_fetch(config, pc, privilege)
+    }
+
+    /// The instruction at `pc`, from the cache when it is there.
+    ///
+    /// Every check is done first, in [`Bus::checked_fetch`], and the cache is
+    /// consulted only after they have passed. That is the whole of the fast
+    /// path's safety argument, and it is why the cache cannot make a program that
+    /// should have faulted succeed.
+    pub fn fetch_instruction_cached(
+        &mut self,
+        config: lazalith_types::ArchitectureConfig,
+        pc: InstructionAddress,
+        privilege: crate::Privilege,
+    ) -> Result<lazalith_cpu::FetchedInstruction, MemoryFault> {
+        let bytes = self.checked_fetch(config, pc, privilege)?;
+        let physical = PhysicalAddress::new(pc.as_u64());
+        if let Some(instruction) = self.cache.as_ref().and_then(|cache| cache.lookup(physical)) {
+            return Ok(lazalith_cpu::FetchedInstruction::Decoded(instruction));
+        }
+        Ok(lazalith_cpu::FetchedInstruction::Bytes(bytes))
+    }
+
+    /// Every check an instruction fetch owes, and then the bytes.
+    ///
+    /// One function so that the cached and uncached paths cannot disagree about
+    /// what a check is: there is one copy, and both paths call it.
+    fn checked_fetch(
         &self,
         config: lazalith_types::ArchitectureConfig,
         pc: InstructionAddress,
@@ -334,6 +424,24 @@ impl<D: Device> lazalith_cpu::CpuMemory for Bus<D> {
         privilege: crate::Privilege,
     ) -> Result<[u8; 8], Self::Error> {
         Bus::fetch_instruction(self, config, pc, privilege)
+    }
+    fn fetch_instruction_cached(
+        &mut self,
+        config: lazalith_types::ArchitectureConfig,
+        pc: InstructionAddress,
+        privilege: crate::Privilege,
+    ) -> Result<lazalith_cpu::FetchedInstruction, Self::Error> {
+        Bus::fetch_instruction_cached(self, config, pc, privilege)
+    }
+    fn cache_instruction(
+        &mut self,
+        _config: lazalith_types::ArchitectureConfig,
+        pc: InstructionAddress,
+        instruction: lazalith_isa::Instruction,
+    ) {
+        if let Some(cache) = self.cache.as_mut() {
+            cache.insert(PhysicalAddress::new(pc.as_u64()), instruction);
+        }
     }
     fn read_data(&mut self, access: DataAccess) -> Result<u64, Self::Error> {
         Bus::read_data(self, access)
