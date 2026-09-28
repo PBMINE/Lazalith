@@ -45,6 +45,7 @@ use std::process::ExitCode;
 mod build;
 mod check;
 mod deps;
+mod format_cmd;
 mod new;
 mod pack;
 mod run;
@@ -198,6 +199,7 @@ fn dispatch(arguments: &[OsString]) -> Result<Outcome, CliError> {
         "test" => run::tests(rest),
         "pack" => pack::run(rest),
         "deps" => deps::run(rest),
+        "fmt" => format_cmd::run(rest),
         "help" | "--help" | "-h" => {
             print!("{}", usage_text());
             Ok(Outcome::Done)
@@ -229,6 +231,8 @@ COMMANDS
     test [file]      run a project's tests and report pass or fail
     pack [out]       write a .lza from a manifest and a built image
     deps             resolve a manifest's dependencies against local directories
+    fmt [--check] [file]
+                     format a file in the canonical style, or report that it is not
 
     help             print this message
     --version        print the version
@@ -238,13 +242,14 @@ EXIT CODES
     1  the program refused, or `run` reported a non-zero status
     2  the command line could not be acted on
 
-`lazen fmt` is not implemented: the formatter is a later milestone, and a command
-that silently did nothing would be worse than an absent one.
-
 `pack` takes `--manifest FILE` and `--image FILE`, and writes `NAME.lza` next to
 the manifest by default. `deps` takes `--manifest FILE` and `--path DIR`, and looks
 in the manifest's directory and `./packages` by default. There is no registry: a
 dependency is a directory on disk, and `docs/lazen-packages.md` is the design.
+
+`fmt` rewrites the file it is given; `fmt --check` changes nothing and exits 1 if a
+file would change, which is the form a script wants. The style is in
+`docs/lazen-formatting.md`, and the formatter only ever moves whitespace.
 ",
         version = env!("CARGO_PKG_VERSION"),
     )

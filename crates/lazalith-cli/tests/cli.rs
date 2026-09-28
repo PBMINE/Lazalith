@@ -507,35 +507,24 @@ fn help_and_version_report_the_tool() {
     let help = project.lazen(&["help"]);
     help.succeeded();
     assert!(help.stdout.contains("lazen"), "{}", help.stdout);
-    // The help must be honest about `fmt` being absent, or a user will try it.
-    assert!(
-        help.stdout.contains("fmt") && help.stdout.contains("not implemented"),
-        "the help says `fmt` is not implemented: {}",
-        help.stdout
-    );
+    // Every command the tool has is named, and every one it says is a milestone it
+    // has not reached is named too, or a user will try it. `fmt` arrived in step 90,
+    // so the honest list now includes it.
+    for command in [
+        "new", "check", "build", "run", "test", "pack", "deps", "fmt",
+    ] {
+        assert!(
+            help.stdout.contains(command),
+            "the help does not name `{command}`: {}",
+            help.stdout
+        );
+    }
     let version = project.lazen(&["--version"]);
     version.succeeded();
     assert!(
         version.stdout.contains(env!("CARGO_PKG_VERSION")),
         "the version is the crate's: {}",
         version.stdout
-    );
-}
-
-/// `lazen fmt` is absent on purpose, and says so rather than doing nothing.
-#[test]
-fn fmt_is_refused_with_a_reason() {
-    let project = Project::new("fmt");
-    project.write("main.lz", HELLO);
-    let before = project.read("main.lz");
-    let run = project.lazen(&["fmt"]);
-    // Refused, not accepted: a `fmt` that exited 0 having changed nothing would
-    // tell a user their file was formatted when it was not.
-    assert_ne!(run.code, 0, "`lazen fmt` is not implemented");
-    assert_eq!(
-        project.read("main.lz"),
-        before,
-        "and it did not touch the file"
     );
 }
 
@@ -702,4 +691,113 @@ fn help_names_the_packaging_commands() {
     assert!(run.stdout.contains("pack"), "{}", run.stdout);
     assert!(run.stdout.contains("deps"), "{}", run.stdout);
     assert!(run.stdout.contains(".lza"), "{}", run.stdout);
+}
+
+// -- formatting, end to end -----------------------------------------------
+
+/// `fmt` rewrites a file, and the result still compiles and runs.
+///
+/// The end-to-end promise: formatting is only safe if the program it produced is the
+/// program that was written. A formatter that changed a token would be a compiler,
+/// and this repository has one — so the test is that the program still runs.
+#[test]
+fn fmt_rewrites_a_file_that_still_runs() {
+    let project = Project::new("fmt-runs");
+    project.write("main.lz", HELLO);
+    let run = project.lazen(&["run", "main.lz"]);
+    run.succeeded();
+    assert!(run.stdout.contains("hi"), "before: {}", run.stdout);
+
+    project.lazen(&["fmt", "main.lz"]).succeeded();
+    let run = project.lazen(&["run", "main.lz"]);
+    run.succeeded();
+    assert!(
+        run.stdout.contains("hi"),
+        "after formatting: {}",
+        run.stdout
+    );
+}
+
+/// `fmt --check` reports without writing, which is the form a script wants.
+#[test]
+fn fmt_check_reports_and_writes_nothing() {
+    let project = Project::new("fmt-check");
+    let messy = "fn main()->i32{\nlet x: i32 =1;\nreturn 0;\n}\n";
+    project.write("main.lz", messy);
+    let run = project.lazen(&["fmt", "--check", "main.lz"]);
+    run.refused();
+    assert!(run.stdout.contains("not formatted"), "{}", run.stdout);
+    // It said which lines, because "not formatted" without a reason is a chore.
+    assert!(run.stdout.contains("line 1"), "{}", run.stdout);
+    assert_eq!(
+        project.read("main.lz"),
+        messy,
+        "--check changed the file it was checking"
+    );
+
+    // After formatting, the same check passes.
+    project.lazen(&["fmt", "main.lz"]).succeeded();
+    let run = project.lazen(&["fmt", "--check", "main.lz"]);
+    run.succeeded();
+    assert!(run.stdout.contains("is formatted"), "{}", run.stdout);
+}
+
+/// Formatting is idempotent, so running it twice in a row changes nothing.
+#[test]
+fn fmt_is_idempotent() {
+    let project = Project::new("fmt-idempotent");
+    project.write(
+        "main.lz",
+        "fn main()->i32{let a: i32 =1;let b: i32 =2;return a+b;}\n",
+    );
+    project.lazen(&["fmt", "main.lz"]).succeeded();
+    let once = project.read("main.lz");
+    project.lazen(&["fmt", "main.lz"]).succeeded();
+    assert_eq!(
+        once,
+        project.read("main.lz"),
+        "a second fmt changed the file"
+    );
+    project.lazen(&["fmt", "--check", "main.lz"]).succeeded();
+}
+
+/// A file that does not lex is refused with a reason rather than mangled.
+#[test]
+fn fmt_refuses_a_file_it_cannot_read() {
+    let project = Project::new("fmt-broken");
+    project.write("main.lz", "fn main() -> i32 { let x = \"unterminated; }\n");
+    let run = project.lazen(&["fmt", "main.lz"]);
+    run.refused();
+    assert!(run.output().contains("did not lex"), "{}", run.output());
+    assert_eq!(
+        project.read("main.lz"),
+        "fn main() -> i32 { let x = \"unterminated; }\n",
+        "a refused file was rewritten"
+    );
+}
+
+/// The repository's own example programs are already in the style.
+#[test]
+fn the_example_programs_are_already_formatted() {
+    let project = Project::new("fmt-examples");
+    for example in ["hello", "window"] {
+        let source = std::fs::read_to_string(format!(
+            "{}/../../examples/{example}/main.lz",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("the example is readable");
+        project.write("main.lz", &source);
+        let run = project.lazen(&["fmt", "--check", "main.lz"]);
+        run.succeeded();
+    }
+}
+
+/// The usage text names the command, so `lazen help` is not a lie.
+#[test]
+fn help_names_fmt() {
+    let project = Project::new("help-fmt");
+    let run = project.lazen(&["help"]);
+    run.succeeded();
+    assert!(run.stdout.contains("fmt"), "{}", run.stdout);
+    assert!(run.stdout.contains("--check"), "{}", run.stdout);
 }

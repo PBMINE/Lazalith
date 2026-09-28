@@ -25,6 +25,7 @@ extern crate alloc;
 
 pub mod ast;
 pub mod diagnostic;
+pub mod format;
 pub mod frontend;
 pub mod lexer;
 pub mod lower;
@@ -33,4 +34,5 @@ pub mod resolve;
 pub mod types;
 
 pub use diagnostic::{CompileError, StageError, render};
+pub use format::{FormatError, format, is_formatted};
 pub use frontend::{check_program, compile, parse_file};

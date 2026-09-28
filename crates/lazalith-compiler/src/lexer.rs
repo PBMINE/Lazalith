@@ -395,9 +395,40 @@ impl Token {
 pub struct Lexed {
     /// The tokens, always ending with `Eof` on success.
     pub tokens: Vec<Token>,
+    /// Every `//` comment, in the order they appear.
+    ///
+    /// Comments are trivia, so nothing in the compiler reads this and nothing in the
+    /// compiler needs to. The formatter does, and it cannot find them any other way:
+    /// a formatter that re-derived comments from the source text would be a second
+    /// lexer, and a second lexer is a second thing to get wrong. Recording them here
+    /// costs one vector and means there is exactly one answer to "where are the
+    /// comments".
+    pub comments: Vec<Comment>,
     /// Every diagnostic, sorted by position. The compiler stops at the first
     /// error per file so later stages never see a broken token stream.
     pub diagnostics: Vec<StageError>,
+}
+
+/// A `//` comment, and where it was.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Comment {
+    /// The exact source range it covers, not counting the `//`.
+    pub span: SourceSpan,
+    /// The text after the `//`, with no trailing whitespace and *with* its leading
+    /// whitespace intact.
+    ///
+    /// The trailing end is trimmed because a comment runs to the end of its line and
+    /// the newline is not part of it. The leading end is not, because a space after
+    /// the `//` is content: a comment holding an indented code sample
+    ///
+    /// ```text
+    /// //     lazen run main.lz
+    /// ```
+    ///
+    /// means it, and trimming it would delete the example. The indent *before* the
+    /// `//` is not in this text at all, so a formatter that re-indents the `//`
+    /// cannot disturb what is inside it.
+    pub text: String,
 }
 
 impl Lexed {
@@ -420,6 +451,7 @@ pub fn lex(source: SourceId, sources: &SourceManager) -> Lexed {
     let Some(file) = sources.file(source) else {
         return Lexed {
             tokens: Vec::new(),
+            comments: Vec::new(),
             diagnostics: alloc::vec![FileDiagnostic::new(source, sources, 0, 0).build(
                 "L0001",
                 "the source file is not registered",
@@ -438,6 +470,7 @@ struct Lexer<'a> {
     bytes: &'a [u8],
     position: u32,
     tokens: Vec<Token>,
+    comments: Vec<Comment>,
     diagnostics: Vec<StageError>,
 }
 
@@ -449,6 +482,7 @@ impl<'a> Lexer<'a> {
             text,
             bytes: text.as_bytes(),
             position: 0,
+            comments: Vec::new(),
             tokens: Vec::new(),
             diagnostics: Vec::new(),
         }
@@ -480,6 +514,7 @@ impl<'a> Lexer<'a> {
         }
         Lexed {
             tokens: self.tokens,
+            comments: self.comments,
             diagnostics: self.diagnostics,
         }
     }
@@ -524,12 +559,30 @@ impl<'a> Lexer<'a> {
             match byte {
                 b' ' | b'\t' | b'\n' | b'\r' => self.position += 1,
                 b'/' if self.peek(1) == Some(b'/') => {
+                    let start = self.position + 2;
                     while let Some(next) = self.peek(0) {
                         if next == b'\n' {
                             break;
                         }
                         self.position += 1;
                     }
+                    // The comment's text is recorded rather than discarded, for the
+                    // formatter. A `//` at the very end of the file and a `//`
+                    // followed by `\r\n` both work, because the loop stops at any
+                    // byte that is not a newline and the slice is taken from the
+                    // text rather than from the bytes.
+                    let end = self.position;
+                    let slice = self
+                        .text
+                        .get(
+                            usize::try_from(start).unwrap_or(usize::MAX)
+                                ..usize::try_from(end).unwrap_or(usize::MAX),
+                        )
+                        .unwrap_or("");
+                    self.comments.push(Comment {
+                        span: self.span(start, end),
+                        text: alloc::string::String::from(slice.trim_end()),
+                    });
                 }
                 b'/' if self.peek(1) == Some(b'*') => {
                     // `/* */` is deliberately not in v1, so it gets a code of

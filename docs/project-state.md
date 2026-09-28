@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–89 complete and verified)
+Last updated: 2026-09-28 (Steps 1–90 complete and verified)
 
 ## Where the roadmap stands
 
@@ -37,9 +37,10 @@ Step  86      complete: fuzzing
 Step  87      complete: deterministic replay
 Step  88      complete: application packaging design
 Step  89      complete: Lazen package management
+Step  90      complete: lazen fmt
 ```
 
-The 1057 workspace tests all pass, including the 4 in
+The 1071 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -925,6 +926,76 @@ Three, all in code written for this step and all found by the tests for it:
 harness is exactly the right tool for a new container. 60,000 inputs on it alone and
 30,000 across all eleven are clean. 1057 tests pass, and fmt, Clippy, check,
 `nix flake check` and `nix build` are green.
+
+## Step 90 — the Lazen formatter
+
+`lazen fmt` and one canonical style, in `docs/lazen-formatting.md`. Two things about
+it are the actual content of the step, and one of them is a bug the step found.
+
+**It changes whitespace and nothing else, and that is asserted rather than claimed.**
+The formatted text lexes to the same token stream as the input, with the same
+comments, in the same order. A formatter that changed a token would be a compiler, and
+this repository has one. Working from the token stream is what makes the guarantee
+cheap: literals are tokens, so there is no "did I mean to rewrite this string"
+question to answer once per language construct, forever.
+
+**It is idempotent, and that is what makes it usable.** `fmt(fmt(x)) == fmt(x)` —
+a formatter that is not idempotent fights the next `fmt`, and a repository that says
+"run `lazen fmt`" with no idempotence test is asking people to check `git diff` every
+time for no reason. Every rule is either forced by the tokens or a *preservation* of
+something the author wrote, and a preservation is stable by construction.
+
+### The four things the style preserves, and why
+
+Each is a case where a token stream cannot say what the author meant, and a formatter
+that guessed would be making a claim about the program:
+
+- **`-` is subtraction or negation.** Both are the same token. The formatter reads
+  the source's own spacing — no space before and a space after is binary, a space
+  before and none after is unary — and preserves that, falling back to "binary after
+  something that can end an expression" when the author was not clear. The lexer has
+  keyword tokens of its own, so "after a keyword" is a fact and not a guess. The
+  alternative was a formatter that only worked on a file that already compiles, at
+  exactly the moment a person most wants to format one.
+- **A blank line is grouping.** Deleting every blank line in a file deletes its
+  structure, which is the difference between a formatter and a refactoring. One is
+  kept, runs collapse to one, and one before a comment is kept too.
+- **A call broken across lines stays broken.** There is no width in a token stream, so
+  keeping the author's choice is the only thing possible — and the alternative is a
+  formatter that joins a 40-line call into one unreadable 400-character line.
+- **`struct S {}` and `if a { b(); }` and `) {` stay as written.** An empty body means
+  "nothing here", and a brace on its own line is a claim about the body the author did
+  not make.
+
+### The bug the step found, in the lexer
+
+The formatter could not keep a comment, because **the lexer discarded them** — it
+skipped over `//` and threw the text away. The two obvious fixes are both wrong: scan
+the source for comments in the formatter (a second lexer, and a second thing to get
+wrong), or print from the AST (a parser, and the same problem as the sign). So
+`Lexed` grew a `comments` field. Nothing in the compiler reads it and nothing needs
+to; the cost is one vector, and the benefit is exactly one answer to "where are the
+comments".
+
+The comment's text keeps its leading whitespace, because a space after the `//` is
+content — `//     lazen run main.lz` is an example in a comment, and trimming it
+deletes the example.
+
+### The check that says the most
+
+`examples/window/main.lz` — the largest program in the repository, using nested calls,
+array types with lengths, casts, comparison chains, one-line blocks, multi-line calls
+and comments inside blocks — is a **fixed point of the formatter**. `lazen fmt --check`
+passes on it byte for byte, and so does it on `examples/hello/main.lz`. The
+repository's own code is the style's worked example, and a test asserts it, so the two
+cannot drift apart without something failing.
+
+`fmt` and `fmt --check` are separate because the first rewrites a person's file and a
+script must not do that by accident. A file that does not lex is refused with the
+lexer's reason and is not touched; a file that does not compile but does lex is
+formatted happily.
+
+1071 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
 
 ## Earlier milestones
