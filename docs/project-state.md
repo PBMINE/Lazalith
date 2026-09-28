@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–93 complete and verified)
+Last updated: 2026-09-28 (Steps 1–94 complete and verified)
 
 ## Where the roadmap stands
 
@@ -41,9 +41,10 @@ Step  90      complete: lazen fmt
 Step  91      complete: expand LazOS
 Step  92      complete: expand Lazen
 Step  93      complete: optimization
+Step  94      complete: optional LLVM backend
 ```
 
-The 1132 workspace tests all pass, including the 4 in
+The 1137 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -1285,6 +1286,79 @@ compiler change at all, so the compiler's output is the same object files as bef
 the testable form of "the cache does not change what runs".
 
 1132 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
+
+## Step 94 — the optional LLVM backend
+
+LLVM is optional, so this step adds none. What it adds is the thing that makes
+"optional" mean something structural rather than aspirational, and a test for each of
+the roadmap's two rules.
+
+**The shape was missing its join.** Two frontends already feed one IR — that is the
+diagram's left half and it exists. The right half is a fan-out, one IR into more than
+one backend, and what was missing was any place for a second backend to attach:
+`lazalith-codegen` exported a free function `generate` and nothing else. A second
+backend under that shape would have had to be threaded through the compiler, the C
+compiler, the toolchain, and the command line — which makes it *mandatory* in the only
+sense that matters, because every caller would have to know it exists. So this step
+adds `pub trait Backend`, `NativeBackend`, and `available_backends()`, with `generate`
+now a free function that calls `NativeBackend`, so every existing caller is unchanged
+and the seam is a place a backend can register rather than a layer the codebase has
+learned to route around. `the_seam_is_real_because_the_native_backend_produces_the_
+same_object` compares the two objects byte for byte and the frame records exactly, so
+if someone routes around the trait later, a test fails.
+
+**"LLVM must not become mandatory" is now a test.** It is the rule about the future,
+and a promise about the future is worth exactly as much as the test enforcing it. One
+test walks `Cargo.lock` and fails on any crate whose name starts with `llvm` —
+`llvm-sys` being the obvious first step toward a real backend, and exactly the step
+that would make a forty-megabyte C++ library a build requirement of a platform whose
+entire premise is that it has none. Another walks all 26 manifests and fails on any
+registry dependency, walking them rather than checking a list because a list is the
+thing that goes stale. If either test ever needs removing, the removal *is* the step 94
+review — written into the test so whoever reaches for it reads that sentence first.
+
+**"Native infrastructure remains the foundation"** is held by three checked things:
+`available_backends()` has one entry and it is `native`; the free function every
+caller uses *is* the native path; and the native backend still produces a working
+program with a frame for `main` and a non-empty object. The last matters most — a step
+that added a seam and broke the one working backend would satisfy the first two and
+fail it.
+
+**What "optional" has to mean in a build system.** The temptation is to read optional
+as "there, but nobody uses it", and in a build system that reading is wrong, because
+the cost of an unusable dependency is paid by everyone who builds the project. So there
+is no LLVM code in the tree at all. A real one, if ever built, would be a crate behind
+a feature that is *off by default* — so `nix flake check` and `nix build` never see
+it — with its own entry in `available_backends()` compiled only under that feature.
+
+**The finding, which is the real output of the step.** An LLVM backend cannot just
+hand the IR to LLVM. The IR is a register-machine IR with virtual registers and a
+frame the lowerer computed, so a backend would have to, in order: allocate host
+registers; match a *host* calling convention when the one on record is a *guest* one,
+which is where a JIT is born and why step 93 refused one for the same reason; decide
+what each instruction means on a host whose arithmetic differs, re-implementing
+Lazalith's trapping, alignment, and width behaviour plus checks for everything LLVM
+would do differently; and emit an object the project linker can read — and
+`lazalith-toolchain`'s reader is written for Lazalith's own format. That last point
+is what makes this a project rather than a feature: an LLVM backend that only worked
+for the native target would be a different toolchain, not a backend, and would not run
+on the guest at all.
+
+**Why not built anyway.** It cannot be verified against anything — a second backend is
+a second implementation of the semantics, and the native one is checked by the suite
+and, since step 85, differentially against a bare reference interpreter; a second
+implementation nobody can check is not a faster platform, it is a second thing to be
+wrong. It buys nothing the platform needs: step 93 measured the time going to
+validation, state cloning, and memory bookkeeping, not code quality, and LLVM
+optimizes code generation. And it would be the project's most expensive dependency,
+added for a capability nothing asks for, in a platform whose stated values include a
+zero-dependency toolchain.
+
+A reader who assumed "add LLVM" meant "call LLVM from the codegen" now knows it means
+"decide what Lazalith's arithmetic means on a host whose arithmetic differs, express it
+twice, and prove the two expressions agree."
+
+1137 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
 
 ## Earlier milestones

@@ -376,6 +376,77 @@ impl Program {
 /// own `Lowered` struct, which meant a C program could only be compiled by
 /// importing Lazen's types — a dependency pointing from the backend to one
 /// language, in a project with two.
+/// A thing that turns a lowered program into an object file.
+///
+/// Step 94 of the roadmap asks for the shape where Lazen and C both feed
+/// Lazalith IR and the IR then feeds a native backend, and *optionally* an LLVM one.
+/// That shape needs one thing this stage did not have: a place a second backend can
+/// be registered without the frontends, the IR, or the command line knowing it
+/// exists. This is that place.
+///
+/// Two rules keep the "optionally" honest, and both are enforced by tests in this
+/// crate rather than by this comment:
+///
+/// - **The native backend is the default and the foundation.** [`generate`] is a
+///   free function that calls [`NativeBackend`], so every existing caller is
+///   unchanged and there is exactly one path that must work. A second backend is an
+///   addition to a working system, never a step on the way to one.
+/// - **No backend may be a build requirement.** `native_backends_required` walks the
+///   workspace's manifests and `Cargo.lock` and fails if an LLVM crate appears. The
+///   test is the point: "LLVM must not become mandatory" is a rule that someone
+///   will eventually be tempted to reinterpret, and a test cannot be reinterpreted.
+pub trait Backend {
+    /// The name this backend is selected and reported by, such as `native`.
+    fn name(&self) -> &'static str;
+
+    /// Turns a lowered program into an object.
+    fn generate(
+        &self,
+        module: &Module,
+        frames: &[FrameLayout],
+        entry: &str,
+        options: &CodegenOptions,
+        source_text: &str,
+    ) -> Result<Program, CodegenError>;
+}
+
+/// The backend this project ships: Lazalith machine code, assembled here.
+///
+/// The whole of the native path, and the one every other stage is written against.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeBackend;
+
+impl Backend for NativeBackend {
+    fn name(&self) -> &'static str {
+        "native"
+    }
+
+    fn generate(
+        &self,
+        module: &Module,
+        frames: &[FrameLayout],
+        entry: &str,
+        options: &CodegenOptions,
+        source_text: &str,
+    ) -> Result<Program, CodegenError> {
+        generate(module, frames, entry, options, source_text)
+    }
+}
+
+/// Every backend this build has, in selection order.
+///
+/// One entry, and it is the native one. A second backend would be added here behind
+/// a Cargo feature that is *off* by default, which is what "optional" has to mean in
+/// a build system: not "there but nobody uses it", but "absent unless asked for".
+pub fn available_backends() -> Vec<&'static dyn Backend> {
+    alloc::vec![&NativeBackend]
+}
+
+/// Generates Lazalith object code from a lowered program.
+///
+/// The default path, and unchanged: a caller that has never heard of [`Backend`]
+/// gets the native backend, because making the seam mandatory would be a way of
+/// making the optional backend's absence a special case.
 pub fn generate(
     module: &Module,
     frames: &[FrameLayout],
