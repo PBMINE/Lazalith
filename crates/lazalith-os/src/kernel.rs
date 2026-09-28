@@ -8,6 +8,9 @@ use crate::{
     ValidatedSyscallKind, VirtualFileSystem, VirtualTerminal, build_init_shell_image,
 };
 use core::{error::Error, fmt};
+use lazalith_os_abi::Capabilities;
+
+use crate::ResolveError;
 use lazalith_cpu::TrapCause;
 use lazalith_devices::Device;
 use lazalith_machine::{LazalithMachine, MachineEvent};
@@ -16,6 +19,8 @@ use lazalith_types::ArchitectureConfig;
 
 #[derive(Debug)]
 pub enum KernelError {
+    /// The bytes at a path were neither a package nor an executable.
+    Resolve(ResolveError),
     Image(NativeShellImageError),
     LzxImage(LzxError),
     Process(ProcessError),
@@ -26,6 +31,7 @@ impl fmt::Display for KernelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Image(source) => write!(f, "kernel init image failed: {source}"),
+            Self::Resolve(source) => write!(f, "kernel could not resolve a program: {source}"),
             Self::LzxImage(source) => write!(f, "kernel executable image failed: {source}"),
             Self::Process(source) => write!(f, "kernel process construction failed: {source}"),
             Self::Scheduler(source) => write!(f, "kernel scheduler failed: {source}"),
@@ -37,6 +43,7 @@ impl Error for KernelError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Image(source) => Some(source),
+            Self::Resolve(_) => None,
             Self::LzxImage(source) => Some(source),
             Self::Process(source) => Some(source),
             Self::Scheduler(source) => Some(source),
@@ -208,6 +215,49 @@ impl LazalithKernel {
         self.scheduler
             .add_process(process)
             .map_err(KernelError::Scheduler)
+    }
+
+    /// Starts whatever a path's bytes turned out to be, with the capabilities it
+    /// implies.
+    ///
+    /// The other half of step 89's resolution rule and of this step's permission
+    /// gate, and the reason they are in the same function: a program started from a
+    /// **package** is restricted to what the package declared, and a program started
+    /// from a **bare `.lzx`** is not restricted at all. Deciding that in one place
+    /// means there is no way to start a package and forget to restrict it, or to
+    /// restrict a bare image by accident.
+    ///
+    /// Returns whether the process was restricted, so a caller can report it.
+    pub fn start_resolved(
+        &mut self,
+        resolved: crate::Resolved,
+        process_id: ProcessId,
+        thread_id: ThreadId,
+    ) -> Result<bool, KernelError> {
+        let (image, capabilities) = match resolved {
+            crate::Resolved::Package(package) => {
+                let capabilities = Capabilities::for_start(package.identity.permissions);
+                // The reader already proved the payload is an image — `resolve` only
+                // returns a package whose `LzxImage` parsed — so this cannot fail,
+                // and there is no honest error to write here that is not a lie about
+                // what went wrong.
+                let image = package
+                    .image()
+                    .map_err(|_| KernelError::Resolve(ResolveError::NotExecutable { bytes: 0 }))?;
+                (image, Some(capabilities))
+            }
+            crate::Resolved::Image(image) => (*image, None),
+        };
+        let mut process = image
+            .load_process(process_id, thread_id)
+            .map_err(KernelError::LzxImage)?;
+        if let Some(capabilities) = capabilities {
+            process.restrict_to(capabilities);
+        }
+        self.scheduler
+            .add_process(process)
+            .map_err(KernelError::Scheduler)?;
+        Ok(capabilities.is_some())
     }
 
     pub fn step<D: Device>(

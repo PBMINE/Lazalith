@@ -1,9 +1,15 @@
 #![no_std]
 
+extern crate alloc;
+mod capability;
 mod error;
 mod records;
 mod syscall;
 
+pub use capability::{
+    ALL_CAPABILITIES, Capabilities, PERMISSION_CONSOLE, PERMISSION_FILESYSTEM, PERMISSION_GRAPHICS,
+    PERMISSION_INPUT, PackagePermissions, RefusedCapability, check,
+};
 pub use error::{AbiError, WordValueOutOfRange};
 pub use records::{
     AbiFileKind, DIRECTORY_NAME_CAPACITY, DIRECTORY_RECORD_SIZE, DISPLAY_RECORD_SIZE,

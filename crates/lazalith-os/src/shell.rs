@@ -1,6 +1,6 @@
 use crate::{
     FileNodeKind, FileSystemError, KernelError, LZX_MAX_FILE_SIZE, LazalithKernel, LzxError,
-    LzxImage, ProcessId, ThreadId, VirtualFileSystem,
+    LzxImage, ProcessId, ResolveError, Resolved, ThreadId, VirtualFileSystem, resolve,
 };
 use alloc::{boxed::Box, collections::TryReserveError, string::String, vec::Vec};
 use core::{error::Error, fmt};
@@ -82,6 +82,15 @@ pub enum ShellError {
     FileSystem(FileSystemError),
     Kernel(Box<KernelError>),
     Image(Box<LzxError>),
+    /// The bytes at a path were neither a package nor an executable.
+    ///
+    /// Step 89 built the resolution rule and nothing called it; this is the caller.
+    /// The path is carried in the message because "these bytes are not a program" is
+    /// not something a person can act on and "what I ran is not a program" is.
+    Unresolvable {
+        path: Vec<u8>,
+        source: Box<ResolveError>,
+    },
     NoPendingRun,
     /// A launch is already queued and has not been consumed yet. The queued path is
     /// reported so a host can explain which program must be cleared.
@@ -117,6 +126,11 @@ impl fmt::Display for ShellError {
             Self::Kernel(source) => write!(f, "shell program launch failed: {source}"),
             Self::Image(source) => write!(f, "shell program image is invalid: {source}"),
             Self::NoPendingRun => f.write_str("no program launch is pending"),
+            Self::Unresolvable { path, source } => write!(
+                f,
+                "{} is neither a package nor an executable: {source}",
+                String::from_utf8_lossy(path)
+            ),
             Self::PendingRun { path } => {
                 write!(
                     f,
@@ -138,6 +152,7 @@ impl Error for ShellError {
             Self::Kernel(source) => Some(source),
             Self::Image(source) => Some(source),
             Self::Allocation(source) => Some(source),
+            Self::Unresolvable { .. } => None,
             _ => None,
         }
     }
@@ -218,13 +233,35 @@ impl HeadlessShell {
             .map_err(|source| ShellError::Kernel(Box::new(source)))
     }
 
-    pub fn take_pending_image(&mut self) -> Result<LzxImage, ShellError> {
+    /// The image or package at the pending path, and the capabilities it implies.
+    ///
+    /// Step 89's resolution rule does the deciding, so a path naming a `.lza` runs
+    /// the executable inside it and a path naming a `.lzx` runs it directly, and the
+    /// *name* of neither is consulted. A package also brings its declared
+    /// capabilities, which is what makes the declaration enforceable at all: without
+    /// this, `resolve` would exist and nothing would call it.
+    pub fn take_pending_program(&mut self) -> Result<Resolved, ShellError> {
         let path = self.pending_run.clone().ok_or(ShellError::NoPendingRun)?;
+        let bytes = self.read_whole_file(&path)?;
+        // The latch is released only once the bytes have *resolved*. Releasing it on
+        // the way in would mean a program that failed to resolve could not be
+        // reported as the pending one, and the shell's whole contract is that
+        // `clear` is the only thing that releases it.
+        let resolved = resolve(&bytes).map_err(|source| ShellError::Unresolvable {
+            path: path.clone(),
+            source: Box::new(source),
+        })?;
+        self.pending_run = None;
+        Ok(resolved)
+    }
+
+    /// Reads a whole file, refusing one larger than either reader could want.
+    fn read_whole_file(&mut self, path: &[u8]) -> Result<Vec<u8>, ShellError> {
         let flags = OpenFlags::new(OPEN_READ)
             .map_err(|source| ShellError::FileSystem(FileSystemError::Abi(source)))?;
         let opened = self
             .filesystem
-            .open(&path, flags)
+            .open(path, flags)
             .map_err(ShellError::FileSystem)?;
         let maximum = self
             .filesystem
@@ -255,10 +292,16 @@ impl HeadlessShell {
                 .checked_add(chunk.len() as u64)
                 .ok_or(ShellError::FileSystem(FileSystemError::OffsetOverflow))?;
         }
-        let image =
-            LzxImage::from_bytes(&bytes).map_err(|source| ShellError::Image(Box::new(source)))?;
-        self.pending_run = None;
-        Ok(image)
+        Ok(bytes)
+    }
+
+    pub fn take_pending_image(&mut self) -> Result<LzxImage, ShellError> {
+        self.take_pending_program()?
+            .into_image()
+            .map_err(|source| ShellError::Unresolvable {
+                path: self.pending_run.clone().unwrap_or_default(),
+                source: Box::new(source),
+            })
     }
 
     pub fn execute_run_command(

@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–90 complete and verified)
+Last updated: 2026-09-28 (Steps 1–91 complete and verified)
 
 ## Where the roadmap stands
 
@@ -38,9 +38,10 @@ Step  87      complete: deterministic replay
 Step  88      complete: application packaging design
 Step  89      complete: Lazen package management
 Step  90      complete: lazen fmt
+Step  91      complete: expand LazOS
 ```
 
-The 1071 workspace tests all pass, including the 4 in
+The 1093 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -996,6 +997,99 @@ lexer's reason and is not touched; a file that does not compile but does lex is
 formatted happily.
 
 1071 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
+
+## Step 91 — expand LazOS
+
+`docs/os-expansion.md` has the whole step, and it opens with a table that says how far
+each of the roadmap's eight areas got — because a step that quietly did a tenth of one
+of them and said nothing is worse than one that says so. Summary: the capability gate,
+four filesystem operations, spawn-by-path with the package's capabilities attached, a
+timer device, and the threads that already existed made *queryable*. Networking and
+audio got nothing, and a test asserts the absence so a syscall cannot appear without a
+device behind it.
+
+### The capability gate is the step
+
+`docs/lazen-applications.md` says a manifest's `[permissions]` declares the
+capabilities an application intends to use, and `docs/lazen-packages.md` recorded that
+nothing enforced them. This is the enforcement, and it is worth more than the other
+seven areas together: it is the one that turns a package from a transport into a
+promise.
+
+The rule is an asymmetry, and the asymmetry is the design. **A process started from a
+package may only make the syscalls its package declared; a process started from a bare
+`.lzx` may make all of them.** A package is the untrusted unit — it arrives from
+somewhere and its author wrote down what it needs. A bare executable is the trusted
+unit: it is what `lazen build` produced, what the boot ROM loads, and what a person
+runs on their own machine, and a gate on it would break the kernel, the init shell and
+every test in exchange for protecting a program that already has the whole machine.
+
+So the gate is a property of *how a process was started*, decided in one place
+(`LazalithKernel::start_resolved`), which means there is no way to start a package and
+forget to restrict it.
+
+Three details that took thought:
+
+- **The check is on the syscall, not the device.** `write` is a console call when the
+  handle is a terminal and a file call when it is not, and a program that declared
+  `console = true, filesystem = false` and then wrote to a file is exactly what the
+  declaration should catch.
+- **The refusal is the same whether or not the arguments were valid**, and it happens
+  before the arguments are read — so a process without the capability learns nothing
+  about the ABI by calling `open` with a bad pointer.
+- **A capability this build cannot enforce is not granted**, which is the *opposite* of
+  a package record's unknown bits being held rather than refused. Both are deliberate:
+  a reader that refused a newer package could not install it at all, and a kernel that
+  granted a capability it did not implement would be promising something it does not
+  have.
+
+The gate lives in `lazalith-os-abi::capability` rather than in the kernel, because the
+permission bits are a contract between a program and the system that runs it. The
+package format re-exports the ABI's four constants rather than declaring its own — one
+set of bits, not two that happen to agree.
+
+### The rest
+
+- **`rename` is a re-link, not a copy**, so a handle open on the old name still reads
+  the same bytes. The cycle check asks whether the *moved node* contains the
+  *destination's parent*; the other direction of that question refuses every rename,
+  because the destination's parent is usually an ancestor of the node being moved. That
+  was a real bug the test found on the first run.
+- **`remove` refuses a directory with children**, because removing a directory means "I
+  am done with this" and emptying one is a different act that shares a name.
+- **`truncate` grows with zeros**, because a program that seeks past the end must read
+  zeros and not another file's bytes.
+- **`walk` reports the root as `/`** rather than as the empty path, which is not a path
+  anything can open — also a real bug the test found.
+- **The timer exists because `Time` is a trap.** A program that wants to *measure*
+  something cannot afford a measurement that interrupts it, so the cycle count is a
+  device read by loading from an address. The register is 64 bits on both targets: a
+  counter that wrapped at 2³² on a 32-bit target would be a clock that lied after
+  about seven minutes. Writes are refused rather than ignored, because a program that
+  believed it had reset the clock and had not would measure a span it thought it
+  controlled. And it is in the device snapshot, because a restored program must not read
+  a time that never happened.
+- **Threads were already per-thread state.** A process carried a thread per thread id
+  with its own register file, and the scheduler already moved a machine's state into a
+  *named* thread — so the state is real and was already load-bearing. What is missing is
+  creation: there is no `spawn_thread`, every process still has exactly one, and
+  `assert_eq!(process.thread_count(), 1)` is in the tests so a process that grew a
+  second thread with nothing creating one would fail rather than pass quietly.
+  `Process::thread_state` was added so a caller can ask for a thread's registers and be
+  told `None` rather than handed the first thread's.
+
+### The layering bug this step exposed
+
+The permission bits were being declared in the package format, which sits *above* the
+ABI. The capability gate needs them at the ABI layer, because they are a contract
+between a program and the system that runs it — and `lazalith-os-abi` cannot depend on
+`lazalith-os` without inverting the whole stack. So the four constants moved down to
+`lazalith-os-abi::capability` and the package format re-exports them, which is the same
+"one definition, not two that agree" rule the ISA, ABI, and syscall lists already
+follow. Found by trying to write the gate and finding the dependency pointed the wrong
+way.
+
+1093 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
 
 ## Earlier milestones

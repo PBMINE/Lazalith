@@ -6,6 +6,7 @@ mod console;
 mod display;
 pub mod host_input;
 pub mod input;
+pub mod timer;
 pub use console::ConsoleDevice;
 pub use display::{
     DISPLAY_ABI_VERSION, DisplayDevice, DisplayError, MAX_DIMENSION, PIXEL_BYTES, PresentedFrame,
@@ -28,6 +29,7 @@ pub use input::{
     REGISTER_POLL as INPUT_REGISTER_POLL, REGISTER_STATUS as INPUT_REGISTER_STATUS,
     STATUS_INJECTED,
 };
+pub use timer::{REGISTER_CYCLES as TIMER_REGISTER_CYCLES, TIMER_REGISTER_BYTES, TimerDevice};
 
 use alloc::{collections::TryReserveError, vec::Vec};
 use core::{error::Error, fmt};

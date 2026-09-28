@@ -288,44 +288,15 @@ impl LzaResource {
     }
 }
 
-/// The four capabilities an application may declare, from step 56.
-///
-/// A `u8` rather than a struct of four booleans, so a reader can hold a declaration
-/// bit this build does not know rather than refusing it — the same rule the input
-/// device's records follow, and the same reason: a program built by a newer compiler
-/// must still be installable.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct PackagePermissions {
-    /// The bits, as declared.
-    pub bits: u8,
-}
-
-/// The `console` bit.
-pub const PERMISSION_CONSOLE: u8 = 1;
-/// The `filesystem` bit.
-pub const PERMISSION_FILESYSTEM: u8 = 2;
-/// The `graphics` bit.
-pub const PERMISSION_GRAPHICS: u8 = 4;
-/// The `input` bit.
-pub const PERMISSION_INPUT: u8 = 8;
-
-impl PackagePermissions {
-    /// Permissions with every bit clear.
-    pub const fn none() -> Self {
-        Self { bits: 0 }
-    }
-
-    /// Whether a capability is declared.
-    pub const fn has(self, capability: u8) -> bool {
-        self.bits & capability != 0
-    }
-
-    /// Declares a capability.
-    pub const fn with(mut self, capability: u8) -> Self {
-        self.bits |= capability;
-        self
-    }
-}
+/// The four capabilities an application may declare are the ABI.s, not the package
+/// format.s, because they are a contract between a program and the system that runs it.
+/// `PackagePermissions` is re-exported here so a package and a syscall talk about the
+/// same four bits rather than two sets that happen to agree -- which is exactly the
+/// duplication step 99 says must not exist.
+pub use lazalith_os_abi::{
+    PERMISSION_CONSOLE, PERMISSION_FILESYSTEM, PERMISSION_GRAPHICS, PERMISSION_INPUT,
+    PackagePermissions,
+};
 
 /// What a package is, once its identity has been read.
 #[derive(Clone, Debug, Eq, PartialEq)]

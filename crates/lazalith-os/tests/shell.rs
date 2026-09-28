@@ -88,9 +88,12 @@ fn shell_rejects_invalid_commands_without_transcript_mutation() {
             ..
         })
     ));
+    // Ten stub bytes are not an image any more than they are a package, and saying
+    // so is more useful than "the image is invalid": step 89's resolution rule decides
+    // by content, so the caller is told *which* reader refused it.
     assert!(matches!(
-        shell.take_pending_image(),
-        Err(ShellError::Image(_))
+        shell.take_pending_program(),
+        Err(ShellError::Unresolvable { .. })
     ));
     assert!(matches!(
         shell.execute_line(b"run /init.lzx"),
@@ -146,8 +149,8 @@ fn a_queued_launch_reports_its_path_from_the_run_command_entry_point() {
         .execute_run_command(b"run /init.lzx", &mut kernel, process, thread)
         .unwrap_err();
     assert!(
-        matches!(&error, ShellError::Image(_)),
-        "the first launch fails while parsing the queued image: {error}"
+        matches!(&error, ShellError::Unresolvable { .. }),
+        "the first launch refuses the queued stub: {error}"
     );
     let error = shell
         .execute_run_command(b"run /init.lzx", &mut kernel, process, thread)
@@ -165,7 +168,7 @@ fn a_queued_launch_reports_its_path_from_the_run_command_entry_point() {
         .execute_run_command(b"run /init.lzx", &mut kernel, process, thread)
         .unwrap_err();
     assert!(
-        matches!(&error, ShellError::Image(_)),
+        matches!(&error, ShellError::Unresolvable { .. }),
         "clear releases the latch: {error}"
     );
 }

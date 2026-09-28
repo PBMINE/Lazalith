@@ -11,7 +11,7 @@ use lazalith_cpu::{
     validate_pc, validate_sp,
 };
 use lazalith_memory::{RegionKind, RegionPermissions, UserSpace};
-use lazalith_os_abi::{FileHandle, ProcessHandle};
+use lazalith_os_abi::{Capabilities, FileHandle, ProcessHandle};
 use lazalith_types::{ArchitectureConfig, InstructionAddress, PhysicalAddress, VirtualAddress};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -843,11 +843,50 @@ pub struct Process {
     threads: Vec<Thread>,
     handles: ProcessHandles,
     execution_context: Option<ExecutionContextId>,
-}
-
-impl Process {
-    /// Puts back a state this process produced.
+    /// What this process may do, from the package it was started from.
     ///
+    /// `None` means "started from a bare executable", which is the trusted path and
+    /// gets everything — see `lazalith_os_abi::capability` for why that asymmetry is
+    /// the design rather than an oversight.
+    capabilities: Option<Capabilities>,
+}
+impl Process {
+    /// Restricts this process to what a package declared.
+    ///
+    /// The gate's other half: a process started from a bare `.lzx` is created with no
+    /// restriction and a process started from a package is created with one, so this
+    /// is the only way a restriction is ever applied and there is no way to apply it
+    /// to a process that has already run.
+    ///
+    /// A capability the process was already given is never taken away, because
+    /// tightening a running process's permissions is a different operation with a
+    /// different set of questions — what about a call already in flight — and this is
+    /// not it.
+    pub fn restrict_to(&mut self, declared: Capabilities) {
+        self.capabilities = Some(self.capabilities().intersect(declared));
+    }
+
+    /// What this process may do.
+    ///
+    /// A process with no restriction — one started from a bare executable — may do
+    /// everything, which is what `lazalith_os_abi::capability` argues for.
+    pub const fn capabilities(&self) -> Capabilities {
+        match self.capabilities {
+            Some(capabilities) => capabilities,
+            None => Capabilities::for_trusted_image(),
+        }
+    }
+
+    /// Whether this process was started from a package.
+    ///
+    /// A host that wants to report "this program may not use the filesystem" needs to
+    /// know that the answer came from a declaration rather than from there being no
+    /// package involved at all.
+    pub const fn is_restricted(&self) -> bool {
+        self.capabilities.is_some()
+    }
+
+    /// Puts back a state this process produced.
     /// The whole process is replaced, not patched field by field. A snapshot is a
     /// clone of this struct, and a restore that assigned only the fields it
     /// remembered would leave a process that was *almost* the one that was saved
@@ -896,6 +935,7 @@ impl Process {
             threads,
             handles: ProcessHandles::new(),
             execution_context: None,
+            capabilities: None,
         })
     }
 
@@ -1087,6 +1127,7 @@ impl Process {
             stack,
             program,
             threads,
+            capabilities,
             handles,
             execution_context,
             ..
@@ -1096,6 +1137,7 @@ impl Process {
         UserMemoryContext::from_process(ProcessContextParts {
             process_id,
             thread_id,
+            capabilities: capabilities.unwrap_or_else(Capabilities::for_trusted_image),
             config,
             space,
             layout,
@@ -1141,6 +1183,7 @@ impl Process {
             memory,
             stack,
             program,
+            capabilities,
             threads,
             handles,
             execution_context,
@@ -1156,6 +1199,7 @@ impl Process {
             layout,
             handles,
             state,
+            capabilities: capabilities.unwrap_or_else(Capabilities::for_trusted_image),
             exit_code,
             thread,
             program,
@@ -1253,6 +1297,31 @@ impl Process {
 
     pub fn primary_thread(&self) -> &Thread {
         &self.threads[0]
+    }
+
+    /// How many threads this process has.
+    ///
+    /// One in this build, and reported rather than assumed so that a test can say so
+    /// and fail when it changes — a process that grew a second thread with nothing
+    /// creating one would be a bug, and `assert_eq!(process.thread_count(), 1)` is how
+    /// a test would catch it.
+    pub fn thread_count(&self) -> usize {
+        self.threads.len()
+    }
+
+    /// A thread's saved register file, if it has one.
+    ///
+    /// This is the state the scheduler moves in and out of around every step, so it
+    /// being per thread is what makes a second thread a thread rather than a second
+    /// name for the first one's registers.
+    pub fn thread_state(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<Option<&ArchitecturalState>, ProcessError> {
+        match self.threads.iter().find(|thread| thread.id == thread_id) {
+            Some(thread) => Ok(Some(thread.cpu())),
+            None => Ok(None),
+        }
     }
 
     pub fn handles(&self) -> &ProcessHandles {

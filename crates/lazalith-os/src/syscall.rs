@@ -17,6 +17,7 @@ use lazalith_cpu::{
 };
 pub use lazalith_memory::AddressSpaceIdentity as UserMemoryIdentity;
 use lazalith_memory::{RegionKind, RegionPermissions, UserSpace};
+use lazalith_os_abi::Capabilities;
 use lazalith_types::{
     ArchitectureConfig, InstructionAddress, InvalidRegisterIndex, PhysicalAddress, RegisterIndex,
     VirtualAddress, WordWidth,
@@ -174,8 +175,8 @@ pub(crate) struct ProcessContextParts<'a> {
     pub(crate) program: &'a ProgramImage,
     pub(crate) stack: &'a StackRegion,
     pub(crate) execution_context: Option<ExecutionContextId>,
+    pub(crate) capabilities: Capabilities,
 }
-
 pub struct UserMemoryContext<'a> {
     config: ArchitectureConfig,
     identity: UserMemoryIdentity,
@@ -191,6 +192,7 @@ pub struct UserMemoryContext<'a> {
     stack: &'a StackRegion,
     execution_context: Option<ExecutionContextId>,
     in_syscall: bool,
+    capabilities: Capabilities,
 }
 
 impl<'a> UserMemoryContext<'a> {
@@ -208,6 +210,7 @@ impl<'a> UserMemoryContext<'a> {
             program,
             stack,
             execution_context,
+            capabilities,
         } = parts;
         if space.config() != config || layout.config() != config {
             return Err(UserMemoryError::Configuration {
@@ -230,6 +233,7 @@ impl<'a> UserMemoryContext<'a> {
             program,
             stack,
             execution_context,
+            capabilities,
             in_syscall: false,
         })
     }
@@ -248,6 +252,20 @@ impl<'a> UserMemoryContext<'a> {
 
     pub const fn thread_id(&self) -> ThreadId {
         self.thread_id
+    }
+
+    /// What the calling process is allowed to do.
+    ///
+    /// This is the capability gate `docs/lazen-packages.md` recorded as missing: a
+    /// process started from a *package* may only make the syscalls its package
+    /// declared, and a process started from a bare `.lzx` may make all of them. The
+    /// asymmetry is the design and `lazalith_os_abi::capability` has the reasoning.
+    ///
+    /// It hangs off the context rather than off the dispatcher because the dispatcher
+    /// is `&self` while the capability belongs to the *process*, which is behind a
+    /// mutable borrow the context already holds.
+    pub const fn capabilities(&self) -> Capabilities {
+        self.capabilities
     }
 
     pub const fn execution_context(&self) -> Option<ExecutionContextId> {
@@ -947,7 +965,12 @@ impl DispatchOutcome {
 #[derive(Debug, Eq, PartialEq)]
 pub enum ValidationError {
     Abi(AbiError),
-    Memory { index: u8, source: UserMemoryError },
+    Memory {
+        index: u8,
+        source: UserMemoryError,
+    },
+    /// The process was not given the capability this syscall needs.
+    Capability(lazalith_os_abi::RefusedCapability),
 }
 
 impl ValidationError {
@@ -959,6 +982,14 @@ impl ValidationError {
             Self::Memory { index, source } => {
                 TaggedOutcome::failure(source.syscall_error(), u32::from(index))
             }
+            // The detail word is the capability, so a guest can tell *which* one it
+            // was refused rather than only that it was refused — which is the
+            // difference between a program that can ask its author for the right
+            // permission and one that can only report that something went wrong.
+            Self::Capability(refused) => TaggedOutcome::failure(
+                lazalith_os_abi::SyscallError::PermissionDenied,
+                u32::from(refused.capability),
+            ),
         }
     }
 }
@@ -970,6 +1001,7 @@ impl fmt::Display for ValidationError {
             Self::Memory { index, source } => {
                 write!(f, "invalid memory for argument {index}: {source}")
             }
+            Self::Capability(refused) => write!(f, "{refused}"),
         }
     }
 }
@@ -979,6 +1011,9 @@ impl Error for ValidationError {
         match self {
             Self::Abi(source) => Some(source),
             Self::Memory { source, .. } => Some(source),
+            // A refusal is its own explanation: the message names the syscall and the
+            // capability, which is everything there is to know about it.
+            Self::Capability(_) => None,
         }
     }
 }
@@ -1065,6 +1100,16 @@ impl SyscallDispatcher {
         if let Err(error) = arguments.validate_required_zero(call) {
             let outcome = ValidationError::Abi(error).into_outcome();
             return returning_outcome(admission, outcome);
+        }
+        // The capability gate, before the arguments are even looked at. A process
+        // that was not given a capability does not learn anything about the
+        // arguments it passed: the refusal is the same whether the call was otherwise
+        // well-formed or not, so a refused syscall cannot be used to probe the ABI.
+        if let Err(refused) = lazalith_os_abi::check(memory.capabilities(), call) {
+            return returning_outcome(
+                admission,
+                ValidationError::Capability(refused).into_outcome(),
+            );
         }
         let call = match Self::validate(config, arguments, memory, call) {
             Ok(call) => call,
