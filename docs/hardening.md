@@ -278,6 +278,58 @@ reserved or sliced.
 
 ---
 
+## H7, H8 — kernel and filesystem: clean
+
+**New test:** `crates/lazalith-os/tests/hardening_filesystem.rs`.
+
+**Result: no defect.** Ten cases, the centre of which is a campaign rather than a list.
+
+`tests/filesystem.rs` asks the filesystem a handful of questions. This file asks it
+*sequences*: 300 randomised runs of 200 operations, each operation applied to both the
+real filesystem and a model written from the documented semantics, comparing the
+outcome of every call **and the whole contents of the file after every step** — so a
+divergence names the operation that caused it rather than merely existing at the end.
+That is 60,000 operations.
+
+Positions are drawn from a table that deliberately includes the two ends, one either
+side of each, and a random interior offset, because a uniform draw almost never lands
+on a boundary and every interesting filesystem bug is on one.
+
+Three documented rules are the specific targets, and each is a place where a reasonable
+implementation could differ:
+
+- A write past the end **extends**; a write *at* an offset beyond the end is an
+  **error**, because there are no sparse files here and a write that would leave a
+  hole is refused rather than silently zero-filled.
+- A read past the end is a **short read**, not a failure; a read *from* beyond the end
+  is an error.
+- A seek is bounded by the file, with the end itself reachable — seeking to exactly the
+  end is what "position at the end" means, and a filesystem that refused it would be
+  wrong in the other direction.
+
+Around the campaign: the open flags are held to what they claim (neither read nor
+write is refused; create and truncate both require write; truncate on open clears the
+file and an open without the flag does not); `truncate` extends with zeroes and cuts;
+and a refused operation never changes the file.
+
+The model holds **one** file, deliberately — every question is about one file.s bytes.
+Two cases cover what a one-file model cannot: two files do not share bytes, and
+removing one file does not disturb another or resurrect its contents on re-creation.
+
+Two test defects here, and the first is worth recording because it is the same mistake
+as H4.s and H2.s:
+
+- The read-only/write-only case built its own `FileAccess` rather than using the
+  handle.s. `read_at` and `write_at` take the access as an *argument*, so the test was
+  asserting something about its own argument, and the write it expected to be refused
+  succeeded. Passing the handle.s own access makes it a claim about the filesystem.
+- The second is the absence of a defect, and is worth saying plainly rather than
+  leaving implied: a 60,000-operation campaign that finds nothing is evidence, not
+  proof, and the value of this file is that it can be re-run and will catch a regression
+  the day one is written.
+
+---
+
 ## H10 — graphics: the recorded defect, resolved
 
 **New test:** `crates/lazalith-runtime/tests/hardening_graphics_address.rs`.
@@ -433,11 +485,11 @@ Three more test defects here, all of the same family as H2's and H4's:
 
 | | before | after |
 | --- | --- | --- |
-| tests | 1176 | 1247 |
+| tests | 1176 | 1257 |
 | confirmed defects | — | 8 (7 in the C frontend; 1 in the runtime, the recorded graphics defect) |
-| test defects found and fixed | — | 18 |
-| clusters audited | — | 8 (H2 twice, H4, H5, H6, H9, H10, H12) |
-| new tests | — | 71 |
+| test defects found and fixed | — | 19 |
+| clusters audited | — | 9 (H2 twice, H4, H5, H6, H7/H8, H9, H10, H12) |
+| new tests | — | 81 |
 
 Seven of the eight confirmed defects are in the C frontend, and all seven were found by a
 *differential* or *property* test rather than by reading code. Nothing in the suite

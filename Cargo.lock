@@ -234,6 +234,7 @@ dependencies = [
  "lazalith-machine",
  "lazalith-memory",
  "lazalith-os-abi",
+ "lazalith-properties",
  "lazalith-types",
 ]
 

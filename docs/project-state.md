@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-29 (hardening: 8 clusters audited, 8 confirmed defects, 1247 tests)
+Last updated: 2026-09-29 (hardening: 9 clusters audited, 8 confirmed defects, 1257 tests)
 
 ## Where the roadmap stands
 
@@ -1743,14 +1743,14 @@ missing, which is the state a state machine is in.
 # HARDENING PHASE
 
 The first 100 steps are complete. This phase is an adversarial audit, and its record
-is `docs/hardening.md`. Eight clusters are done and **eight confirmed defects** have
+is `docs/hardening.md`. Nine clusters are done and **eight confirmed defects** have
 been found: seven in the C frontend, all the kind a green suite cannot see — a program
 using `unsigned int` ran and produced wrong answers, every `unsigned long` constant
 panicked the compiler, and one silently became zero — and one in the runtime, which is
 the graphics defect `docs/graphics-test.md` had recorded with a reproduction and a
 *wrong theory* for a whole cluster.
 
-Eighteen *test* defects were found alongside them, which is the phase.s more
+Nineteen *test* defects were found alongside them, which is the phase.s more
 interesting result: on this platform the implementation has been more reliable than
 the tests describing it.
 
@@ -1827,7 +1827,7 @@ against itself and against the shared backend, and never against C.
 
 1189 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
-## H4, H2, H6, H12 — clean; H2 and H10 again — four more confirmed defects
+## H4, H2, H6, H7, H8, H12 — clean; H2 and H10 again — four more confirmed defects
 
 `docs/hardening.md` has the full record. In summary:
 
@@ -1866,6 +1866,22 @@ behaviours it compared, a baseline taken before a legitimate write, and one asse
 demanding a checksum the object format was never going to have. Deriving an expected
 value in the test rather than writing it down is now a stated convention.
 
+## H7, H8 — kernel and filesystem: clean
+
+`crates/lazalith-os/tests/hardening_filesystem.rs` runs 300 randomised sequences of
+200 operations — 60,000 of them — against a model of the documented semantics,
+comparing every call.s outcome and the file.s whole contents after every step, with
+positions drawn from a table of the boundaries a uniform sample would miss. Every
+operation agreed. The documented rules pinned: a write at the end extends, a write
+*past* the end is refused (no sparse files), a read past the end is short rather than
+a failure, a seek is bounded by the file with the end itself reachable.
+
+One test defect: the read-only case built its own `FileAccess` rather than using the
+handle.s, so it was asserting something about its own argument. That is the third
+time in this phase that a hand-built value has stood in for a value the system
+produced, and the rule — derive the expectation, do not construct it — now covers
+handles as well as constants.
+
 ## H10 — graphics: the recorded defect, resolved
 
 `docs/graphics-test.md` had recorded an open defect with a reproduction and two
@@ -1890,7 +1906,7 @@ It was *documented*, with evidence and a theory, and the theory was what kept it
 alive. Asking "which of these two addresses is right" could not have found it; asking
 "read the bytes through each and see which holds the picture" did, immediately.
 
-1247 tests pass, and fmt, strict Clippy, check, `nix flake check` and `nix build` are
+1257 tests pass, and fmt, strict Clippy, check, `nix flake check` and `nix build` are
 green. `lazalith-c-runtime` and `lazalith-runtime` are dev-dependencies of
 `lazalith-c-compiler`, as they should be; they were briefly regular dependencies when
 the cross-frontend test was written.
