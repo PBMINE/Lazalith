@@ -86,6 +86,7 @@ dependencies = [
  "lazalith-memory",
  "lazalith-os",
  "lazalith-os-abi",
+ "lazalith-runtime",
  "lazalith-toolchain",
  "lazalith-types",
 ]
@@ -94,11 +95,13 @@ dependencies = [
 name = "lazalith-compiler"
 version = "0.1.0"
 dependencies = [
+ "lazalith-devices",
  "lazalith-diagnostics",
  "lazalith-ir",
  "lazalith-isa",
  "lazalith-os-abi",
  "lazalith-properties",
+ "lazalith-runtime",
  "lazalith-types",
 ]
 

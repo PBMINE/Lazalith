@@ -2155,62 +2155,112 @@ impl<'a> Checker<'a> {
     }
 
     /// The type and value of an integer constant, following C's rules.
+    ///
+    /// The magnitude is read once and used twice — for the type the constant *earns*
+    /// and for the bits it *carries* — because a frontend that derives the type from
+    /// one reading of the digits and the value from another has two chances to be
+    /// wrong, and did.
     fn integer_constant(&mut self, number: &crate::lexer::Number, span: SourceSpan) -> CType {
-        let value = self.integer_value(number, span).unwrap_or(0);
-        let (bits, signed) = self.constant_type(number, value);
+        let magnitude = self.integer_magnitude(number, &span);
+        let (bits, signed) = self.constant_type(number, magnitude);
         CType::Int { bits, signed }
     }
 
+    /// A literal's magnitude as a `u64`, with a diagnostic if it is not one.
+    ///
+    /// The value is read as unsigned because that is what a constant's digits are:
+    /// `18446744073709551615ul` is a perfectly ordinary constant, and reading its
+    /// digits as a *signed* 64-bit number is what used to make it fail.
+    fn integer_magnitude(&mut self, number: &crate::lexer::Number, span: &SourceSpan) -> u64 {
+        if number.digits.is_empty() {
+            return 0;
+        }
+        match u64::from_str_radix(&number.digits, number.base) {
+            Ok(magnitude) => magnitude,
+            Err(_) => {
+                self.error(
+                    span.clone(),
+                    codes::CONSTANT_TOO_LARGE,
+                    alloc::format!(
+                        "`{}` is not a constant this machine can hold",
+                        number.digits
+                    ),
+                    "use a smaller value, or a type wide enough for it",
+                );
+                0
+            }
+        }
+    }
+
     fn integer_value(&mut self, number: &crate::lexer::Number, span: SourceSpan) -> Option<i64> {
-        let digits = &number.digits;
-        if digits.is_empty() {
+        if number.digits.is_empty() {
             return Some(0);
         }
-        let magnitude = u64::from_str_radix(digits, number.base).ok()?;
-        // C computes a constant in its *declared* type, so a value too large for
-        // that type is not truncated silently: it is refused, because the
-        // program asked for a number the type cannot hold.
-        let (bits, signed) = self.constant_type(number, 0);
-        let limit = if signed {
-            1u64 << (bits - 1)
-        } else {
-            1u64 << bits
-        };
-        if bits < 64 && magnitude >= limit && (signed || magnitude >= limit) {
-            let fits_unsigned = magnitude < (1u64 << bits);
-            if signed || !fits_unsigned {
+        let magnitude = self.integer_magnitude(number, &span);
+        // C computes a constant in the type the *value* earns it, and only refuses
+        // one that has no type at all. The type is therefore worked out from the
+        // magnitude — the same ladder `constant_type` walks — and a constant is
+        // refused only when the type that ladder picked cannot hold it. That last
+        // case is a decimal constant too large for `long`, which C says has no type,
+        // and a `u`/`ul` constant too large for its type, which cannot be written.
+        //
+        // This check used to work out the type from a *zero* value, which made every
+        // unsuffixed constant look like a small `int` and so refused anything above
+        // `INT_MAX` — including `5000000000`, which C gives type `long`, and
+        // `0x80000000`, which it gives type `unsigned int`. Both are legal C and both
+        // were rejected.
+        let (bits, signed) = self.constant_type(number, magnitude.min(i64::MAX as u64));
+        // A 64-bit type has no limit above `u64::MAX`, so there is nothing to
+        // compare against, and `1u64 << 64` does not exist. The width is checked
+        // before the shift rather than after: computing it unconditionally meant
+        // every unsigned-long constant panicked this function in a debug build,
+        // `1ul` as much as `18446744073709551615ul`.
+        if bits < 64 {
+            let limit = if signed {
+                1u64 << (bits - 1)
+            } else {
+                1u64 << bits
+            };
+            if magnitude >= limit {
                 self.error(
                     span,
                     codes::CONSTANT_TOO_LARGE,
                     alloc::format!(
-                        "`{digits}` does not fit in a {}",
+                        "`{}` does not fit in a {}",
+                        number.digits,
                         signed_type_name(bits, signed)
                     ),
                     "give it a wider type with a suffix, or use a smaller value",
                 );
                 return None;
             }
+        } else if signed && magnitude > i64::MAX as u64 {
+            // A *signed* 64-bit type does have a limit, and it is `LONG_MAX`: a
+            // decimal constant above it has no type at all, which C says and this
+            // reports. (An *unsigned* long above `LONG_MAX` is perfectly ordinary —
+            // the IR carries the same 64 bits either way, and the caller treats them
+            // as unsigned.)
+            self.error(
+                span,
+                codes::CONSTANT_TOO_LARGE,
+                alloc::format!("`{}` does not fit in a `long`", number.digits),
+                "give it a `u` suffix for an `unsigned long`",
+            );
+            return None;
         }
-        if signed {
-            if magnitude > i64::MAX as u64 {
-                return None;
-            }
-            Some(magnitude as i64)
-        } else if magnitude > i64::MAX as u64 {
-            // A value that fits in `unsigned long` but not in `long` is still a
-            // constant, and the IR carries it as the same bits.
-            Some(magnitude as i64)
-        } else {
-            Some(magnitude as i64)
-        }
+        Some(magnitude as i64)
     }
 
     /// C's rule for an integer constant's type, from its value, base and suffix.
-    fn constant_type(&self, number: &crate::lexer::Number, value: i64) -> (u16, bool) {
+    ///
+    /// The value is the constant's magnitude, clamped to what fits an `i64` so that
+    /// the comparisons below are total: a magnitude above `LONG_MAX` is larger than
+    /// every threshold this function tests, which is the answer it wants, and
+    /// clamping cannot change that.
+    fn constant_type(&self, number: &crate::lexer::Number, magnitude: u64) -> (u16, bool) {
         let unsigned = number.suffix.contains('u');
         let long = number.suffix.contains('l');
         let decimal = number.base == 10;
-        let magnitude = value.unsigned_abs();
         if unsigned {
             return if long { (64, false) } else { (32, false) };
         }

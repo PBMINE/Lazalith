@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (hardening H5 and H9 complete: 4 confirmed defects fixed)
+Last updated: 2026-09-29 (hardening: 7 clusters audited, 7 confirmed defects, 1240 tests)
 
 ## Where the roadmap stands
 
@@ -1743,10 +1743,14 @@ missing, which is the state a state machine is in.
 # HARDENING PHASE
 
 The first 100 steps are complete. This phase is an adversarial audit, and its record
-is `docs/hardening.md`. The first two clusters are done and **four confirmed
-wrong-answer defects** have been found, all of them in the C frontend and all of
-them the kind a green suite cannot see: a program using `unsigned int` ran and
-produced wrong answers.
+is `docs/hardening.md`. Seven clusters are done and **seven confirmed defects** have
+been found, all of them in the C frontend and all of them the kind a green suite
+cannot see: a program using `unsigned int` ran and produced wrong answers, every
+`unsigned long` constant panicked the compiler, and one silently became zero.
+
+Fifteen *test* defects were found alongside them, which is the phase's more
+interesting result: on this platform the implementation has been more reliable than
+the tests describing it.
 
 ## H5 — ISA, CPU and machine: clean
 
@@ -1770,11 +1774,11 @@ not exist, so a model that cannot express a case quietly skips it.
 
 ## H9 — runtime and C frontend: four confirmed defects
 
-`crates/lazalith-c-compiler/tests/cross_frontend.rs` runs the same ten algorithms
-through both front ends and compares the printed value and the exit status. That is
-the only oracle this project has — two implementations of overlapping semantics
-sharing one IR, one lowerer and one code generator — and a disagreement is a bug in
-one of them. It found four.
+`crates/lazalith-c-compiler/tests/cross_frontend.rs` runs nine algorithms through
+both front ends and compares the printed value and the exit status. That is the only
+oracle this project has — two implementations of overlapping semantics sharing one
+IR, one lowerer and one code generator — and a disagreement is a bug in one of them.
+It found four.
 
 **1. A widening conversion sign-extended from the wrong bit.** `int v = -3; long
 w = v; if (w < 0)` answers `0`. The wrongness is *selective*, which is what makes
@@ -1807,18 +1811,63 @@ width keyword and the following `int` overrode the whole type. C says `long int`
 a `long`.
 
 The merge now lets a width or signedness keyword win over a following bare `int`,
-and a 21-spelling table checks each type twice — once for `sizeof`, which catches a
-width, and once against a value above `INT_MAX`, which catches a sign. All four
-have a regression test that fails without the fix, verified by running each against
-the unpatched implementation before patching.
+and a 23-spelling table, now permanent as `hardening_c_types.rs`, checks each type
+three times — once for `sizeof` (a width), once against a value above `INT_MAX` (a
+sign), and once by comparing an all-ones value `< 0`. All four have a regression
+test that fails without the fix, verified by running each against the unpatched
+implementation before patching.
 
 **What none of this says about Lazen.** The differential agrees with itself and
-with hand-computed values on all ten algorithms; Lazen's conversions were not
+s with hand-computed values on every algorithm; Lazen's conversions were not
 touched, and the C fixes change no Lazen output. The lesson is about the *absence*
 of the differential during the first hundred steps: the C frontend was tested
 against itself and against the shared backend, and never against C.
 
 1189 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
+
+## H4, H2, H6, H12 — clean; H2 again — three more confirmed defects
+
+`docs/hardening.md` has the full record. In summary:
+
+- **H4 (code generation)**, `crates/lazalith-codegen/tests/hardening_frames.rs`: six
+  frame and calling-convention programs — deep recursion with several live
+  temporaries per frame, nested calls with five arguments, recursion with the ABI's
+  full six-word argument budget, values live across calls, repeated outgoing-argument
+  use in a loop, and frame reuse. All return the right exit status.
+- **H2 (Lazen frontend)**, `crates/lazalith-compiler/tests/hardening_semantics.rs`:
+  twelve cases on precedence and scoping. All correct.
+- **H6 (memory)**,
+  `crates/lazalith-memory/tests/hardening_validate_before_mutation.rs`: twelve
+  refused-access cases, each checking every byte of the regions involved afterwards.
+  Validation is complete before mutation in all of them, and the boundary is pinned
+  from both sides — the last valid word of a region is writable, and the next one is
+  not.
+- **H12 (object format)**,
+  `crates/lazalith-toolchain/tests/hardening_object_format.rs`: 408 objects
+  round-tripped exactly, and every prefix and every single-byte corruption of eight
+  of them either refused or validated. The reader never reads past the file.
+- **H2 again (C constants)**: three more confirmed defects, in code nothing had ever
+  asked about. Every `unsigned long` constant **panicked** the compiler (`1ul` as
+  much as `18446744073709551615ul`); a `ul` constant above `LONG_MAX` **silently
+  became zero**; and the range check derived a constant's type from a *zero* value,
+  so `5000000000` and `0x80000000` — both legal C — were rejected with a diagnostic
+  naming a type they never had. The specifier matrix H9 promised is now permanent at
+  23 spellings measured three ways each.
+
+Two of those three were stacked: the panic fired first and hid the range check's
+wrong answer, so fixing the crash unmasked the bug underneath it.
+
+**The ratio is the finding.** Seven implementation defects, fifteen *test* defects,
+and every test defect was a test that would have passed or failed for the wrong
+reason — a stale hand-computed constant, a case whose values did not distinguish the
+behaviours it compared, a baseline taken before a legitimate write, and one assertion
+demanding a checksum the object format was never going to have. Deriving an expected
+value in the test rather than writing it down is now a stated convention.
+
+1240 tests pass, and fmt, strict Clippy, check, `nix flake check` and `nix build` are
+green. `lazalith-c-runtime` and `lazalith-runtime` are dev-dependencies of
+`lazalith-c-compiler`, as they should be; they were briefly regular dependencies when
+the cross-frontend test was written.
 
 
 ## Earlier milestones

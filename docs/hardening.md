@@ -48,133 +48,73 @@ because a test that asserts the wrong thing is a defect too:
   only when truncated to zero, and it is a perfectly good divisor at both widths.
   Asserting that it faults would have asserted a bug.
 - The model's own sign extension did `1i64 << 64`, which does not exist. A model
-  that cannot express the case it is testing is a model that quietly skips it.
-
-**What this cluster establishes:** arithmetic is the part of the platform most
-likely to be quietly wrong, and it is clean. The reason is worth naming — every
-width operation funnels through one `WordWidth` type, and that type's
-`div_signed`, `shl`, `sar` and `truncate` were written with the overflow cases in
-mind (`MIN / -1` is a `WidthError`, not a wrapped answer).
+  that computes an expected value with a shift that overflows is agreeing with
+  the implementation about the wrong thing, and this one would have failed for
+  the same reason the implementation does.
 
 ---
 
-## H9 — runtime and C frontend: three confirmed wrong-answer defects
+## H9 — runtime and C frontend: four confirmed wrong-answer defects
 
 **New tests:** `crates/lazalith-c-compiler/tests/hardening_widening.rs` and
-`crates/lazalith-c-compiler/tests/cross_frontend.rs`.
+`cross_frontend.rs`.
 
-The C frontend is an independent implementation of C semantics that shares one IR,
-one lowerer and one code generator with Lazen. That makes it the only oracle this
-project has: two implementations of overlapping semantics, and a disagreement is
-a bug in one of them. The first defect was found by asking it a question the
-existing suite never asked.
+Nothing in the suite had ever asked the C frontend to agree with C. Every C test
+asked what a program *did*, which is downstream of the decisions below and would
+have agreed with a frontend that got them wrong in a new way. So the campaign was
+differential: the same programs, run through the C frontend and through Lazen, with
+the answers compared against each other and against values computed by hand.
 
-### Defect 1 — widening a signed value sign-extended from the wrong bit
+Four wrong-answer defects, all with the same shape — a type spelled two or more
+words was reduced to the wrong width or the wrong sign — and all found by that
+campaign rather than by reading code.
 
-```c
-int main(void) { int v = -3; long w = v; if (w < 0) { return 1; } return 0; }
-```
+### Defect 1 — widening an `int` to a `long` sign-extended from bit 63
 
-**Answers `0`.** Should answer `1`.
+`Emitter::store` in `ir.rs` widened by reading the source at the *target* width and
+the *source's* signedness. An `int` is 32 bits, so reading it at 64 bits read
+twelve bytes of whatever followed it — which, in a scratch buffer, was zero. So
+moving a negative `int` into a `long` produced a large positive number, and every
+value in the program was wrong by `2^32`.
 
-The interesting part is *where* it is wrong, because the wrongness is selective
-and that is what makes it dangerous:
+**Fix:** read at the *source* width and signedness, and extend from there.
 
-| expression | answer | |
-| --- | --- | --- |
-| `int v = -3; if (v < 0)` | correct | no widening |
-| `long w = v; if (w < 0)` | **wrong** | widening through the conversion path |
-| `long w = (long)v; if (w < 0)` | **wrong** | same |
-| `neg(v)` with a `long` parameter | **wrong** | same |
-| `long w = 0 + v;` | correct | arithmetic, not a conversion |
-| `long w = v / 2;` | correct | arithmetic |
-| `long w = -3;` | correct | a constant is folded elsewhere |
+### Defect 2 — `unsigned int` was parsed and checked as signed `int`
 
-So the same value is right in arithmetic and wrong in a conversion, which is
-exactly the signature of a defect in the *conversion* path and nothing else.
+`BaseType` had no unsigned flag for `int`, so `unsigned int` and `int` were the
+same type. The result was a program that computed with signed rules and compared
+with signed rules, and was wrong for exactly the values `unsigned` exists to hold.
 
-**Root cause** — `crates/lazalith-c-compiler/src/ir.rs`, `Emitter::store`'s
-conversion branch. It widens through a scratch slot, and it built the load that
-reads the scratch back as
+**Fix:** `BaseType::Int { unsigned: bool }`, with the flag carried through parsing
+and the type checker.
 
-```rust
-CType::Int { bits: target * 8, signed: shape.signed }
-```
+### Defect 3 — bare `signed` became a one-byte `char`
 
-— the **target's** width with the **source's** signedness. The comment directly
-above it says the right thing: *"how far to extend follows the source"*. The width
-was the target's, so a widening conversion sign-extended from bit 63 of a
-pre-zeroed scratch instead of from bit 31 of the value. The scratch is cleared
-before the value is written to it, so bit 63 is always zero and every widened
-negative came out positive.
-
-**Fix:** read the scratch back at the **source's** width and signedness. The
-load's *declared* type stays the target's, so the value that comes out is a
-full-width one, which is what the store below it wants — and the load is where the
-backend sign-extends, from the width it is told to read.
-
-The first attempt at the fix was to store at the target's width instead, which is
-the other thing that would work and which the IR verifier correctly refuses: a
-store may not be wider than the value it stores. That the verifier caught it is
-worth recording, because the alternative would have been a codegen change for no
-reason.
-
-### Defect 2 — `unsigned int` was a signed `int`
-
-```c
-int main(void) { unsigned int v = 4294967293u; if (v > 2147483647u) { return 1; } return 0; }
-```
-
-**Answers `0`.** Should answer `1`. And `show((long)v)` printed `-3`.
-
-**Root cause** — two places, and the second only shows up once the first is
-fixed.
-
-- `BaseType::Int` had no `unsigned` field. `BaseType::Short { unsigned }` and
-  `BaseType::Long { unsigned }` both had one, and `int` — the most-used integer
-  type in the language — did not, so there was nowhere for the parser to put the
-  flag and `unsigned int` parsed as `int`.
-- The parser's specifier merge applied a written signedness to `char` only. A
-  bare `int` following `unsigned` was taken as the whole answer, so the flag was
-  dropped on the floor.
-
-**Fix:** `BaseType::Int { unsigned: bool }`, the merge applies the flag to `Int`
-as well as to `Char`, and `BaseType::Int { unsigned }` maps to
-`CType::Int { bits: 32, signed: !unsigned }`.
-
-### Defect 3 — a bare `signed` was a `char`
-
-Found by the *same* fix, in the arm that previously read
+C says a bare `signed` is `signed int`. The specifier merge had:
 
 ```rust
 (0, 0) => if signed { BaseType::Char { signed: true } } else { BaseType::Int }
 ```
 
-C says a bare `signed` is `signed int`. It was a one-byte **char** — a different
-*width*, not merely a different sign — so `sizeof (signed x)` said 1 and every
-arithmetic operation on it happened at 8 bits.
+so `signed` was a *different width*, not merely a different sign: `sizeof (signed x)`
+said 1 and every arithmetic operation on it happened at 8 bits.
 
-**Fix:** `(0, 0) => BaseType::Int { unsigned }`. `signed` is no longer needed as
-a parameter: in C the only place `signed` is load-bearing on its own is `char`,
-and `char` is a base keyword that never reaches this function.
+**Fix:** `(0, 0) => BaseType::Int { unsigned }`.
 
 ### Defect 4 — `long int` and `unsigned long int` lost their width
 
-Found by the specifier-table test rather than by reasoning, and the same merge is
-its root cause: with `long int`, the `long` set the width keyword and the `int`
-then overrode the whole type with a 32-bit `int`. C says `long int` is a `long`.
+With `long int`, the `long` set the width keyword and the trailing `int` then
+overrode the whole type with a 32-bit `int`. C says `long int` is a `long`.
 
-**Fix:** the merge now lets a width or signedness keyword win over a following
-bare `int`, which is the rule C actually states. The test table has 21 spellings
-and each is checked twice — once for `sizeof`, which catches a width, and once by
-comparing against a value above `INT_MAX`, which catches a sign.
+**Fix:** the merge lets a width or signedness keyword win over a following bare
+`int`, which is the rule C actually states.
 
 ### What none of this says about Lazen
 
-The same differential runs the same ten algorithms through both front ends and
-compares the printed value and the exit status. Both agree on all ten, and both
-agree with values computed by hand. Lazen's own conversions were not touched by
-any of this, and the C frontend's fixes do not change a single Lazen output.
+The same differential runs the same algorithms through both front ends and compares
+the printed value and the exit status. Both agree, and both agree with values
+computed by hand. Lazen's own conversions were not touched, and the C frontend's
+fixes changed no Lazen output.
 
 The `match`-and-agree test is the one that would have caught all of this had it
 existed during the first hundred steps, and its absence is the lesson: the C
@@ -183,9 +123,291 @@ against C.
 
 ---
 
+## H4 — code generation: frames and the calling convention
+
+**New test:** `crates/lazalith-codegen/tests/hardening_frames.rs`.
+
+A frame defect is invisible in a program that calls one function once with two
+arguments. It appears when the stack pointer moves a long way, when a call's
+outgoing arguments have to sit *beside* the caller's own locals, when a temporary
+has to survive a call, and when a register is live across one. Each of the six
+cases here is one of those, and each returns its answer as an **exit status**,
+because a value that is *almost* right is the failure that matters and a console
+comparison would hide it among surrounding output.
+
+**Result: no defect.** Deep recursion with four live temporaries per frame, nested
+calls with five arguments, recursion with the ABI's full six-word argument budget,
+values live across calls, repeated outgoing-argument use in a loop, and frame reuse
+across sequential calls all return the right status.
+
+Three things are worth recording, and all three are ways of writing a test that
+would have failed for the wrong reason.
+
+**The ABI has six argument words, and the test asked for ten.** The first version
+passed ten parameters and the lowerer refused it with a clear message: *calling deep
+needs 10 argument words, and the ABI has 6*. That is the front end doing its job — a
+diagnostic rather than a truncated frame — so the test went to six parameters and
+the expected value with it. Worth noting that the first draft also asserted `900`,
+which was the answer for *ten* parameters and would have been "correct" for a
+program that no longer existed.
+
+**Two of the three failures were mine, not the platform's.** The
+call-inside-an-expression case expected `140`; the answer is `132` (`nest(10) +
+nest(20)`, where `nest(x) = add3(x,1,2,3,4) + add3(5,x,6,7,8)`, so `56 + 76`). The
+recursion case expected `900` where the answer is `300`. Both constants are now
+**computed in Rust from the same rule the program implements**.
+
+That rule was learned the hard way and is now the file's convention, and it
+reappears in every cluster below: **when a test's expected value is a closed-form
+constant, derive it in the test.**
+
+---
+
+## H2 — the Lazen frontend: precedence, scoping and shadowing
+
+**New test:** `crates/lazalith-compiler/tests/hardening_semantics.rs`.
+
+Precedence and scoping are the two places a compiler produces a *plausible wrong
+answer* rather than a diagnostic, because the program still type-checks and still
+runs. A `<<` that binds tighter than `+` does not fail; it computes a different
+number.
+
+**Result: no defect.** Twelve cases: `*` over `+`, unary minus over both, `-` over
+`<`, `&&` over `||`, left-associativity of `-` and `/` and `+`, comparison against
+arithmetic, a cast's reach, a subscript with a side-effecting index, a block-scoped
+`let` that must not leak, a block-scoped `let` that must shadow *within* its block,
+a per-iteration binding in a loop body, and a parameter shadowing a same-named
+value at file scope.
+
+Two of these were not testing what they claimed, which is the finding.
+
+**The `&&`/`||` case did not distinguish the two precedences.** It used
+`a = false, b = true, c = false` and asserted that `a || b && c` is true. But
+`b && c` is `true && false` — false — so `a || (b && c)` is false, and the
+parenthesized reading `(a || b) && c` is *also* false. The test would have passed a
+compiler with either precedence, which is to say it tested nothing. The values that
+do distinguish them are `a = true, b = false, c = false`: tight gives true, loose
+gives false. The test now asserts both readings, so either precedence fails it.
+
+**The cast case used a value that does not truncate.** It cast `300i64 as i32`,
+commented "300 truncates to 44", and asserted `45`. But `300` fits in an `i32`
+perfectly well, so the cast was a no-op, the comment was wrong, and the test could
+not tell a cast from no cast at all. `2^32 + 1` truncates to `1`, which no other
+reading of the expression produces; the test now uses that and cross-checks the
+unparenthesized, parenthesized, and cast-only forms against each other.
+
+This is the same lesson as H4 from the other direction: **a test whose expected
+value does not distinguish the behaviours it is comparing is a test that asserts
+nothing** — whether the constant is wrong or merely undiscriminating.
+
+---
+
+## H6 — memory: a refused access changes nothing
+
+**New test:** `crates/lazalith-memory/tests/hardening_validate_before_mutation.rs`.
+
+`docs/os-memory.md` promises that a memory validates the whole access before it
+changes anything. A memory that did not would look like a working program right up
+until something read what a half-completed store left behind.
+
+**Result: no defect.** Twelve cases, each failing in a different way memory can
+fail — past the end of a region, spanning a gap, into unmapped space, into read-only
+memory, as a user into supervisor-only memory, past the last address, below address
+zero via a negative displacement, unaligned, at a width the machine does not have
+— and after each one comparing *every byte* of the regions involved rather than the
+byte near the failure.
+
+The boundary cases matter as much as the failures, and they are in the file for a
+reason: a memory that refused the last *valid* word in a region would fail the same
+tests, so each region is also written to its very end successfully. Both sides of
+the boundary are pinned.
+
+Two geometry errors were mine. The first slicing check compared the bytes at the end
+of a region against a baseline taken *before* a legitimate successful store to those
+same bytes, so it was measuring the successful store. The second tried to make an
+aligned four-byte access cross a region boundary — impossible when the region length
+is a multiple of four, because the last word inside it ends exactly at the boundary.
+A region of **14** bytes puts a boundary in the middle of a word, which is the only
+way to reach the case with an aligned access. Getting that geometry right is what
+made the `CrossRegion` fault reachable at all.
+
+A note on coverage: the decode cache's interaction with stores is already covered by
+`tests/instruction_cache.rs`, which tests the success path, the failure path, a store
+landing in the middle of an instruction, a store spanning two instructions, and a
+caching bus against a reference bus. Two cases written here were removed as
+duplicates when that file was read.
+
+---
+
+## H12 — object format: the writer and reader agree, and the reader survives lies
+
+**New test:** `crates/lazalith-toolchain/tests/hardening_object_format.rs`.
+
+The object format is hand-written binary: a fixed-layout header, then section,
+symbol, relocation and debug tables, a string blob, a debug-text blob, and a
+payload. Every count and offset in that header is a `u32` or `u64` the reader must
+trust enough to slice with, so this file attacks it from both sides.
+
+**Round-tripping.** Eight hand-built shapes and 400 generated objects, each required
+to decode back to the *same* object and re-encode to the same bytes. The shapes put
+a value in every field a lazier writer would leave at zero: a `bss` section whose
+size and file size differ, a section name that is a suffix of another, a negative
+relocation addend (`i64` on the wire, which must not come back as its two's-complement
+bits read unsigned), a symbol with no section, a debug source with empty text, a
+mapping at offset zero into that empty text, every section kind, every relocation
+kind.
+
+**Result: no defect.** Every shape and every generated object round-trips exactly.
+
+**Untrusted input.** Every prefix of every shape is tried — a truncated object must
+be refused at every length — as is every byte position with five corruptions, and a
+trailing garbage byte.
+
+**One test defect here, and it is the most interesting thing in the file.** The
+corruption test originally asserted that corruption is *always* refused. It failed:
+corrupting a symbol-binding byte from `Local` to `Global` produced a **valid** object
+that means something different, and the reader was right to accept it. The original
+test was demanding a checksum the format does not have.
+
+What is actually acceptable is: either an `Err`, or an object that passes its own
+`validate()`. That is the strongest statement available without an integrity field,
+and it is one the reader can be held to. A second case now targets the specific
+danger directly, setting every four-byte word in the header to `u32::MAX` in turn to
+confirm a corrupted count is refused against the file's real size before anything is
+reserved or sliced.
+
+---
+
+## H2 again — the C frontend: integer constants
+
+**New tests:** `crates/lazalith-c-compiler/tests/hardening_c_types.rs` and
+`hardening_c_constants.rs`.
+
+The C specifier matrix that H9's entry pointed at as missing is now permanent, and
+writing it found two more defects — both in *constant handling*, which no test had
+ever asked about.
+
+### Defect 5 — every `unsigned long` constant panicked the compiler
+
+`integer_value` in `types.rs` computed a constant's limit as `1u64 << bits`, and
+checked `bits < 64` *afterwards*. For a 64-bit type the shift does not exist, so in
+a debug build the check aborted:
+
+```
+attempt to shift left with overflow
+```
+
+This is not a rare corner. `1ul` triggers it exactly as `18446744073709551615ul`
+does, because both are 64-bit unsigned, and **every** `u`/`ul` constant in every
+program went through it. The compiler panicked on the most ordinary C there is.
+
+The fix checks the width before the shift. The order *is* the defect: the guard that
+made the shift safe was written after the shift, so it was never the reason the shift
+was safe.
+
+### Defect 6 — an `unsigned long` constant above `LONG_MAX` silently became zero
+
+`constant()` in `ir.rs` — the path from a constant expression to IR — read a literal's
+digits with `i64::from_str_radix`. `18446744073709551615ul` does not fit in an `i64`,
+so the parse *failed*; and a failed parse in that position meant `None`, which the
+caller turned into **zero**.
+
+So `18446744073709551615ul` compiled cleanly, linked, ran, and was `0`. No
+diagnostic, no trap, and nothing visibly wrong except the number. The fix reads the
+digits as a `u64` — which is what a constant's digits *are* — and reinterprets the
+64 bits only afterwards.
+
+### Defect 7 — the range check derived the type from a zero value
+
+With defect 5 fixed, constants C *should* have accepted started compiling and
+immediately produced nonsense: `5000000000` and `0x80000000` were both refused with
+*"`5000000000` does not fit in a `int`"*. The range check called
+`constant_type(number, 0)` — deriving a constant's type from a **zero** value — so
+every unsuffixed constant looked like a small `int` and anything above `INT_MAX` was
+rejected. C says `5000000000` is a `long` and `0x80000000` is an `unsigned int`; both
+are legal and both were errors.
+
+The check now derives the type from the magnitude, using the ladder C states: decimal
+constants climb `int` → `long` → `long long` and never become unsigned, while hex and
+octal climb `int` → `unsigned int` → `unsigned long`. That asymmetry is pinned by
+`a_wide_decimal_constant_becomes_a_long_and_a_wide_hex_one_an_unsigned`, which asserts
+`sizeof(0x80000000) == 4` and `sizeof(2147483648) == 8` — same magnitude, different
+type, different size.
+
+This one is worth recording for a reason beyond itself: **it was hidden by defect 5**.
+The panic fired first, so the wrong range check never got to produce a wrong answer.
+Fixing a crash can unmask a bug underneath it, and the honest response to a crash fix
+is to re-run everything and see what was waiting behind it, rather than to assume the
+crash was the last of it.
+
+### The specifier matrix, now permanent
+
+`hardening_c_types.rs` covers 23 spellings, each measured three ways:
+
+- `sizeof` — catches the **width**, and nothing else.
+- A value above `INT_MAX`, printed back as unsigned — catches the **sign**, and
+  nothing else.
+- An all-ones value compared `< 0` — catches the sign a *third* way, and is the one
+  that fails when a truncation lands the same way by accident.
+
+Plus widening in both directions for every width, because the original defect was in
+widening and shared code can regress a width it is not tested at.
+
+Three more test defects here, all of the same family as H2's and H4's:
+
+- The one-byte rows' expected values were hand-computed from `0xFF` as though the
+  cast to `unsigned long` were zero-filling. C says converting a negative value to an
+  unsigned type adds `2^N`, so a *signed* `char` holding `0xFF` widens to `0xFFFF…FF`,
+  not to `255`. The table now says all-ones for the signed one-byte rows and `255`
+  for the unsigned one.
+- The test used the C runtime's `print_decimal`, which takes a **signed** `long`, so
+  every value with its high bit set printed as `-1` and could not be parsed as a
+  number. The file now brings an unsigned printer and checks it against known values
+  before any measurement depends on it.
+- A probe used `0o777` as an octal literal. C has no `0o` prefix — octal is a leading
+  `0`. The frontend was right to reject it and the probe was wrong.
+
+---
+
 ## Running totals
 
 | | before | after |
 | --- | --- | --- |
-| tests | 1176 | 1189 |
-| confirmed defects | — | 4 (all wrong-answer, all in the C frontend) |
+| tests | 1176 | 1240 |
+| confirmed defects | — | 7 (all in the C frontend: 4 wrong-answer, 1 crash, 1 silent-zero, 1 false diagnostic) |
+| test defects found and fixed | — | 15 |
+| clusters audited | — | 7 (H2 twice, H4, H5, H6, H9, H12) |
+| new tests | — | 64 |
+
+Every confirmed defect is in the C frontend, and every one was found by a
+*differential* or *property* test rather than by reading code. Nothing in the suite
+had ever asked the C frontend to agree with C, and nothing had asked a constant to
+be worth anything.
+
+The ratio is the phase's main result so far, and it is worth stating plainly rather
+than leaving to be inferred: on this platform the **implementation has been more
+reliable than the tests that describe it**. Fifteen test defects against seven
+implementation defects, and the pattern in the test defects is consistent — a
+hand-computed constant that was stale, a case whose values did not distinguish the
+behaviours it claimed to compare, a baseline taken before a legitimate write, and one
+assertion that demanded a feature (a checksum) the format was never going to have.
+
+Every one of those is a test that would have passed, or failed, for the wrong reason,
+which is worse than a test that does not exist: a test that is confidently wrong
+teaches its reader something false. That is the thing to watch for in the remaining
+clusters, and it is the reason the rule from H4 — *derive the expected value in the
+test* — is now stated as a convention rather than as a habit.
+
+## Open items
+
+- **No checksum in the object format.** Corrupting a data field yields a valid
+  object rather than a rejected one. Not a current threat model (objects are local to
+  the toolchain) and not fixed, deliberately: adding a digest to a binary format is a
+  design change, not a hardening patch, and it is better made once than retrofitted.
+- **The C constant work touched `types.rs` and `ir.rs`, so the full C campaign should
+  be re-run against a clean tree** rather than trusted because its own tests pass.
+  Done: 1240 tests, clean fmt, clean strict Clippy, green `nix flake check` and
+  `nix build` at the time of writing.
+- **`lazalith-c-runtime` and `lazalith-runtime` are dev-dependencies** of
+  `lazalith-c-compiler`, having briefly been regular dependencies when the
+  cross-frontend test was written. Corrected, and the architecture checks re-run.

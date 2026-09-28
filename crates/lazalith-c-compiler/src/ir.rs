@@ -2308,7 +2308,16 @@ fn constant(expression: &Expression) -> Option<i64> {
             if number.digits.is_empty() {
                 Some(0)
             } else {
-                i64::from_str_radix(&number.digits, number.base).ok()
+                // The digits are read as a `u64` and only then reinterpreted as the
+                // 64 bits a value has, rather than parsed as an `i64` directly. An
+                // `unsigned long` constant above `LONG_MAX` — `18446744073709551615ul`
+                // is the one every test reaches for — does not fit in an `i64`, so
+                // parsing it as one *failed*, and a failed parse here is a constant
+                // that silently becomes zero. `18446744073709551615ul` in a program
+                // was `0`, and no diagnostic said so.
+                u64::from_str_radix(&number.digits, number.base)
+                    .ok()
+                    .map(|magnitude| magnitude as i64)
             }
         }
         Expression::Character { value, .. } => Some(*value),

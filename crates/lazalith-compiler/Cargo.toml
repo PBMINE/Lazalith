@@ -15,4 +15,6 @@ lazalith-os-abi = { path = "../lazalith-os-abi" }
 workspace = true
 
 [dev-dependencies]
+lazalith-devices = { path = "../lazalith-devices" }
 lazalith-properties = { path = "../lazalith-properties" }
+lazalith-runtime = { path = "../lazalith-runtime" }

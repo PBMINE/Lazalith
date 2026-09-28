@@ -21,3 +21,4 @@ workspace = true
 [dev-dependencies]
 lazalith-compiler = { path = "../lazalith-compiler" }
 lazalith-machine = { path = "../lazalith-machine" }
+lazalith-runtime = { path = "../lazalith-runtime" }
