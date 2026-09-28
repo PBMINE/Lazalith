@@ -27,4 +27,5 @@ lazalith-machine = { path = "../lazalith-machine" }
 lazalith-memory = { path = "../lazalith-memory" }
 lazalith-os = { path = "../lazalith-os" }
 lazalith-runtime = { path = "../lazalith-runtime" }
+lazalith-c-runtime = { path = "../lazalith-c-runtime" }
 lazalith-toolchain = { path = "../lazalith-toolchain" }

@@ -3044,3 +3044,86 @@ Raw machine interfaces
 ```
 
 when necessary.
+
+---
+# HARDENING PHASE
+
+The first 100 steps are complete and verified. This phase is not a feature phase.
+
+Its question is:
+
+```text
+What is still wrong with Lazalith despite all existing tests passing?
+```
+
+The answer is not "nothing", and the defects that matter most are the ones a
+green suite cannot see: wrong answers rather than traps, behaviour that is only
+wrong end to end, representation lost between two stages, a stale assumption, an
+ABI mistake, a width or sign handled in the wrong place, a test that was green
+because it asserted nothing.
+
+So this phase is an **adversarial audit**. For every subsystem: read it, state
+its invariants, design inputs that should break them, run them against the
+*unmodified* implementation, and only then patch. A finding that cannot be
+reproduced is not a finding.
+
+A defect is only fixed when it leaves behind:
+
+```text
+a minimal reproducer
+the root cause
+the fix
+a regression test that fails without the fix
+an entry in docs/project-state.md
+```
+
+## The clusters
+
+Numbered as steps so each one is a checkpoint, following the convention above.
+
+```text
+H1   architecture audit
+H2   compiler frontend audit
+H3   IR verifier and value-flow audit
+H4   code generation and frame-layout audit
+H5   ISA, CPU and machine audit
+H6   memory, bus and device audit
+H7   kernel, ABI and OS audit
+H8   filesystem, process and device-service audit
+H9   runtime and C frontend audit
+H10  graphics, input, GUI and SDL audit
+H11  debugger, snapshot and replay audit
+H12  object format, linker, package and build audit
+H13  property, fuzz and differential expansion
+H14  performance and resource audit
+H15  state isolation and repeatability
+H16  public-API hardening
+H17  documentation and specification consistency
+H18  final adversarial regression campaign
+```
+
+## What this phase must not become
+
+No feature wishlist. A language feature, an ABI call, a GUI widget, an ISA
+instruction, an OS service, a third-party dependency or a speculative abstraction
+is added only when it is needed to fix a demonstrated defect, to expose one, to
+meet an existing contract, or to remove a demonstrated defect's cause.
+
+An **acceptable limitation** is not a defect and is not "fixed" into undefined
+behaviour: a missing allocator, a missing thread, a headless-only test, and a
+display frame address the platform cannot yet vouch for are all recorded, none
+of them are invented around.
+
+## The rule at the end
+
+```text
+"all tests pass"
+```
+
+is not
+
+```text
+"the platform is thoroughly hardened"
+```
+
+The purpose of these steps is to find what the current tests are **not** seeing.

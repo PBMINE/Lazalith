@@ -379,7 +379,10 @@ impl<'a> Checker<'a> {
                 bits: 16,
                 signed: !*unsigned,
             },
-            BaseType::Int => CType::int(),
+            BaseType::Int { unsigned } => CType::Int {
+                bits: 32,
+                signed: !*unsigned,
+            },
             BaseType::Long {
                 doubled: _,
                 unsigned,

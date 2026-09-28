@@ -181,8 +181,18 @@ pub enum BaseType {
         /// Whether `unsigned` was written.
         unsigned: bool,
     },
-    /// `int` on its own.
-    Int,
+    /// `int` on its own, `signed int`, `unsigned int`, or bare `unsigned`.
+    ///
+    /// The `unsigned` flag is here because this is the one integer base type that
+    /// used to have nowhere to put it: `short` and `long` both carry it, and `int`
+    /// did not, so `unsigned int` parsed as `int` and every program that used it got
+    /// signed comparisons, signed division and a sign-extended widening — silently,
+    /// because the type checker believed what the parser told it.
+    Int {
+        /// Whether `unsigned` was written. C's `int` is signed, and a bare
+        /// `unsigned` means `unsigned int`.
+        unsigned: bool,
+    },
     /// `long` or `long long`, with or without `unsigned`.
     Long {
         /// Whether a second `long` was written.

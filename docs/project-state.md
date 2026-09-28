@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (all 100 steps complete and verified)
+Last updated: 2026-09-28 (hardening H5 and H9 complete: 4 confirmed defects fixed)
 
 ## Where the roadmap stands
 
@@ -50,7 +50,7 @@ Step  99      complete: final architecture review
 Step 100      complete: the final project
 ```
 
-The 1176 workspace tests all pass, including the 4 in
+The 1189 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -1736,6 +1736,89 @@ Each of the hundred steps is implemented, tested, fixed and documented in
 missing, which is the state a state machine is in.
 
 1176 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
+
+
+---
+
+# HARDENING PHASE
+
+The first 100 steps are complete. This phase is an adversarial audit, and its record
+is `docs/hardening.md`. The first two clusters are done and **four confirmed
+wrong-answer defects** have been found, all of them in the C frontend and all of
+them the kind a green suite cannot see: a program using `unsigned int` ran and
+produced wrong answers.
+
+## H5 — ISA, CPU and machine: clean
+
+`crates/lazalith-cpu/tests/hardening_arithmetic.rs` compares every arithmetic
+operation against a model written from the ISA document rather than from the
+implementation — explicit masking, Rust's own integer arithmetic, a hand-written
+sign extension — after every instruction, through a real interpreter and a real
+memory. A test that computes its expected value by calling the same `WordWidth`
+method the interpreter calls is a test that agrees with the bug.
+
+Over 10,000 comparisons across 13 operations and both widths, with half the values
+drawn from a table of interesting ones because those are where a width or sign
+mistake shows up: **no defect**. The fault cases fault, and the two widths agree
+wherever the widths say they should.
+
+Two *test* defects were found and fixed on the way, and they are recorded because a
+test that asserts the wrong thing is a defect too: the division-by-zero case
+treated `u64::MAX` as zero — it is zero at 32 bits only when truncated, and a good
+divisor at both — and the model's own sign extension did `1i64 << 64`, which does
+not exist, so a model that cannot express a case quietly skips it.
+
+## H9 — runtime and C frontend: four confirmed defects
+
+`crates/lazalith-c-compiler/tests/cross_frontend.rs` runs the same ten algorithms
+through both front ends and compares the printed value and the exit status. That is
+the only oracle this project has — two implementations of overlapping semantics
+sharing one IR, one lowerer and one code generator — and a disagreement is a bug in
+one of them. It found four.
+
+**1. A widening conversion sign-extended from the wrong bit.** `int v = -3; long
+w = v; if (w < 0)` answers `0`. The wrongness is *selective*, which is what makes
+it dangerous: the same value is correct in `0 + v` and in `v / 2`, because arithmetic
+is emitted at the full width and never came through the conversion path. The
+conversion's scratch slot is pre-cleared and then the load that reads it back was
+built with the **target's** width and the **source's** signedness, so the extension
+came from bit 63 of a zero rather than bit 31 of the value. The comment directly
+above that line already said "how far to extend follows the source"; the width was
+the target's. Fixed by reading the scratch at the source's width and keeping the
+load's *declared* type the target's. The first attempt — storing at the target's
+width — is the other thing that would have worked, and the IR verifier correctly
+refused it, which is worth recording: the alternative would have been a codegen
+change for no reason.
+
+**2. `unsigned int` was a signed `int`.** `unsigned int v = 4294967293u; if (v >
+2147483647u)` answers `0`, and printing it prints `-3`. `BaseType::Int` had no
+`unsigned` field — `Short` and `Long` both had one, and the most-used integer type
+in the language did not — so there was nowhere for the parser to put the flag. The
+specifier merge then applied a written signedness to `char` only, so a bare `int`
+after `unsigned` overrode the whole type.
+
+**3. A bare `signed` was a `char`.** Found by the fix for #2, in the arm that read
+`if signed { Char } else { Int }`. C says a bare `signed` is `signed int`; it was a
+one-byte **char**, so `sizeof` said 1 and every operation on it happened at 8 bits.
+
+**4. `long int` and `unsigned long int` lost their width.** Found by a specifier
+table rather than by reasoning, with the same merge as its cause: `long` set the
+width keyword and the following `int` overrode the whole type. C says `long int` is
+a `long`.
+
+The merge now lets a width or signedness keyword win over a following bare `int`,
+and a 21-spelling table checks each type twice — once for `sizeof`, which catches a
+width, and once against a value above `INT_MAX`, which catches a sign. All four
+have a regression test that fails without the fix, verified by running each against
+the unpatched implementation before patching.
+
+**What none of this says about Lazen.** The differential agrees with itself and
+with hand-computed values on all ten algorithms; Lazen's conversions were not
+touched, and the C fixes change no Lazen output. The lesson is about the *absence*
+of the differential during the first hundred steps: the C frontend was tested
+against itself and against the shared backend, and never against C.
+
+1189 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
 
 ## Earlier milestones

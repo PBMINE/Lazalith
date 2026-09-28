@@ -939,8 +939,20 @@ impl<'a> Emitter<'a> {
         // the target type — and a `size_t` argument has to arrive as a `u64` or the
         // IR verifier, correctly, refuses it.
         let read_as = if target > shape.width {
+            // The **source's** width, and the source's signedness. This is the
+            // decision the comment above describes — "how far to extend follows the
+            // source" — and the bug was in the width, not the idea: the load used to
+            // read the *target's* width with the source's signedness, so a widening
+            // conversion sign-extended from bit 63 of the pre-zeroed scratch instead
+            // of from bit 31 of the value. Every negative `int` widened to a `long`
+            // then compared as a large positive number, while the same value used in
+            // arithmetic was right, because arithmetic is emitted at the full width
+            // and never came through this path.
+            //
+            // The load's *declared* type is still the target's, so the value that
+            // comes out is a full-width one, which is what the store below wants.
             CType::Int {
-                bits: u16::try_from(target * 8).unwrap_or(64),
+                bits: u16::try_from(shape.width * 8).unwrap_or(64),
                 signed: shape.signed,
             }
         } else {

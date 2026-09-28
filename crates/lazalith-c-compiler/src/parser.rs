@@ -530,7 +530,7 @@ impl<'a> Parser<'a> {
         let base = base
             .or_else(|| {
                 if signed || unsigned || longs > 0 || shorts > 0 {
-                    Some(integer_base(signed, unsigned, longs, shorts))
+                    Some(integer_base(unsigned, longs, shorts))
                 } else {
                     None
                 }
@@ -543,8 +543,19 @@ impl<'a> Parser<'a> {
                 // `char` is signed, so a `strcmp` that skips its `unsigned char`
                 // comparison sees a high bit as a negative and calls `'c'` less than
                 // `'a'`.
+                //
+                // `int` is the other, and for the opposite reason. A bare `int` after
+                // a width or signedness keyword must not **undo** that keyword: C
+                // says `unsigned int` is an unsigned `int`, `long int` is a `long`,
+                // and `unsigned long int` is an unsigned `long`. Taking the bare
+                // `int` as the whole answer made all three 32-bit signed `int`s, which
+                // is how `unsigned int` came to be a signed type with nothing wrong
+                // anywhere in the type checker.
                 match base {
                     BaseType::Char { .. } => BaseType::Char { signed: !unsigned },
+                    BaseType::Int { .. } if signed || unsigned || longs > 0 || shorts > 0 => {
+                        integer_base(unsigned, longs, shorts)
+                    }
                     other => other,
                 }
             });
@@ -613,7 +624,7 @@ impl<'a> Parser<'a> {
             // by the type checker. It is a *placeholder* and not a translation,
             // and saying so is better than a silent `int` that would look like a
             // decision the compiler made on purpose.
-            return BaseType::Int;
+            return BaseType::Int { unsigned: false };
         }
         if self.eat_keyword("char") {
             // The signedness is applied by the caller, which is the only place
@@ -621,7 +632,7 @@ impl<'a> Parser<'a> {
             return BaseType::Char { signed: true };
         }
         if self.eat_keyword("int") {
-            return BaseType::Int;
+            return BaseType::Int { unsigned: false };
         }
         if self.is_keyword_at(0, "struct") || self.is_keyword_at(0, "union") {
             return BaseType::Record(Box::new(self.record_reference()));
@@ -633,7 +644,7 @@ impl<'a> Parser<'a> {
             let token = self.advance();
             return BaseType::Named(token.value);
         }
-        BaseType::Int
+        BaseType::Int { unsigned: false }
     }
 
     /// Reports that a floating-point type is not representable.
@@ -973,7 +984,7 @@ impl<'a> Parser<'a> {
         let start = self.peek().clone();
         let (storage, _, _, _, base) = self.declaration_specifiers();
         let base = base.unwrap_or(TypeSpecifier {
-            base: BaseType::Int,
+            base: BaseType::Int { unsigned: false },
             qualifiers: storage,
             span: self.span_from(&start, self.at),
         });
@@ -1326,7 +1337,7 @@ impl<'a> Parser<'a> {
         if self.is_declaration() {
             let (storage, extern_, static_, typedef, base) = self.declaration_specifiers();
             let base = base.unwrap_or(TypeSpecifier {
-                base: BaseType::Int,
+                base: BaseType::Int { unsigned: false },
                 qualifiers: storage,
                 span: self.peek().span.clone(),
             });
@@ -1762,7 +1773,7 @@ impl<'a> Parser<'a> {
         }
         let span = self.span_from(&start, self.at);
         let base = base.unwrap_or(TypeSpecifier {
-            base: BaseType::Int,
+            base: BaseType::Int { unsigned: false },
             qualifiers: Storage::default(),
             span: span.clone(),
         });
@@ -1790,21 +1801,25 @@ fn empty_token(source: SourceId, sources: &SourceManager) -> Token {
 }
 
 /// The integer base type a set of signedness and width keywords describes.
-fn integer_base(signed: bool, unsigned: bool, longs: usize, shorts: usize) -> BaseType {
+///
+/// C's rules for the no-width case: `int` and `signed` are `int`, and `unsigned` is
+/// `unsigned int`. Neither of those was right here — `unsigned` became a signed
+/// `int` because `BaseType::Int` had nowhere to put the flag, and a bare `signed`
+/// became a **char**, which is a different width and not merely a different sign.
+/// Both are silent: a program using `unsigned int` ran and produced wrong answers.
+fn integer_base(unsigned: bool, longs: usize, shorts: usize) -> BaseType {
     match (longs, shorts) {
-        (0, 0) => {
-            if signed {
-                BaseType::Char { signed: true }
-            } else {
-                BaseType::Int
-            }
-        }
+        (0, 0) => BaseType::Int { unsigned },
         (1 | 2, 0) => BaseType::Long {
             doubled: longs == 2,
             unsigned,
         },
         (0, 1) => BaseType::Short { unsigned },
-        _ => BaseType::Int,
+        // Unreachable for a well-formed specifier list: the caller only calls this
+        // when no base keyword was seen, so `long` and `short` were never both
+        // written. Answering with an `int` rather than panicking is right anyway,
+        // because the checker will report the conflicting specifiers.
+        _ => BaseType::Int { unsigned },
     }
 }
 

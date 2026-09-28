@@ -1,3 +1,12 @@
+//! Shared test support for the `lazalith-cpu` tests.
+//!
+//! `dead_code` is allowed because each test file compiles this module *separately*
+//! and uses a different part of it, so a helper one binary never calls is a warning
+//! in that binary and not a defect. Removing the helpers that a sibling test needs
+//! would be the only way to silence it honestly, and the alternative is a support
+//! module per test file.
+#![allow(dead_code)]
+
 use lazalith_cpu::{
     ArchitecturalState, CpuMemory, DataAccess, DataAccessKind, Privilege, ReferenceInterpreter,
 };
