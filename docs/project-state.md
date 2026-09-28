@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–84 complete and verified)
+Last updated: 2026-09-28 (Steps 1–85 complete and verified)
 
 ## Where the roadmap stands
 
@@ -32,9 +32,10 @@ Step  81      complete: the C compiler
 Step  82      complete: the C runtime
 Step  83      complete: assembly, C and Lazen convergence
 Step  84      complete: property testing
+Step  85      complete: differential testing
 ```
 
-The 989 workspace tests all pass, including the 4 in
+The 994 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -640,6 +641,81 @@ bugs above were found.
   "is this C", the lowering answers "is this a program". Asserting otherwise would
   have asserted the wrong layering — and it did, until the test failed and the
   layering turned out to be right.
+
+## Step 85 — differential testing
+
+`crates/lazalith-machine/tests/differential.rs` runs the same program on two paths
+and compares what each of them did, after every step rather than at the end.
+
+### What is compared, and what is not
+
+The step asks for a `ReferenceInterpreter` checked against *an optimised emulator*.
+There is no optimised emulator — step 93 introduces one, and until then this
+repository has exactly one instruction executor, which `LazalithMachine` calls.
+
+Building a second executor here to compare against would be step 93 written badly,
+and a differential between two implementations written in the same sitting catches
+less than the harness it needs anyway. So this builds the *harness* and points it
+at the two genuinely independent paths that exist:
+
+| | what it is | what a disagreement would mean |
+|---|---|---|
+| **bare** | `ReferenceInterpreter` against a flat byte array, stepped directly | — |
+| **machine** | `LazalithMachine` against a real `AddressSpace`, a `Bus`, a region table, a device and a clock | the bus, the address space, the region permissions or the clock disagree with the processor |
+
+The processor code is shared, so this cannot find a bug *in* the interpreter. Step
+93's differential will, once there are two. What it can find is a disagreement about
+anything the machine adds on top: an address translation, a data size, a permission,
+a fault classification, a clock.
+
+The step's list is addressed one item at a time, and where an item cannot be
+compared the reason is in the test:
+
+- **registers, PC, flags, memory** — compared on every step, plus a per-address
+  memory window so a store that lands in the wrong place is caught.
+- **devices** — the bare path has no devices, so a program that writes to one is
+  compared for its *permissions* on both paths and its *output* on the machine,
+  against the byte it stored. A console on one path and nothing on the other is not
+  a difference to report; it is the difference between a processor and a machine.
+- **virtual time** — the clock belongs to the machine and not the processor. A step
+  does not move it and the scheduler advances it by a quantum per process, so the
+  property is that it moves *only* when the driver moves it, which is what makes a
+  replay reproducible. A step-count property would have been wrong.
+- **process state** — not comparable here: a process is a kernel object, and a bare
+  processor has none. The kernel's process state is compared by step 96's
+  integration test and by `lazalith-os`'s own suites.
+
+### Two things the harness had to get right about the two paths
+
+- **The same memory permissions on both.** The flat array started with none, so a
+  program storing into the code region *succeeded* on the bare path and was refused
+  by the machine — a difference that is the region table working correctly. The flat
+  path now answers the same three questions the region table answers, over the same
+  regions, including the device window.
+- **The same notion of "where the program is".** The machine *enters a trap* and its
+  architectural `pc` becomes the trap vector; the bare processor *returns* a trap
+  request with the resume point in the outcome. Comparing the two `pc`s compares a
+  vector with a program counter. Both observers now report the **guest's** pc — the
+  trap event's `resume_pc` and the outcome's `resume_pc` — which is the thing a
+  program can observe.
+
+Their vocabularies for *why* also differ, and the comparison is on coarse categories
+rather than on a field-by-field translation: the bare processor has one `Width`
+cause for a divide by zero, an overflow and a misaligned displacement, and the
+machine splits it into four. Both are `width`.
+
+### The corpus
+
+Curated programs for what a random draw will not reach — a call and a return, a trap,
+a fault on unmapped memory, a store into a read-only region, a write to the device,
+and an arithmetic chain that sets and clears every flag — and *random* instruction
+sequences over step 84's fixed seed corpus for everything else. A random program
+that faults is compared too: a fault is an answer.
+
+The operand lists in the curated corpus are written out rather than generated. A
+corpus built by asking the format what it wants is a corpus of the *builder's*
+opinion rather than of a program somebody meant — and the first version of this file
+had `Addi` with two operands, which is not an instruction this ISA has.
 
 
 ## Earlier milestones

@@ -14,3 +14,6 @@ lazalith-types = { path = "../lazalith-types" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+lazalith-properties = { path = "../lazalith-properties" }

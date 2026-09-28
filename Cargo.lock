@@ -183,6 +183,7 @@ dependencies = [
  "lazalith-diagnostics",
  "lazalith-isa",
  "lazalith-memory",
+ "lazalith-properties",
  "lazalith-types",
 ]
 
