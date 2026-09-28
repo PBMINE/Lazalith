@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–94 complete and verified)
+Last updated: 2026-09-28 (Steps 1–95 complete and verified)
 
 ## Where the roadmap stands
 
@@ -42,6 +42,7 @@ Step  91      complete: expand LazOS
 Step  92      complete: expand Lazen
 Step  93      complete: optimization
 Step  94      complete: optional LLVM backend
+Step  95      complete: Nix integration
 ```
 
 The 1137 workspace tests all pass, including the 4 in
@@ -1357,6 +1358,80 @@ zero-dependency toolchain.
 A reader who assumed "add LLVM" meant "call LLVM from the codegen" now knows it means
 "decide what Lazalith's arithmetic means on a host whose arithmetic differs, express it
 twice, and prove the two expressions agree."
+
+1137 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
+
+## Step 95 — Nix integration
+
+All three commands work. What changed is that the coverage list is now *checkable* and
+that `nix build` produces something anybody can run.
+
+| check | covers | what it does |
+| --- | --- | --- |
+| `workspace` | Rust, emulator, OS, assembler, linker, Lazen, C compiler, SDL3, tests | builds every crate, runs the whole suite, and compiles the SDL3 crate's C probe |
+| `formatting` | style | `cargo fmt --all --check` in a clean sandbox, not the developer's checkout |
+| `clippy` | style | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+| `program` | Lazen, and the artifact | runs the *installed* `lazen` on two example programs |
+| `devShell` | the development environment | builds the dev shell |
+
+**`nix build` produced a package with no program in it.** That was the step's biggest
+actual defect: the install phase named eleven library crates and no executables, so
+the package contained rlibs that nothing outside a cargo workspace could use. A
+package with no program is a way of checking that a build succeeds, which
+`nix flake check` and `cargo build` between them already did. The install phase now
+discovers what to install — all 24 rlibs, every executable, `lazen` among them — and
+then *asserts* `lazen` exists, so a build that stopped producing the command fails
+with a sentence saying so instead of succeeding and shipping nothing. Discovering
+rather than listing is the same reasoning as the documentation filter below.
+
+**The documentation list can no longer be one short.** The source fileset listed
+thirty-odd `docs/*.md` paths by hand, and a hand-written list is a list that will be
+one document short the day somebody adds one — and it fails *silently*, because a
+document missing from the source tarball is not a build error, it is a document
+missing from a release. Every document added since was a chance to get it wrong. It
+is now a `cleanSourceWith` filter over the directory, and all 34 are found
+structurally: adding a document cannot be forgotten because there is nothing to add
+it to.
+
+**`program`: the system being used, not merely built.** Everything else in the flake
+builds the system; this check runs it. It formats both examples, type-checks both,
+reports the version, and asserts the binary it tested is the one this build produced
+rather than one that happened to be on `PATH` — because a check that silently tests
+some other build's `lazen` has stopped checking. `lazen check` on a real example is
+the only check that uses the installed artifact rather than the source tree, and it
+runs the lexer, parser, resolver, and type checker over a program that uses the
+standard library.
+
+**`devShell`: `nix develop` is verified by building it.** A dev shell that has quietly
+stopped building is the reproducibility failure nobody notices until somebody new
+clones the repository, and building it as a check is the only way it gets noticed on
+the day it breaks. It evaluates on both `x86_64-linux` and `aarch64-linux`.
+
+**Three bugs found while making the checks real**, each of which failed the *build*
+rather than a test, and each of which the next person would otherwise make: `[ -x ]`
+is true for a directory, so the install loop tried to install `release/build` and
+failed with coreutils' `install: omitting directory` — a confusing way to learn that a
+shell test needs `-f`; `"$out/bin/lazen"` inside `passthru` is the *literal string*
+`$out/bin/lazen`, because Nix does not substitute `$out` outside a derivation's own
+attribute set, so the check using it was handed a path that did not exist; and
+escaping `${...}` as `''${...}` in a `runCommand` script passes it to the shell, which
+then tries to expand a Nix attribute path as a shell variable. None would have been
+caught by `nix build` alone, because the first only appears with the new install phase
+and the other two only inside the new check. Adding a check that cannot pass is the
+only way to find out whether it can.
+
+`nix flake check` reports all checks passed on `x86_64-linux` and evaluates the dev
+shell for `aarch64-linux` as well. It prints a warning that `aarch64-linux` is
+incompatible on this machine and therefore omitted, and that warning is left in place
+rather than silenced by narrowing the system list to the one that happens to work
+here. The SDL3 frontend is covered in the *build* environment and not only the dev
+shell, because a package that builds in `nix develop` and not in `nix build` is broken
+for everyone who installs it.
+
+The honest limit: this step verifies the *system* is reproducible, not that a
+*program* is — which is step 96's job. A program that misbehaves on one machine and
+not another is not something a build sandbox can see, and pretending otherwise would
+be the wrong lesson to end a reproducibility step on.
 
 1137 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
