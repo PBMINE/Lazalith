@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–99 complete and verified)
+Last updated: 2026-09-28 (all 100 steps complete and verified)
 
 ## Where the roadmap stands
 
@@ -47,9 +47,10 @@ Step  96      complete: final integration test
 Step  97      complete: final graphics test
 Step  98      complete: final debugging test
 Step  99      complete: final architecture review
+Step 100      complete: the final project
 ```
 
-The 1171 workspace tests all pass, including the 4 in
+The 1176 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -1671,6 +1672,70 @@ reasoning written down in the function: a code generator may legitimately run wh
 generated in a test, and what it may not do is depend on the machine from its library.
 
 1171 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
+
+## Step 100 — the final project
+
+`docs/platform.md` is the step, and it is the first one that adds no feature: a finished
+project's honest boundary is part of finishing it. The claim the diagram makes is that three
+languages reach one machine, so that is what the step *tests*.
+
+**The one claim, in one test file.** `crates/lazalith-c-compiler/tests/platform.rs` is the
+only place where all three languages go through one path and are compared. The individual
+languages were already tested — `pipeline.rs` for Lazen, `end_to_end.rs` for C, the
+toolchain's assembler tests for assembly — but each in its own test file, in its own crate,
+against its own copy of the boot sequence. The claim is narrow and mechanical: the same
+program, in three languages, produces the same arithmetic, the same exit status and the same
+bytes through one object format, one linker, one loader and one machine. The program sums
+one through ten, *computed* rather than stated, so the number on screen and the status the
+process exits with are both the program's own arithmetic. The three paths are written out
+separately, with a comment saying why: the claim is that the paths coincide, and a test that
+shared the code between them would be asserting that they were the same code.
+
+**The assembly case found something.** The program is unrolled, and the reason is the ISA
+rather than the test: the instruction set has `BR`, `JMP` and `CALL`, and **no conditional
+branch**, so a hand-written loop cannot be written without a branch the architecture does
+not have. That is worth stating plainly rather than working around quietly, because it is
+the sharpest real difference between the three layers: the compilers have a conditional
+branch to give a program, so `while` costs a Lazen or C programmer nothing, and at the
+assembly layer the same loop is not expressible and the cost lands on whoever is writing. It
+is a gap in the ISA, not in the assembler — the assembler faithfully emits everything the
+ISA defines — and the next ISA revision is where it would be closed.
+
+**The entry sequence taught the file the return convention by being wrong first.** The
+startup does `CALL <entry>; MOV r1, r0`, so a program's result comes back in r0. The first
+version of the assembly program put the sum in r3 and exited 0, which demonstrates the
+convention better than a comment would have.
+
+**The layer table is not a hopeful caption.** Every row names the step-99 check that would
+fail if the boundary were crossed, so the diagram is backed by thirteen tests rather than
+by a drawing.
+
+**What the platform does today**, all exercised by a test: build and run Lazen, C and
+assembly to one executable format on one machine; a working OS with a loader, processes, a
+scheduler, a filesystem, a terminal, a display driver, an input driver and a timer; a
+capability system where a package may only make the syscalls it declared; a debugger that
+recovers file, line, column, instruction, guest PC, registers and stack from a runtime fault
+and keeps a guest fault apart from an emulator bug; graphics through the SDK and the OS
+with the pixels in the guest's own memory; deterministic emulation with a decode cache, a
+differential harness, replay and a fuzz target set; and a reproducible build whose dev shell
+is itself a check.
+
+**What it does not do**, each with the document that says what it would take: generics, a
+heap and a growing collection (the ABI has no allocation call); threads (step 91 built the
+per-thread state and deliberately not creation); networking and audio (no device, so no
+ABI); an LLVM backend (a second implementation of the semantics, and the project's premise
+is that it has no dependencies); a JIT (step 93 measured where the time goes, and it is not
+code quality); the display's frame address (step 97 recorded the evidence rather than
+working around it); and a window on a real display (SDL3 is not linked in tests, because
+every machine they run on is headless).
+
+**That is the roadmap's own instruction applied.** "Do not treat this document as a request
+to generate 100 steps of code immediately. Treat it as a state machine for development."
+Each of the hundred steps is implemented, tested, fixed and documented in
+`docs/project-state.md`, in the order the steps happened — and the last entry says what is
+missing, which is the state a state machine is in.
+
+1176 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
 
 ## Earlier milestones
