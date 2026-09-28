@@ -4,13 +4,14 @@
 //! the same kernel, because a `run` that took a shortcut a `test` did not would
 //! mean a program could pass its tests and fail when a person ran it.
 //!
-//! # Why the harness is here and not in the runtime
+//! # The run itself
 //!
-//! Running an image needs a machine, a supervisor kernel to hand off from, and a
-//! `LazalithKernel` to dispatch syscalls. The runtime crate builds and links
-//! images; it deliberately does not own a machine, because a library that
-//! started one would be a library with a global. So the harness lives in the
-//! tool, which is the only place that wants a process to exist and go away.
+//! The boot, the handoff, and the kernel loop live in `lazalith_runtime::run`.
+//! They used to live here, for the reason that the runtime crate "deliberately
+//! does not own a machine, because a library that started one would be a library
+//! with a global" — which was true, and which was the wrong reason: a function
+//! that *returns* a machine owns nothing global, and moving it put the one code
+//! path in the project that boots a compiled program under a test.
 //!
 //! # The step budget
 //!
@@ -22,25 +23,9 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use lazalith_boot::{BootImage, KERNEL_LOAD_ADDRESS};
-use lazalith_cpu::Privilege;
 use lazalith_devices::{DeviceManager, NoDevice};
-use lazalith_isa::{Instruction, Opcode, encode};
-use lazalith_os::{
-    KernelError, KernelServiceOutcome, LazalithKernel, LzxImage, ProcessId, ProcessState,
-    SchedulerError, ThreadId, VirtualFileSystem, VirtualTerminal,
-};
-use lazalith_types::{ArchitectureConfig, InstructionAddress};
 
 use crate::{CliError, Outcome, architecture_for, build_options, one_file, read_source};
-
-/// How many instructions a program may retire before it is called a runaway.
-///
-/// A single `print` is a few thousand. The largest program in the test suite
-/// prints three digits it computed itself, which is well under a hundred
-/// thousand. Five million is therefore several orders of magnitude above anything
-/// that works and far below "waited too long".
-const STEP_BUDGET: u64 = 5_000_000;
 
 /// What a finished run produced.
 struct Finished {
@@ -269,6 +254,10 @@ fn run_test(source: &str, path: &Path, test: &str, helpers: &str) -> Result<(), 
 }
 
 /// Builds a program and runs it to completion under LazOS.
+///
+/// The run itself is the runtime's, so that `lazen run` and the step-96
+/// integration test boot a program the *same* way. Two copies of this sequence
+/// would drift, and the one that drifted would be the one nobody tested.
 fn execute(source: &str, path: &Path) -> Result<Finished, CliError> {
     let architecture = architecture_for(path);
     let options = build_options(path);
@@ -277,133 +266,11 @@ fn execute(source: &str, path: &Path) -> Result<Finished, CliError> {
     let bytes = program
         .to_image_bytes()
         .map_err(|error| CliError::Refused(error.to_string()))?;
-    // The image is read back from its own bytes, not used as the in-memory image
-    // it was built as. A `.lzx` is a file format with its own reader, and a run
-    // that skipped the reader would not be the run a user's image gets.
-    let image =
-        LzxImage::from_bytes(&bytes).map_err(|error| CliError::Refused(error.to_string()))?;
-    let (exit_code, output) = boot_and_run(image, architecture)?;
-    Ok(Finished { exit_code, output })
-}
-
-/// Boots a machine, hands off to the kernel, and runs `image` to completion.
-fn boot_and_run(
-    image: LzxImage,
-    architecture: ArchitectureConfig,
-) -> Result<(u32, Vec<u8>), CliError> {
-    let kernel_bytes = supervisor_kernel(architecture);
-    let boot_image = BootImage::new(architecture, kernel_bytes, 0)
-        .map_err(|error| CliError::Refused(error.to_string()))?;
-    let mut machine = boot_image
-        .start(DeviceManager::<NoDevice>::new())
-        .map_err(|error| CliError::Refused(error.to_string()))?;
-    machine
-        .set_trap_vector(InstructionAddress::new(KERNEL_LOAD_ADDRESS + 8))
-        .map_err(|error| CliError::Refused(error.to_string()))?;
-    if machine.architectural_state().privilege() != Privilege::Supervisor {
-        return Err(CliError::Refused(
-            "the machine did not start in supervisor mode".into(),
-        ));
-    }
-    // The supervisor kernel's `RFE` is what drops to user privilege. Stepping it
-    // here rather than letting the first program step do it keeps the handoff
-    // explicit: a program is never given the chance to run before the machine has
-    // left supervisor mode.
-    machine
-        .step()
-        .map_err(|error| CliError::Refused(error.to_string()))?;
-
-    let mut kernel = LazalithKernel::new(
-        STEP_BUDGET,
-        VirtualTerminal::new(b"").expect("a terminal over an empty byte string"),
-        VirtualFileSystem::with_defaults().map_err(|error| CliError::Refused(error.to_string()))?,
-    )
-    .map_err(|error| CliError::Refused(error.to_string()))?;
-    // One and one: a single-threaded program, which is all Lazen v1 can be.
-    // Zero is not a usable identifier because the ids are `NonZeroU32`, so this
-    // cannot be a silently wrong value.
-    let process_id = ProcessId::new(1).expect("one is a valid process id");
-    let thread_id = ThreadId::new(1).expect("one is a valid thread id");
-    kernel
-        .start_image(image, process_id, thread_id)
-        .map_err(|error| CliError::Refused(error.to_string()))?;
-
-    let mut exit_code = None;
-    for _ in 0..STEP_BUDGET {
-        // A program that has exited leaves nothing to step. That is the normal end
-        // of a run, not a failure, so it ends the loop — the status was recorded on
-        // the step before. A scheduler that says so with *nothing* exited is a real
-        // problem and falls through to the error below.
-        let step = match kernel.step(&mut machine) {
-            Ok(step) => step,
-            Err(KernelError::Scheduler(SchedulerError::NoRunnableProcess))
-                if exit_code.is_some() =>
-            {
-                break;
-            }
-            Err(error) => return Err(CliError::Refused(error.to_string())),
-        };
-        match step.outcome {
-            Some(KernelServiceOutcome::Exit(code)) => {
-                exit_code = Some(code);
-                break;
-            }
-            Some(KernelServiceOutcome::Fault(error)) => {
-                return Err(CliError::Refused(format!("the program faulted: {error:?}")));
-            }
-            // A guest trap is the program's own `TRAP` — a bounds check, a
-            // runtime check, an explicit trap. `lazen run` has no debugger to
-            // show it in, so it reports the trap rather than running on: the
-            // alternative is the program spinning in a trap frame until the step
-            // budget ran out and being reported as "did not finish", which says
-            // nothing about why.
-            Some(KernelServiceOutcome::GuestTrap { cause, payload }) => {
-                return Err(CliError::Refused(format!(
-                    "the program trapped ({cause:?}, payload {payload}) at {:#x}",
-                    machine.architectural_state().pc().as_u64()
-                )));
-            }
-            Some(KernelServiceOutcome::Return(_)) | None => {}
-        }
-    }
-    let exit_code = exit_code.ok_or_else(|| {
-        CliError::Refused(format!(
-            "the program did not finish in {STEP_BUDGET} instructions"
-        ))
-    })?;
-    // The process's own record is checked as well as the exit code, because a
-    // status that reached the caller but left the process marked running would
-    // mean the kernel and the exit path disagree.
-    let process = kernel
-        .scheduler()
-        .process(process_id)
-        .ok_or_else(|| CliError::Refused("the process is no longer known".into()))?;
-    if process.state() != ProcessState::Exited {
-        return Err(CliError::Refused(format!(
-            "the program reported status {exit_code} but is still {:?}",
-            process.state()
-        )));
-    }
-    let output = kernel.terminal().terminal().output().to_vec();
-    Ok((exit_code, output))
-}
-
-/// A two-instruction supervisor kernel: a `NOP` and the `RFE` that hands off.
-///
-/// The kernel is one instruction longer than the trap vector it shares an address
-/// with, which is why the trap vector is set to the load address plus eight.
-fn supervisor_kernel(architecture: ArchitectureConfig) -> Vec<u8> {
-    [
-        encode(
-            architecture,
-            &Instruction::new(architecture, Opcode::Nop, &[]).expect("a NOP encodes"),
-        )
-        .expect("the NOP encodes"),
-        encode(
-            architecture,
-            &Instruction::new(architecture, Opcode::Rfe, &[]).expect("an RFE encodes"),
-        )
-        .expect("the RFE encodes"),
-    ]
-    .concat()
+    let finished =
+        lazalith_runtime::run_image_with(&bytes, architecture, DeviceManager::<NoDevice>::new())
+            .map_err(|error| CliError::Refused(error.to_string()))?;
+    Ok(Finished {
+        exit_code: finished.exit_code,
+        output: finished.output,
+    })
 }

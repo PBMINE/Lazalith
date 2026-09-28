@@ -39,9 +39,14 @@
 
 extern crate alloc;
 
+mod run;
 mod source;
 mod startup;
 
+pub use run::{
+    Finished, RunError, STEP_BUDGET, architecture_for, boot, run_image, run_image_on,
+    run_image_with, run_loaded, supervisor_kernel,
+};
 pub use source::PRELUDE;
 pub use startup::{
     ENTRY_SYMBOL, StartupError, startup_object, startup_object_for, startup_source,

@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–95 complete and verified)
+Last updated: 2026-09-28 (Steps 1–96 complete and verified)
 
 ## Where the roadmap stands
 
@@ -43,9 +43,10 @@ Step  92      complete: expand Lazen
 Step  93      complete: optimization
 Step  94      complete: optional LLVM backend
 Step  95      complete: Nix integration
+Step  96      complete: final integration test
 ```
 
-The 1137 workspace tests all pass, including the 4 in
+The 1144 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -1434,6 +1435,66 @@ not another is not something a build sandbox can see, and pretending otherwise w
 be the wrong lesson to end a reproducibility step on.
 
 1137 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
+
+## Step 96 — the final integration test
+
+`crates/lazalith-runtime/tests/pipeline.rs` walks the whole chain — Lazen source,
+compiler, object, linker, `.lzx`, loader, process, syscalls, virtual hardware,
+emulator — in seven tests that assert something at each arrow rather than only at the
+end. A test that checked only the final output would pass for a program that got
+there by accident: with the wrong exit code, or without ever reading its image back
+from the file format, or with a syscall count of zero, which would mean the console
+output came from somewhere other than the kernel.
+
+**The boot-and-run path had no test under it.** The sequence that boots a machine,
+hands off from the supervisor kernel, drives the kernel loop, and reports output and
+status lived in the `lazen` command — defended in a comment saying the runtime crate
+"deliberately does not own a machine, because a library that started one would be a
+library with a global". The first half of that is right. The second is a
+non-argument: the function *returns* the machine, so it owns no global, and "a
+library with a global" describes a design that was never the one in question. The
+consequence was concrete — **the one code path in the project that boots a compiled
+program had no test under it**, because the only way to reach it was to build the
+binary and run it as a subprocess. Every other layer had hundreds of tests; the layer
+where all of them meet was covered by a shell invocation. It moved to
+`lazalith_runtime::run`, with the step budget, and both `lazen run` and the new test
+call it.
+
+**The syscall count was being inferred from an event that no longer existed.** The
+first implementation counted `MachineEvent::Trapped` in the step the kernel returns,
+and a program printing two lines reported one trap. The reason is the kernel's own
+design and it is correct: `LazalithKernel::step` *replaces* the step that trapped
+with the step that returned from the syscall, so the trap event has been consumed by
+the time the step is handed back. The runner was counting something the kernel had
+already overwritten. The count is now what the kernel reports — a dispatched syscall
+comes back as `Return`, the last one as `Exit` — which is a better measure anyway, since
+a trap count would also have counted a guest's `TRAP`, which is not a syscall and which
+the kernel deliberately reports under a different name.
+
+The two tests worth expanding are the ones a weaker suite would skip. The runner takes
+*bytes*, not a decoded image, and decodes them with the same reader a person's `.lzx`
+gets — a run that used the in-memory image it was built as would skip the serialiser,
+and a wrong serialiser would pass right up to the day somebody built a program and ran
+it. The test goes further, re-serialises the decoded image and runs that too, requiring
+the same answer, so the reader cannot be the only thing being trusted. And
+`a_program_computes_its_own_output_rather_than_repeating_a_literal` runs a loop that
+sums one through ten, prints `55`, and returns 55: Lazen's `while`, the type checker's
+arithmetic rules, the lowerer's comparison and branch, the code generator's encoding of
+both, the emulator's execution of them, and the syscall that puts the result on a
+console, with every stage load-bearing for the number on screen.
+
+Not covered, and not pretended to be: the C half of step 94's two-frontends diagram
+(the C front end has its own end-to-end tests and converges on the same object
+format, but no single test runs a C program and a Lazen program under one kernel);
+`.lza` packages, since this runs a bare `.lzx` which is the *trusted* half of step 91's
+design; and performance, because `Finished` reports an instruction count and nothing
+asserts anything about it — step 93 measured throughput in an example for exactly this
+reason, and a number in a test is a number that fails on a busy machine.
+
+`lazen run` and `lazen test` still work through the shared runner, which the CLI's own
+36 unchanged tests confirm.
+
+1144 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
 
 ## Earlier milestones
