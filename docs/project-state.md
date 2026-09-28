@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-29 (hardening: 7 clusters audited, 7 confirmed defects, 1240 tests)
+Last updated: 2026-09-29 (hardening: 8 clusters audited, 8 confirmed defects, 1247 tests)
 
 ## Where the roadmap stands
 
@@ -1743,12 +1743,14 @@ missing, which is the state a state machine is in.
 # HARDENING PHASE
 
 The first 100 steps are complete. This phase is an adversarial audit, and its record
-is `docs/hardening.md`. Seven clusters are done and **seven confirmed defects** have
-been found, all of them in the C frontend and all of them the kind a green suite
-cannot see: a program using `unsigned int` ran and produced wrong answers, every
-`unsigned long` constant panicked the compiler, and one silently became zero.
+is `docs/hardening.md`. Eight clusters are done and **eight confirmed defects** have
+been found: seven in the C frontend, all the kind a green suite cannot see — a program
+using `unsigned int` ran and produced wrong answers, every `unsigned long` constant
+panicked the compiler, and one silently became zero — and one in the runtime, which is
+the graphics defect `docs/graphics-test.md` had recorded with a reproduction and a
+*wrong theory* for a whole cluster.
 
-Fifteen *test* defects were found alongside them, which is the phase's more
+Eighteen *test* defects were found alongside them, which is the phase.s more
 interesting result: on this platform the implementation has been more reliable than
 the tests describing it.
 
@@ -1825,7 +1827,7 @@ against itself and against the shared backend, and never against C.
 
 1189 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
-## H4, H2, H6, H12 — clean; H2 again — three more confirmed defects
+## H4, H2, H6, H12 — clean; H2 and H10 again — four more confirmed defects
 
 `docs/hardening.md` has the full record. In summary:
 
@@ -1864,7 +1866,31 @@ behaviours it compared, a baseline taken before a legitimate write, and one asse
 demanding a checksum the object format was never going to have. Deriving an expected
 value in the test rather than writing it down is now a stated convention.
 
-1240 tests pass, and fmt, strict Clippy, check, `nix flake check` and `nix build` are
+## H10 — graphics: the recorded defect, resolved
+
+`docs/graphics-test.md` had recorded an open defect with a reproduction and two
+hypotheses: a program drew correctly, and the address the display device recorded was
+not the address the program.s framebuffer occupied. Both hypotheses were wrong. The
+address was correct at every layer, and the runner was reading the right address in
+the wrong memory.
+
+A process.s memory lives in the machine only while the process is resident —
+`activate_user_context` swaps the process.s regions in and the machine.s own out, and
+`release_user_context` swaps them back. `run_loaded` read the presented frame through
+the machine *after* the release, by which point the machine held a freshly zeroed set
+of user regions belonging to no process. The fix reads the pixels from the *process.s*
+address space, where a dead process.s memory still lives, and the host now returns the
+exact bytes the program drew.
+
+That is the assertion step 97 said it could not make honestly. It can now, and
+`crates/lazalith-runtime/tests/hardening_graphics_address.rs` makes it.
+
+The lesson is worth stating on its own: the defect was not hidden by a missing test.
+It was *documented*, with evidence and a theory, and the theory was what kept it
+alive. Asking "which of these two addresses is right" could not have found it; asking
+"read the bytes through each and see which holds the picture" did, immediately.
+
+1247 tests pass, and fmt, strict Clippy, check, `nix flake check` and `nix build` are
 green. `lazalith-c-runtime` and `lazalith-runtime` are dev-dependencies of
 `lazalith-c-compiler`, as they should be; they were briefly regular dependencies when
 the cross-frontend test was written.

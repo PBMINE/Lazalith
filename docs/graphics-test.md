@@ -12,7 +12,13 @@ through the Lazen SDK, LazOS, the virtual devices, and SDL3.
 records the one thing it could not do honestly, with the evidence — because that
 thing is more useful than a passing test would have been.
 
-## The defect: the device's framebuffer address is not the program's
+## RESOLVED — the defect was in the runner, not in the drawing path
+
+> **This defect is fixed.** The investigation below is kept because it is the record
+> of how it was found and because its conclusion was wrong in an instructive way.
+> See "What the defect actually was" at the end of this section.
+
+## The defect: the device.s framebuffer address is not the program.s
 
 The first version of this test asserted the *pixels*: after a program drew a white
 block on a black window, the test read the framebuffer back out of the machine and
@@ -47,11 +53,45 @@ the program's framebuffer lives, and the address varies between runs of an
 identical program. The drawing itself is correct, and the device's *record*
 (geometry, present count) is correct.
 
-**What is not established:** which of the two is wrong. The candidates are the
-compiler handing the SDK a view onto a frame slot rather than onto the array, or
-the SDK passing a different `as_mut_slice()` result to `display_open` than the one
-the program itself uses. Both are consistent with the evidence, and separating them
-needs a lower-level test than this step has budget for.
+**What is not established (and turned out to be the wrong question):** which of the two
+is wrong. The candidates considered were the compiler handing the SDK a view onto a
+frame slot rather than onto the array, or the SDK passing a different
+`as_mut_slice()` result to `display_open` than the one the program itself uses. Both
+are consistent with the evidence. Neither is what was happening, and separating them
+did need a lower-level test — just not the one either of these hypotheses implied.
+
+### What the defect actually was
+
+None of the above. The address was correct at every layer, and the test was reading
+the right address in the wrong memory.
+
+A process.s memory lives in the machine only while the process is resident.
+`activate_user_context` swaps the process.s regions *in* and the machine.s own user
+regions *out*; `release_user_context` swaps them back. `run_loaded` read the presented
+frame through the machine *after* the scheduler had released the process — at which
+point the machine held a different, freshly zeroed set of user regions at the same
+addresses, belonging to no process.
+
+So the reader was correct about the address and correct about the machine, and wrong
+about which of the two owned the picture. Instrumenting the release shows it exactly:
+
+```text
+BEFORE release 0x40ea08=[255, 0, 0, 0, 255, 0, 0, 0]   <- the pixels, in the machine
+AFTER  release 0x40ea08=[0, 0, 0, 0, 0, 0, 0, 0]        <- zeros, in a different stack
+process address space now holds the three user regions   <- including the drawn one
+```
+
+This also explains the two facts that made the evidence look so strange. The
+address "varied between runs" because the stack layout is not fixed. The recorded
+address "read back as zeroes" because it was no longer the frame.s address by the
+time anything read it.
+
+**The fix** is one line of ownership: the runner reads the pixels from the *process.s*
+address space, which is where a dead process.s memory still lives, rather than from
+the machine, which by then holds somebody else.s. `docs/hardening.md` records this as
+defect 8, and `crates/lazalith-runtime/tests/hardening_graphics_address.rs` asserts
+the pixels directly — the assertion step 97 said it could not make honestly, and now
+can.
 
 ## What the API does about it
 
@@ -64,10 +104,13 @@ deliberate:
 ```
 
 A host-side read that fails is reported as "there was a frame and I could not read
-it" rather than as a page of zeroes. Those are different facts, and in this build
-they are genuinely different: a frame of zeroes is exactly what a program which
-drew nothing would produce, so returning zeroes for a read that did not happen would
-make the failure invisible to the very test written to catch it.
+it" rather than as a page of zeroes. Those are different facts, and they were
+genuinely different *while the bug above was live*: a frame of zeroes is exactly what
+a program which drew nothing would produce, so returning zeroes for a read that did
+not happen would have made the failure invisible to the very test written to catch
+it — which is what happened, and is why the bug survived a passing suite. The `None`
+case is kept because the two answers are still different, and now that the read is
+done in the right memory they are distinguishable.
 
 ## What the tests do assert
 
@@ -117,7 +160,7 @@ rather say that than imply otherwise.
 ## The one-line summary
 
 The drawing path, the display syscall path, the input path, and the response to
-input are all demonstrated end to end from real Lazen source. The address the
-display device records does not match the address the program's framebuffer lives
-at, and that is recorded here as an open defect with a reproduction rather than
-worked around in a test.
+input are all demonstrated end to end from real Lazen source, and the host now reads
+back the exact pixels the program drew. The defect this document recorded is fixed and
+resolved above: it was the runner reading a dead process.s frame through a machine
+that no longer owned it.

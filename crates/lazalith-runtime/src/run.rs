@@ -404,7 +404,7 @@ pub fn run_loaded_seeded<D: Device>(
         output: kernel.terminal().terminal().output().to_vec(),
         instructions,
         syscalls,
-        presented: presented(&kernel, &machine),
+        presented: presented(&kernel, process),
         input_delivered: kernel.input().delivered(),
     })
 }
@@ -415,10 +415,23 @@ pub fn run_loaded_seeded<D: Device>(
 /// test that got an address would have to reach back into a machine that has been
 /// dropped, and a caller that got the bytes cannot accidentally read them from
 /// somewhere that is no longer the machine the program drew in.
-fn presented<D: Device>(
-    kernel: &LazalithKernel,
-    machine: &LazalithMachine<D>,
-) -> Option<Presented> {
+///
+/// The pixels are read from the **process's** address space, and that is the whole
+/// fix for the defect `docs/graphics-test.md` records. A process's memory lives in
+/// the machine only while the process is resident: `activate_user_context` swaps the
+/// process's regions in and the machine's own user regions out, and
+/// `release_user_context` swaps them back. By the time a run has finished and the
+/// scheduler has released the process, the machine holds a *different* set of user
+/// regions at the same addresses — freshly zeroed ones that belong to no process.
+///
+/// So reading through the machine after the fact did not read the frame; it read
+/// zeroes from somebody else's stack. The device's record was right all along, the
+/// SDK was right, and the ABI was right: the address they all agreed on was correct,
+/// and the runner was looking at memory that no longer held the picture. That is
+/// also why the address appeared to vary between runs and why the recorded address
+/// read back as zeroes — both are what "the frame is somewhere else now" looks like
+/// from the outside.
+fn presented(kernel: &LazalithKernel, process: &lazalith_os::Process) -> Option<Presented> {
     let frame = kernel.display().device().presented()?;
     let length = frame
         .width
@@ -429,8 +442,10 @@ fn presented<D: Device>(
     // A read that fails is reported as no pixels rather than as an empty frame: the
     // caller asked about a frame, and "there was a frame and I could not read it"
     // is a different answer from "there was no frame".
-    let pixels = machine
-        .peek_memory(
+    let pixels = process
+        .memory()
+        .address_space()
+        .peek(
             lazalith_types::PhysicalAddress::new(frame.address),
             &mut pixels,
         )

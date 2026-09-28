@@ -278,6 +278,66 @@ reserved or sliced.
 
 ---
 
+## H10 — graphics: the recorded defect, resolved
+
+**New test:** `crates/lazalith-runtime/tests/hardening_graphics_address.rs`.
+
+`docs/graphics-test.md` recorded an open defect: a program drew correctly, and the
+address the display device recorded was a *different* address from the one the
+program.s own framebuffer occupied. The document could not say which of the two was
+wrong, and listed two candidates — the compiler handing the SDK a view onto a frame
+slot, or the SDK passing a different slice to `display_open` than the program uses.
+
+**Both candidates were wrong, and the recorded evidence was right.**
+
+### Defect 8 — the runner read a dead process.s frame through a machine that no longer owned it
+
+A process.s memory lives in the machine only while the process is resident.
+`activate_user_context` swaps the process.s regions in and the machine.s own user
+regions out; `release_user_context` swaps them back. `run_loaded` read the presented
+frame through the machine *after* the scheduler had released the process.
+
+Instrumenting the release shows it exactly:
+
+```text
+BEFORE release 0x40ea08=[255, 0, 0, 0, 255, 0, 0, 0]   <- the pixels, in the machine
+AFTER  release 0x40ea08=[0, 0, 0, 0, 0, 0, 0, 0]        <- zeros, in a different stack
+process address space now holds the three user regions   <- including the drawn one
+```
+
+The reader was right about the address and right about the machine, and wrong about
+which of the two owned the picture. The device.s record, the SDK and the ABI were all
+correct at every layer.
+
+This also explains the two facts that made the original evidence look so strange. The
+address "varied between runs" because the stack layout is not fixed. The recorded
+address "read back as zeroes" because by the time anything read it, it was no longer
+the frame.s address.
+
+**Fix:** read the pixels from the *process.s* address space, which is where a dead
+process.s memory still lives, rather than from the machine, which by then holds
+somebody else.s. The host now returns the exact bytes the program drew, which is the
+assertion step 97 said it could not make honestly.
+
+The first five tests in the file are the ones that separate the recorded hypotheses,
+all of which pass: a view of an array and a view of that view are at the same
+address; a `&mut [u8]` keeps its address across a call; the SDK hands the ABI the
+caller.s address; a second open reports the second buffer.s address; and a buffer
+written through the ABI is the buffer the program reads.
+
+Two test defects were found here, and both would have sent the investigation in the
+wrong direction:
+
+- The probe used `0o777` for an octal literal. C has no `0o` prefix; Lazen neither.
+  The frontend was right to reject it.
+- The first printer printed the buffer.s leading zeroes, because `write_u64` fills
+  from the *end* of the buffer backwards and returns only a count. For a few minutes
+  that looked like the platform returning null addresses. The file now has its own
+  unsigned printer, and the assertion about channel order went the same way: the
+  first draft assumed the alpha byte was last, and the format is ARGB.
+
+---
+
 ## H2 again — the C frontend: integer constants
 
 **New tests:** `crates/lazalith-c-compiler/tests/hardening_c_types.rs` and
@@ -373,16 +433,23 @@ Three more test defects here, all of the same family as H2's and H4's:
 
 | | before | after |
 | --- | --- | --- |
-| tests | 1176 | 1240 |
-| confirmed defects | — | 7 (all in the C frontend: 4 wrong-answer, 1 crash, 1 silent-zero, 1 false diagnostic) |
-| test defects found and fixed | — | 15 |
-| clusters audited | — | 7 (H2 twice, H4, H5, H6, H9, H12) |
-| new tests | — | 64 |
+| tests | 1176 | 1247 |
+| confirmed defects | — | 8 (7 in the C frontend; 1 in the runtime, the recorded graphics defect) |
+| test defects found and fixed | — | 18 |
+| clusters audited | — | 8 (H2 twice, H4, H5, H6, H9, H10, H12) |
+| new tests | — | 71 |
 
-Every confirmed defect is in the C frontend, and every one was found by a
+Seven of the eight confirmed defects are in the C frontend, and all seven were found by a
 *differential* or *property* test rather than by reading code. Nothing in the suite
 had ever asked the C frontend to agree with C, and nothing had asked a constant to
 be worth anything.
+
+The eighth was the exception that proves the rule. It was not hidden by a missing
+test at all — it was a defect **recorded in this repository, with a reproduction and a
+theory**, for a whole cluster, and the theory was wrong. The reader was right about
+the address and wrong about which memory owned it. What finally found it was asking a
+question step 97.s investigation had not: not "which of these two addresses is right"
+but "read the bytes through each of them and see which one holds the picture".
 
 The ratio is the phase's main result so far, and it is worth stating plainly rather
 than leaving to be inferred: on this platform the **implementation has been more
