@@ -6,6 +6,7 @@ mod assembler;
 mod disassembler;
 mod linker;
 mod lzo;
+mod manifest;
 mod object;
 
 pub use assembler::{AssemblyError, assemble, assemble_named};
@@ -14,6 +15,10 @@ pub use disassembler::{
     disassemble_one,
 };
 pub use linker::{LinkError, LinkOptions, LinkedProgram, link_objects};
+pub use manifest::{
+    Architecture, MANIFEST_NAME, Manifest, ManifestError, ResolveError, Resolved,
+    ResolvedDependency, Resolver, VersionRequirement,
+};
 pub use object::{
     CodeMapping, DebugSource, DebugSourceIndex, OBJECT_DEBUG_MAPPING_ENTRY_SIZE,
     OBJECT_DEBUG_SOURCE_ENTRY_SIZE, OBJECT_FORMAT_VERSION, OBJECT_HEADER_SIZE, OBJECT_ISA_VERSION,

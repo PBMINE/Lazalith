@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–88 complete and verified)
+Last updated: 2026-09-28 (Steps 1–89 complete and verified)
 
 ## Where the roadmap stands
 
@@ -36,9 +36,10 @@ Step  85      complete: differential testing
 Step  86      complete: fuzzing
 Step  87      complete: deterministic replay
 Step  88      complete: application packaging design
+Step  89      complete: Lazen package management
 ```
 
-The 1023 workspace tests all pass, including the 4 in
+The 1057 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -858,6 +859,72 @@ the only way into the scheduler is an image (the first driver), and the size
 contradiction still points where the design says it does. A test for "this does not
 exist" is a comment, so the missing path→image step is recorded as a gap rather than
 asserted.
+
+## Step 89 — Lazen package management
+
+Local package and dependency support, kept small, with no registry. Four things, each
+one a promise rather than a feature.
+
+**The container** (`crates/lazalith-os/src/lza.rs`) is step 88's design in code: a
+header, a resource table, the resource names, the application's name, the manifest
+verbatim, one complete `.lzx`, and the resource bytes. Every offset is *derived* from
+the counts and the lengths, and a reader that finds a disagreement refuses rather
+than tolerates — the property step 86's fuzzer earned the hard way, in the object
+format, and it is the first test in `packages.rs` that touches it.
+
+**The resolution rule** (`crates/lazalith-os/src/resolve.rs`) closes step 88's first
+driver. `SpawnProcess` names a path; `resolve` turns the bytes at that path into
+either a package or an image, **deciding by content and never by name**. Three reasons
+for that, each about something that already exists: `FileMetadata` has no
+"executable" flag, a user can rename a file, and deciding by name would make `install`
+a naming convention and `run` a privilege question. The property that matters is that
+a package and a bare executable are interchangeable to everything downstream —
+`Resolved::into_image` is the whole of what a caller needs.
+
+**The manifest reader** (`crates/lazalith-toolchain/src/manifest.rs`) is deliberately
+not a TOML parser. This repository has no third-party dependencies and a TOML parser
+is not a side effect of a package step, so it reads exactly the four tables
+`docs/lazen-applications.md` specifies and **refuses everything else** — a table
+array is an error with a line number, not a best-effort reading. That is a real
+limitation and the right one: a format this reader accepts and another tool also
+accepts is worth more than one it half-implements.
+
+**The resolver** takes a list of `name -> manifest text` pairs and no filesystem, so
+the directory walking stays in the CLI and the interesting questions — which version
+wins, what a cycle reports, whether a missing dependency says where it looked — are
+answerable without a disk. A requirement is a floor *inside one minor series*: `0.1`
+means `>=0.1.0, <0.2.0` and never admits `1.0.0`, because a resolver that let it
+through would silently resolve across an incompatible change, which is the one thing
+a version number exists to prevent. A missing dependency is an error listing every
+directory searched, and a cycle is reported as the path `hello -> a -> b -> a`, which
+is what `docs/lazen-modules.md` asks for.
+
+Two commands: `lazen pack` writes `NAME.lza` next to the manifest, and `lazen deps`
+prints the resolution or the reason there is not one. `pack` refuses a manifest that
+pins a word width its image does not have rather than producing a package that lies
+about the only thing it describes. There is no `install`: where a package lands is
+the system's decision, and step 88's design says a file recording where it goes has
+to be rewritten on every move.
+
+### Bugs found while building it
+
+Three, all in code written for this step and all found by the tests for it:
+
+- **`VersionRequirement::accepts` admitted a different major.** `0.1` accepted
+  `1.0.0`, which is precisely the failure a version number exists to prevent. Now a
+  requirement never leaves its major.
+- **`LzaResource` carried file offsets.** A package built in memory therefore could
+  never equal the same package read back, because the built one had no offsets and
+  the read one did. Offsets are now decode-time values in a private row type, and a
+  resource's identity is its name and how much it contributes.
+- **A resource the manifest did not declare was reported as a duplicate.** Two
+  different mistakes, one error. The table is now reconciled against the manifest
+  name by name, and the error says which one it was.
+
+`lazalith-fuzz` grew an eleventh target for the package reader, since step 86's
+harness is exactly the right tool for a new container. 60,000 inputs on it alone and
+30,000 across all eleven are clean. 1057 tests pass, and fmt, Clippy, check,
+`nix flake check` and `nix build` are green.
 
 
 ## Earlier milestones

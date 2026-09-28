@@ -206,6 +206,54 @@ pub fn executable_loader(input: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Bytes read as a Lazen application package.
+///
+/// The strongest round trip in this file, and the one that pays for step 86's
+/// property. A package that reads must re-write to a package that reads to the *same*
+/// package, and then re-write to the same bytes again — one pass reaches a fixed
+/// point. That is what a packer needs (packing twice gives one file) and it is what a
+/// reader tolerating a non-canonical offset would fail, which is exactly the bug
+/// step 86 found in the object format.
+///
+/// The contained executable is the `.lzx` reader's business, and it is the one thing
+/// the package must not have an opinion about: if the package's own view of its image
+/// ever disagreed with the image reader, the design's rule 1 would be a claim rather
+/// than a fact.
+pub fn package_reader(input: &[u8]) -> Result<(), String> {
+    let Ok(package) = lazalith_os::LzaPackage::from_bytes(input) else {
+        return Ok(());
+    };
+    let bytes = package
+        .to_bytes()
+        .map_err(|error| format!("a package that read would not write: {error}"))?;
+    let again = lazalith_os::LzaPackage::from_bytes(&bytes)
+        .map_err(|error| format!("the re-encoding would not read back: {error}"))?;
+    if again != package {
+        return Err(String::from(
+            "a package read, re-written and read again came out different",
+        ));
+    }
+    let third = again
+        .to_bytes()
+        .map_err(|error| format!("a package read back would not write: {error}"))?;
+    if third != bytes {
+        return Err(format!(
+            "writing a package twice gave {} bytes then {}",
+            bytes.len(),
+            third.len()
+        ));
+    }
+    let image = package
+        .image()
+        .map_err(|error| format!("a package that read holds an unusable image: {error}"))?;
+    if lazalith_os::LzxImage::from_bytes(&package.image).ok() != Some(image) {
+        return Err(String::from(
+            "a package's image reader disagrees with the image reader",
+        ));
+    }
+    Ok(())
+}
+
 /// Bytes loaded as a kernel image.
 pub fn kernel_loader(input: &[u8]) -> Result<(), String> {
     use lazalith_types::PhysicalAddress;
@@ -607,6 +655,26 @@ fn seed_image() -> Result<lazalith_os::LzxImage, lazalith_os::LzxError> {
     )
 }
 
+/// A whole valid package, which the package-reader target needs as a seed.
+///
+/// Built with a manifest that declares a resource, so the fuzzer's mutations land in
+/// the resource table and not only in the header — the table is where the offsets
+/// are, and the offsets are where a reader goes wrong.
+fn seed_package() -> Result<lazalith_os::LzaPackage, lazalith_os::LzaError> {
+    lazalith_os::LzaPackage::new(
+        b"hello",
+        lazalith_os::PackageVersion::new(1, 2, 3),
+        lazalith_os::LzxArchitecture::Lz64,
+        b"[application]\nname = \"hello\"\nversion = \"1.2.3\"\nentry = \"m.lz\"\narchitecture = \"any\"\n\n[resources]\nlogo = \"a.rgb\"\nsound = \"b.wav\"\n",
+        &seed_image()
+            .map_or_else(|_| Vec::new(), |image| image.to_bytes().unwrap_or_default()),
+        &[
+            lazalith_os::LzaResource::label(b"logo"),
+            lazalith_os::LzaResource::label(b"sound"),
+        ],
+    )
+}
+
 /// A hand-written seed per target.
 ///
 /// Each one is a *valid* input of the shape the target expects, because a fuzzer
@@ -654,6 +722,8 @@ fn structural_seed(name: &str) -> Vec<u8> {
         .map_or_else(|_| Vec::new(), |object| object.to_bytes().unwrap_or_default()),
         "executable loader" => seed_image()
             .map_or_else(|_| Vec::new(), |image| image.to_bytes().unwrap_or_default()),
+        "package reader" => seed_package()
+            .map_or_else(|_| Vec::new(), |package| package.to_bytes().unwrap_or_default()),
         "kernel loader" => lazalith_boot::BootImage::new(CONFIG, seed_kernel(), 0)
             .map_or_else(|_| Vec::new(), |image| image.rom().to_vec()),
         "snapshot reader" | "instruction decoder" => {

@@ -44,7 +44,9 @@ use std::process::ExitCode;
 
 mod build;
 mod check;
+mod deps;
 mod new;
+mod pack;
 mod run;
 
 /// The exit code for a program that refused, by diagnostic or by exit status.
@@ -194,6 +196,8 @@ fn dispatch(arguments: &[OsString]) -> Result<Outcome, CliError> {
         "build" => build::run(rest),
         "run" => run::run(rest),
         "test" => run::tests(rest),
+        "pack" => pack::run(rest),
+        "deps" => deps::run(rest),
         "help" | "--help" | "-h" => {
             print!("{}", usage_text());
             Ok(Outcome::Done)
@@ -223,6 +227,8 @@ COMMANDS
     build [file]     compile and link to a {MAIN_IMAGE} image
     run [file]       build, then execute the program under LazOS
     test [file]      run a project's tests and report pass or fail
+    pack [out]       write a .lza from a manifest and a built image
+    deps             resolve a manifest's dependencies against local directories
 
     help             print this message
     --version        print the version
@@ -234,6 +240,11 @@ EXIT CODES
 
 `lazen fmt` is not implemented: the formatter is a later milestone, and a command
 that silently did nothing would be worse than an absent one.
+
+`pack` takes `--manifest FILE` and `--image FILE`, and writes `NAME.lza` next to
+the manifest by default. `deps` takes `--manifest FILE` and `--path DIR`, and looks
+in the manifest's directory and `./packages` by default. There is no registry: a
+dependency is a directory on disk, and `docs/lazen-packages.md` is the design.
 ",
         version = env!("CARGO_PKG_VERSION"),
     )

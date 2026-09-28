@@ -12,11 +12,13 @@ mod filesystem;
 mod init;
 pub mod input;
 mod kernel;
+mod lza;
 mod lzx;
 mod memory;
 mod native_shell;
 mod pool;
 mod process;
+mod resolve;
 mod scheduler;
 mod shell;
 mod syscall;
@@ -34,6 +36,11 @@ pub use init::{
 };
 pub use input::InputService;
 pub use kernel::{KernelError, KernelServiceOutcome, KernelStep, LazalithKernel};
+pub use lza::{
+    LZA_FORMAT_VERSION, LZA_MAGIC, LzaError, LzaPackage, LzaResource, PERMISSION_CONSOLE,
+    PERMISSION_FILESYSTEM, PERMISSION_GRAPHICS, PERMISSION_INPUT, PackageIdentity,
+    PackagePermissions, PackageVersion, check_name,
+};
 pub use lzx::{
     LZX_ABI_VERSION, LZX_CODE_PERMISSIONS, LZX_DATA_PERMISSIONS, LZX_FORMAT_VERSION,
     LZX_HEADER_SIZE, LZX_ISA_VERSION, LZX_MAGIC, LZX_MAX_FILE_SIZE, LZX_MAX_SECTIONS,
@@ -62,6 +69,7 @@ pub use process::{
     ProcessHandles, ProcessId, ProcessParts, ProcessState, ProcessStateError, ProgramError,
     ProgramImage, Thread, ThreadError, ThreadId,
 };
+pub use resolve::{Container, ResolveError, Resolved, installable, resolve};
 pub use scheduler::{
     ActiveThread, RoundRobinScheduler, SchedulerError, SchedulerRun, SchedulerStep,
 };

@@ -548,3 +548,158 @@ fn the_default_file_needs_no_argument() {
     project.lazen(&["build"]).succeeded();
     project.lazen(&["run"]).succeeded();
 }
+
+// -- packaging, end to end ------------------------------------------------
+
+/// A manifest for a project that depends on `util 0.1`.
+const MANIFEST: &str = "[application]\n\
+name = \"hello\"\n\
+version = \"1.2.3\"\n\
+entry = \"main.lz\"\n\
+architecture = \"any\"\n\
+\n\
+[dependencies]\n\
+util = \"0.1\"\n";
+
+/// A manifest with no dependencies.
+const SOLO_MANIFEST: &str = "[application]\n\
+name = \"hello\"\n\
+version = \"1.2.3\"\n\
+entry = \"main.lz\"\n\
+architecture = \"any\"\n";
+
+/// `build` then `pack` writes a package a reader can load.
+///
+/// The whole point of a package, end to end: a person builds, packs, and the result
+/// is a file the OS can resolve into a running image. If `pack` wrote something the
+/// OS could not read, the design's rule 1 would be a claim rather than a fact.
+#[test]
+fn build_then_pack_produces_a_package_the_os_can_resolve() {
+    let project = Project::new("pack-roundtrip");
+    project.write("main.lz", HELLO);
+    project.write("lazen.toml", SOLO_MANIFEST);
+    project.lazen(&["build", "main.lz"]).succeeded();
+    assert!(project.exists("main.lzx"), "build wrote an image");
+
+    let run = project.lazen(&["pack"]);
+    run.succeeded();
+    assert!(
+        project.exists("hello.lza"),
+        "pack wrote hello.lza: {}",
+        run.output()
+    );
+    assert!(run.stdout.contains("1.2.3"), "{}", run.stdout);
+
+    // And the file is a real package, read by the crate that will read it in
+    // production rather than by the code that wrote it.
+    let bytes = std::fs::read(project.root.join("hello.lza")).expect("the package is readable");
+    let package = lazalith_os::LzaPackage::from_bytes(&bytes).expect("the package loads");
+    assert_eq!(package.identity.name, b"hello");
+    assert_eq!(package.identity.version.major, 1);
+    assert_eq!(package.identity.version.minor, 2);
+    // The manifest is verbatim, so a diff of two packages is a diff of two sources.
+    assert_eq!(package.manifest, SOLO_MANIFEST.as_bytes());
+    // And the executable inside is the one that was built.
+    let built = std::fs::read(project.root.join("main.lzx")).expect("the image is readable");
+    assert_eq!(package.image, built);
+    assert_eq!(
+        package.image().expect("the image loads"),
+        lazalith_os::LzxImage::from_bytes(&built).expect("the image reads back")
+    );
+}
+
+/// `pack` refuses a manifest that pins a word width its image does not have,
+/// rather than producing a package that lies about the only thing it describes.
+#[test]
+fn pack_refuses_a_manifest_that_contradicts_its_image() {
+    let project = Project::new("pack-architecture");
+    project.write("main.lz", HELLO);
+    project.lazen(&["build", "main.lz"]).succeeded();
+    project.write(
+        "lazen.toml",
+        "[application]\nname = \"hello\"\nversion = \"0.1.0\"\nentry = \"main.lz\"\narchitecture = \"lz32\"\n",
+    );
+    let run = project.lazen(&["pack"]);
+    run.refused();
+    assert!(
+        run.output().contains("lz32"),
+        "the refusal says what was asked for: {}",
+        run.output()
+    );
+}
+
+/// `deps` resolves a local dependency and says which one it chose.
+///
+/// The local-only promise, end to end: a dependency is a directory on disk, and
+/// nothing else is consulted.
+#[test]
+fn deps_resolves_a_local_dependency_from_a_directory() {
+    let project = Project::new("deps-resolve");
+    project.write("lazen.toml", MANIFEST);
+    project.write(
+        "packages/util/lazen.toml",
+        "[application]\nname = \"util\"\nversion = \"0.1.4\"\nentry = \"m.lz\"\narchitecture = \"any\"\n",
+    );
+    project.write(
+        "packages/other/lazen.toml",
+        "[application]\nname = \"other\"\nversion = \"9.0.0\"\nentry = \"m.lz\"\narchitecture = \"any\"\n",
+    );
+    let run = project.lazen(&["deps"]);
+    run.succeeded();
+    assert!(run.stdout.contains("util 0.1.4"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("other 9.0.0"),
+        "deps also says what is on disk and unused: {}",
+        run.stdout
+    );
+}
+
+/// `deps` refuses a dependency nothing provides, and says where it looked.
+#[test]
+fn deps_refuses_a_missing_dependency_and_names_where_it_looked() {
+    let project = Project::new("deps-missing");
+    project.write("lazen.toml", MANIFEST);
+    let run = project.lazen(&["deps"]);
+    run.refused();
+    let output = run.output();
+    assert!(output.contains("util"), "{output}");
+    assert!(output.contains("packages"), "{output}");
+}
+
+/// `deps` reports a dependency cycle as a path, as `docs/lazen-modules.md` requires.
+#[test]
+fn deps_reports_a_cycle_as_a_path() {
+    let project = Project::new("deps-cycle");
+    project.write("lazen.toml", MANIFEST);
+    project.write(
+        "packages/util/lazen.toml",
+        "[application]\nname = \"util\"\nversion = \"0.1.0\"\nentry = \"m.lz\"\narchitecture = \"any\"\n\n[dependencies]\nhello = \"1.0\"\n",
+    );
+    let run = project.lazen(&["deps"]);
+    run.refused();
+    let output = run.output();
+    assert!(output.contains("cycle"), "{output}");
+    assert!(output.contains("->"), "{output}");
+}
+
+/// `deps` reports a manifest it cannot read rather than resolving nothing.
+#[test]
+fn deps_reports_a_manifest_it_cannot_read() {
+    let project = Project::new("deps-bad-manifest");
+    project.write("lazen.toml", "[application]\nname = \"Hello\"\n");
+    let run = project.lazen(&["deps"]);
+    run.refused();
+    let output = run.output();
+    assert!(output.contains("name"), "{output}");
+}
+
+/// The usage text names the two new commands, so `lazen help` is not a lie.
+#[test]
+fn help_names_the_packaging_commands() {
+    let project = Project::new("help-packaging");
+    let run = project.lazen(&["help"]);
+    run.succeeded();
+    assert!(run.stdout.contains("pack"), "{}", run.stdout);
+    assert!(run.stdout.contains("deps"), "{}", run.stdout);
+    assert!(run.stdout.contains(".lza"), "{}", run.stdout);
+}

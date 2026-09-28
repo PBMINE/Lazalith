@@ -68,7 +68,7 @@ pub struct Target {
 }
 
 /// Every target the step lists, in the order it lists them.
-pub const TARGETS: [Target; 10] = [
+pub const TARGETS: [Target; 11] = [
     Target {
         name: "instruction decoder",
         description: "raw bytes decoded as an instruction",
@@ -98,6 +98,11 @@ pub const TARGETS: [Target; 10] = [
         name: "executable loader",
         description: "bytes loaded as an LZX executable",
         run: targets::executable_loader,
+    },
+    Target {
+        name: "package reader",
+        description: "bytes read as a Lazen application package",
+        run: targets::package_reader,
     },
     Target {
         name: "kernel loader",

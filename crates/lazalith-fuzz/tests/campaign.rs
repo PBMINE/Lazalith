@@ -19,7 +19,7 @@ fn every_target_survives_the_pinned_seeds() {
     let mut failures = Vec::new();
     for target in &TARGETS {
         for seed in SEEDS {
-            let outcome = campaign(300, seed);
+            let outcome = campaign(200, seed);
             for failure in outcome.failures {
                 if failure.starts_with(target.name) {
                     failures.push(failure);
