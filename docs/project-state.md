@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–97 complete and verified)
+Last updated: 2026-09-28 (Steps 1–98 complete and verified)
 
 ## Where the roadmap stands
 
@@ -45,9 +45,10 @@ Step  94      complete: optional LLVM backend
 Step  95      complete: Nix integration
 Step  96      complete: final integration test
 Step  97      complete: final graphics test
+Step  98      complete: final debugging test
 ```
 
-The 1151 workspace tests all pass, including the 4 in
+The 1158 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -1564,6 +1565,56 @@ lives at — recorded as an open defect with a reproduction rather than worked a
 test.
 
 1151 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
+
+## Step 98 — the final debugging test
+
+`crates/lazalith-debug/tests/fault_recovery.rs` runs a Lazen program that indexes out of
+bounds, all the way from source text to a diagnosis a person could act on, in seven tests
+with one per item the step lists. A test per item is the point: a debugger that recovers
+six of them and a debugger that recovers none look identical to a user who only ever saw
+the one they needed.
+
+The program is `let value: u32 = values[index as usize];` with `index` equal to 7 in a
+four-element array, so the fault is the **bounds check the compiler emits** rather than a
+`TRAP` the programmer wrote. That choice is what makes the source mapping testable: an
+explicit `TRAP` would fault just as well but would land on a line nobody wrote, and a
+debugger that pointed at a line the user could not see would look like a debugger that
+worked.
+
+**The guest's program counter is not the machine's**, and that is the most important thing
+this step pins. While a guest trap is being handled the machine's own program counter is in
+the kernel, and the guest's is in the trap frame; `RuntimeDiagnostic::guest_pc` is where the
+guest's address lives. A frontend that read the register file would point a user at the
+kernel's next instruction and call it their own program. Two tests depend on the
+distinction and would fail if it were dropped, and one of them asserts the two are *not*
+equal, with both addresses in the failure message.
+
+**The fault is the program's, not the emulator's.** `docs/isa.md` separates "the program
+did something wrong" from "the emulator is broken", and the test checks the
+`DiagnosticKind` rather than matching a code string — a frontend that worked the kind out
+by matching a code would be a frontend whose correctness depends on the spelling of every
+code, and a new code would silently be shown as the wrong sort of thing. An
+out-of-bounds index must be a `GuestFault` and must not be an `EmulatorBug`, or a person
+would go hunting for a CPU bug when their own index was out of range.
+
+The rest, item by item: the source file is named as the compiler was given it, the line and
+column are ones a person can use, and the recovered line is checked to be *the line that
+indexed* — a debugger that named a different line would be confidently pointing at the
+wrong statement, which is worse than naming none. The instruction at the guest program
+counter is rendered, and it is a `TRAP`, which is the bounds check itself. The registers
+are all readable, including ones the program never wrote. And the stack carries its honest
+limit: the calling convention reserves the return address below the frame but records no
+frame pointer, so there is no call chain to walk, and `StackView::has_call_chain` is false —
+a debugger that printed addresses and called them a call stack would be showing a heap of
+numbers. The diagnostic's own scan depth is bounded and non-empty, so a user looking at one
+frame can tell whether there was one or whether the scan stopped.
+
+The control runs the same program with an in-range index: the session reaches
+`Exited { code: 0 }`, the controller has no diagnostics, and the console shows the program's
+output. A debugger that reported a fault for a healthy program would make every other test
+here worthless.
+
+1158 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
 
 ## Earlier milestones
