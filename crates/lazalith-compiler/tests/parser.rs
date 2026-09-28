@@ -552,3 +552,154 @@ fn a_question_mark_after_any_expression_is_rejected() {
     parse_err_with("fn f() -> i32 { let a = f()?; 0 }", codes::QUESTION);
     parse_err_with("fn f() -> i32 { let a = v[0]?; 0 }", codes::QUESTION);
 }
+
+// The `match` of step 92. A `match` is an `if` chain with the comparisons
+// written out, so most of these tests are about the *one* thing the sugar adds:
+// the scrutinee is written once, bound once, and evaluated once.
+
+#[test]
+fn a_match_becomes_a_binding_and_an_if_chain() {
+    let function = only_function(
+        r#"
+fn f() -> i32 {
+    let x = 2i32;
+    match x {
+        1 => { return 10; },
+        2 => { return 20; },
+        else => { return 30; },
+    }
+}
+"#,
+    );
+    // The match is the block's tail, and its first statement is the binding.
+    let Some(lazalith_compiler::ast::Expr::Block { block, .. }) = function.body.tail.as_deref()
+    else {
+        panic!("expected the match to be a block");
+    };
+    let lazalith_compiler::ast::Stmt::Let { name, .. } =
+        block.statements.first().expect("a statement")
+    else {
+        panic!("expected a `let`");
+    };
+    // The binding is `$match_<offset>`: a name no Lazen identifier can spell,
+    // so it cannot capture anything and nothing can shadow it by accident.
+    assert!(
+        name.text.starts_with("$match_"),
+        "the scrutinee should be bound to a compiler name, got {}",
+        name.text
+    );
+}
+
+#[test]
+fn a_match_arm_becomes_an_equality_test_against_the_binding() {
+    let program = parse_ok(
+        r#"
+fn f() -> i32 {
+    let x = 2i32;
+    match x {
+        7 => { return 1; },
+        else => { return 2; },
+    }
+}
+"#,
+    );
+    let text = format!("{program:?}");
+    assert!(
+        text.contains("Compare(Equal)"),
+        "a pattern arm should be an equality test:\n{text}"
+    );
+}
+
+#[test]
+fn a_match_must_be_total() {
+    let (code, rendered) = parse_err(
+        r#"
+fn f() -> i32 {
+    let x = 2i32;
+    match x {
+        1 => { return 1; },
+        2 => { return 2; },
+    }
+}
+"#,
+    );
+    assert_eq!(code, codes::MATCH_EXHAUSTIVE);
+    assert!(rendered.contains("`else` arm"), "{rendered}");
+    assert!(
+        rendered.contains("cannot know which arms are reachable"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn an_arm_cannot_follow_the_else_arm() {
+    let (code, rendered) = parse_err(
+        r#"
+fn f() -> i32 {
+    match 1i32 {
+        else => { 1 }
+        2 => { 2 }
+    }
+}
+"#,
+    );
+    assert_eq!(code, codes::EXPECTED);
+    assert!(rendered.contains("cannot follow"), "{rendered}");
+}
+
+#[test]
+fn a_pattern_must_be_a_value_and_not_an_expression() {
+    let (code, rendered) = parse_err(
+        r#"
+fn f() -> i32 {
+    match 1i32 {
+        1 + 2 => { 1 }
+        else => { 2 }
+    }
+}
+"#,
+    );
+    assert_eq!(code, codes::MATCH_PATTERN);
+    assert!(rendered.contains("whole number"), "{rendered}");
+}
+
+#[test]
+fn a_match_with_no_arms_to_choose_from_is_an_if_statement() {
+    let (code, rendered) = parse_err(
+        r#"
+fn f() -> i32 {
+    match 1i32 {
+        else => { 1 }
+    }
+}
+"#,
+    );
+    assert_eq!(code, codes::MATCH_EXHAUSTIVE);
+    assert!(rendered.contains("write `if condition"), "{rendered}");
+}
+
+#[test]
+fn match_is_a_keyword_and_no_longer_names_a_variable() {
+    // A keyword, not an identifier: `match_count` still lexes as one name, but
+    // `match` alone does not, so a program that used it as a variable gets a
+    // diagnostic that says what happened rather than a confusing parse error.
+    let program = parse_ok("fn f() -> i32 { let match_count = 1i32; match_count }");
+    assert_eq!(program.items.len(), 1);
+    parse_err_with("fn f() -> i32 { let match = 1i32; match }", codes::EXPECTED);
+}
+
+#[test]
+fn a_match_may_have_a_trailing_comma_and_comments_between_arms() {
+    parse_ok(
+        r#"
+fn f() -> i32 {
+    match 1i32 {
+        // the first case
+        1 => { return 1; },
+        2 => { return 2; },
+        else => { return 3; },
+    }
+}
+"#,
+    );
+}

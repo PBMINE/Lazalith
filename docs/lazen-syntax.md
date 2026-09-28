@@ -327,7 +327,7 @@ the compiler reports each of them with a specific diagnostic rather than
 accepting a construct it cannot lower:
 
 - records (`struct`) and their literals;
-- enums, `optional`, and `match`;
+- enums and `optional`;
 - closures, generics, traits, iterators, and operator overloading;
 - `for x in collection` over arrays or slices; ranges only;
 - string interpolation; formatting lives in the standard library;
@@ -341,6 +341,46 @@ language rule that cannot be checked exhaustively is worse than a missing one.
 `docs/lazen-types.md` records the same decisions from the type system's side, and
 `docs/lazen-memory-model.md` explains why a closed type set matters for a
 platform whose heap is not yet served.
+
+### `match` is here, and it is `if` with the comparisons written out
+
+Step 92 added `match`, so it is no longer in the list above. What it is, and what
+it deliberately is not:
+
+```lazen
+fn name_of(status: i32) -> &[u8] {
+    match status {
+        0 => { return "ok"; },
+        1 => { return "retry"; },
+        else => { return "failed"; },
+    }
+}
+```
+
+- **The scrutinee is evaluated once**, however many arms there are. This is the
+  one thing a hand-written `if status == 0 { } else if status == 1 { }` cannot
+  promise, and the reason the sugar is worth having. A program matching on a
+  function call that reads a device gets one read, not one per arm.
+- **Arms are tried in order and the first match wins**, exactly as the first
+  `if` whose condition holds wins. Two arms naming the same value are not a
+  duplicate-pattern error; the second is simply unreachable.
+- **The `else` arm is required.** Lazen has no enums, so the compiler cannot know
+  which values an integer can hold, and it will not pretend to. An unhandled
+  value has to be written down.
+- **A pattern is a whole number, `true`, `false`, or a name** — a `const` or a
+  variable. There is nothing to destructure, because there are no records and no
+  enums, so a pattern can only be a value to compare against.
+- **A `bool` pattern is the condition, not a comparison.** `==` is an integer
+  operator in Lazen, so `match flag { true => … }` becomes `if flag { … }`
+  rather than `flag == true`, which is not an expression that exists.
+
+A `match` in statement position ends with `;`, like any other expression used for
+its effect, and a `match` in value position has no such semicolon. It is
+desugared in the parser, so it has no representation of its own in the tree, in
+the type checker, or in the IR — which is what keeps a feature from disagreeing
+with itself in four places. `docs/os-expansion.md`'s step-91 table is the
+predecessor of this decision, not its successor: it names the same five
+refusals and the same reasons.
 
 ## 14. How these examples are validated
 

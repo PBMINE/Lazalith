@@ -168,6 +168,8 @@ pub enum TokenKind {
     AmpOpenBracket,
     /// `->`
     Arrow,
+    /// `=>`
+    FatArrow,
     /// `::`
     PathSep,
     /// `:`
@@ -212,6 +214,8 @@ pub enum TokenKind {
     Const,
     /// `if`
     If,
+    /// `match`
+    Match,
     /// `else`
     Else,
     /// `while`
@@ -259,6 +263,7 @@ impl TokenKind {
             TokenKind::AmpMut => "&mut",
             TokenKind::AmpOpenBracket => "&[",
             TokenKind::Arrow => "->",
+            TokenKind::FatArrow => "=>",
             TokenKind::PathSep => "::",
             TokenKind::Colon => ":",
             TokenKind::Semi => ";",
@@ -281,6 +286,7 @@ impl TokenKind {
             TokenKind::Pub => "pub",
             TokenKind::Const => "const",
             TokenKind::If => "if",
+            TokenKind::Match => "match",
             TokenKind::Else => "else",
             TokenKind::While => "while",
             TokenKind::For => "for",
@@ -316,6 +322,7 @@ fn is_keyword_text(text: &str) -> bool {
             | "pub"
             | "const"
             | "if"
+            | "match"
             | "else"
             | "while"
             | "for"
@@ -865,6 +872,7 @@ impl<'a> Lexer<'a> {
             "pub" => TokenKind::Pub,
             "const" => TokenKind::Const,
             "if" => TokenKind::If,
+            "match" => TokenKind::Match,
             "else" => TokenKind::Else,
             "while" => TokenKind::While,
             "for" => TokenKind::For,
@@ -923,6 +931,7 @@ impl<'a> Lexer<'a> {
             (Some(b'/'), _) => (TokenKind::Slash, 1),
             (Some(b'%'), _) => (TokenKind::Percent, 1),
             (Some(b'='), Some(b'=')) => (TokenKind::EqEq, 2),
+            (Some(b'='), Some(b'>')) => (TokenKind::FatArrow, 2),
             (Some(b'='), _) => (TokenKind::Eq, 1),
             (Some(b'!'), Some(b'=')) => (TokenKind::BangEq, 2),
             (Some(b'!'), _) => (TokenKind::Bang, 1),

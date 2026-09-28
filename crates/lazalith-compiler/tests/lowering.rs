@@ -1045,3 +1045,126 @@ fn every_syscall_call_resolves_to_a_declaration() {
         }
     }
 }
+
+// A `match` is an `if` chain, so these tests are about the two things the sugar
+// is responsible for and an `if` chain cannot promise on its own: the scrutinee
+// is evaluated *once* however many arms there are, and the arms are tested in
+// the order they were written.
+
+/// Counts the calls a module makes to one function.
+fn calls_to(module: &Module, name: &str) -> usize {
+    module
+        .functions
+        .iter()
+        .flat_map(|function| function.blocks.iter())
+        .flat_map(|block| block.instructions.iter())
+        .filter(|instruction| match instruction {
+            Instruction::Call {
+                target: lazalith_ir::CallTarget::Function(called),
+                ..
+            } => called.as_str() == name,
+            _ => false,
+        })
+        .count()
+}
+
+#[test]
+fn a_match_evaluates_its_scrutinee_once_however_many_arms_it_has() {
+    // The point of binding the scrutinee. Written as an `if` chain this program
+    // would call `next` once per arm, and a function with a side effect — a
+    // read, a syscall, a counter — would be called a different number of times
+    // depending only on which arm matched. The test measures the call count
+    // rather than the effect, which is the same claim with fewer moving parts.
+    let (module, _) = lower_source(
+        r#"
+fn next(seed: i32) -> i32 {
+    return seed + 1;
+}
+fn main(seed: i32) -> i32 {
+    match next(seed) {
+        1 => { return 10; },
+        2 => { return 20; },
+        3 => { return 30; },
+        else => { return 40; },
+    };
+    return 50;
+}
+"#,
+    );
+    assert_eq!(
+        calls_to(&module, "next"),
+        1,
+        "the scrutinee must be evaluated once, not once per arm"
+    );
+}
+
+#[test]
+fn a_match_tests_its_arms_in_the_order_they_were_written() {
+    // The first arm that matches wins, so the order is part of the meaning and
+    // not an implementation detail. Two arms naming the same value must produce
+    // the *first* one's body.
+    let (module, _) = lower_source(
+        r#"
+fn main(x: i32) -> i32 {
+    match x {
+        1 => { return 111; },
+        1 => { return 222; },
+        else => { return 333; },
+    };
+    return 444;
+}
+"#,
+    );
+    let found = format!("{module:?}");
+    let first = found.find("111").expect("the first arm");
+    let second = found.find("222").expect("the second arm");
+    assert!(first < second, "the first arm must come first:\n{found}");
+}
+
+#[test]
+fn a_match_on_a_bool_lowers_to_the_condition_rather_than_a_comparison() {
+    // `==` is an integer operator, so a bool pattern has to become the condition
+    // itself. This test is that it does, rather than an `==` the type checker
+    // would have refused.
+    let (module, _) = lower_source(
+        r#"
+fn main(flag: bool) -> i32 {
+    match flag {
+        true => { return 1; },
+        else => { return 2; },
+    };
+    return 3;
+}
+"#,
+    );
+    let found = format!("{module:?}");
+    assert!(
+        !found.contains("Equal"),
+        "a bool pattern must not lower to a comparison:\n{found}"
+    );
+}
+
+#[test]
+fn a_match_whose_arms_all_return_needs_no_value_and_no_frame() {
+    // A match in statement position is a binding and a conditional, so arms that
+    // `return` are fine — which is the whole reason statement position exists.
+    let (module, frames) = lower_source(
+        r#"
+fn main(x: i32) -> i32 {
+    match x {
+        0 => { return 1; },
+        else => { return 2; },
+    };
+    return 3;
+}
+"#,
+    );
+    // One frame: the function's. A value conditional in Step 61 has no frame of
+    // its own, and a match that lowered to a value would have needed one.
+    assert_eq!(frames.len(), 1, "a match should not add a frame");
+    let found = format!("{module:?}");
+    assert!(
+        found.contains("Return") || found.contains("return"),
+        "{found}"
+    );
+}

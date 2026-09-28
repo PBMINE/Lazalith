@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–91 complete and verified)
+Last updated: 2026-09-28 (Steps 1–92 complete and verified)
 
 ## Where the roadmap stands
 
@@ -39,9 +39,10 @@ Step  88      complete: application packaging design
 Step  89      complete: Lazen package management
 Step  90      complete: lazen fmt
 Step  91      complete: expand LazOS
+Step  92      complete: expand Lazen
 ```
 
-The 1093 workspace tests all pass, including the 4 in
+The 1119 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -1090,6 +1091,117 @@ follow. Found by trying to write the gate and finding the dependency pointed the
 way.
 
 1093 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
+
+## Step 92 — expand Lazen
+
+`docs/lazen-expansion.md` is the step. The roadmap lists six things to consider
+and then says, in the same breath, "Do not add features merely because another
+language has them" — so the step is not picking six features, it is picking which
+ones this repository has a use for and saying why in terms of something
+checkable. One was built; five were not, and for each of the five the document
+names the *gate* — the thing that would have to exist first, and which is worth
+building on its own merits whether or not the feature ever follows.
+
+| area | verdict | the gate |
+| --- | --- | --- |
+| pattern matching | **built** | none; the arm grammar *is* a comparison chain |
+| generics | not yet | a container to be generic over, and monomorphisation in the backend |
+| advanced collections | not yet | an allocator the SDK can reach |
+| concurrency | not yet | `spawn_thread` — step 91 built the per-thread state, not creation |
+| advanced modules | not yet | a module that is genuinely a facade |
+| macros | not yet | compile-time evaluation in the IR |
+
+### The `match`, and the half-right argument it replaced
+
+The compiler already refused `match`, and its refusal said why: *"Lazen v1 has no
+enums, so there is nothing to match."* That was half right, and the half that was
+wrong is the whole step. **Right:** with no enums, records, or destructuring, a
+pattern cannot bind a name or pull a field out of a value, so a pattern can only
+be a value to compare against. **Wrong:** everything on this platform returns a
+tagged integer — a syscall returns an `i64` status, a string lookup returns a
+byte and an index, a `for` over a view returns a count — so the entire platform
+is shaped like an untagged union and every program consuming one writes the same
+`if status == 0 { } else if status == 1 { } else { }` chain.
+
+Which is a `match` with the comparisons written out **and the scrutinee written
+out too**. So every one of those chains calls the scoring function once per arm,
+and the language was asking the programmer to remember something they did not know
+they had to remember. That is the bug, and it is why the sugar earns its place.
+
+Four decisions, each of which could have gone the other way:
+
+- **The scrutinee is bound to `$match_<offset>`, and the binding cannot be
+  captured.** A `$` cannot appear in a Lazen identifier — the lexer cannot
+  produce one — so the binding cannot shadow a name in an arm body, no arm body
+  can refer to it, and no program can declare it. Hygiene by construction rather
+  than by a renaming pass, and `tests/lexer.rs` is written so it fails if a `$`
+  ever becomes identifier text.
+- **A `bool` pattern is the condition, not a comparison.** `==` is an integer
+  operator here, so `flag == true` is not an expression that exists. Rather than
+  teach `==` about `bool` to make one desugaring work, `match flag { true => … }`
+  becomes `if flag { }` — because that is what the pattern *means* and the
+  language already had the expression.
+- **The `else` arm is required.** With no enums, exhaustiveness is not checkable
+  and pretending otherwise is worse than not having it; the alternative is a
+  `match` that falls off the end, which makes an unhandled status a silent no-op
+  — a bug that does not reproduce. Its own code, `P0109`, says exactly this.
+- **A `match` in statement position is a binding plus an `if`**, so its arms may
+  `return` and need no value. A value conditional in this language has no frame,
+  so a value `match` may not bind a name; the parser decides from context, exactly
+  as it already does for `if`.
+
+**There is no `Match` node in the AST.** It desugars in the parser, so the type
+checker sees the `if` chain, the IR is the IR, the lowerer knows nothing, and the
+verifier checks what it always checks. The alternative threads a variant through
+five places and buys the right to disagree with itself in each. One consequence
+is worth naming: *the formatter would have broken `match` if it printed from the
+tree* — step 90 formats tokens precisely so comments survive, so a tree-printing
+formatter would have rewritten a person's `match` as a `$match_4` binding, a
+different program in their file that would not even compile. `tests/format.rs`
+asserts no `$match` ever reaches a file.
+
+### The five refusals
+
+Each is refused for a reason from *this* repository, not from taste:
+
+- **Generics** need a uniform type. The built-in types are ten concrete widths
+  with deliberately different ABI stories; there is no user container to be
+  generic over; and a generic function's frame is not a frame of anything until
+  the type is known, so monomorphisation is a real design question. Gate: a
+  container.
+- **Collections** need somewhere to grow to. The OS has `AllocateMemory`; the
+  Lazen ABI has no allocation call, and step 91's gate has no memory capability
+  to put one behind. Then reallocation is a capability question, and a view into
+  a growing buffer is invalidated by a push, which the current model has no way
+  to express. Gate: a length-carrying allocation call.
+- **Concurrency** is blocked on the OS, not the language: step 91 left per-thread
+  state real and creation missing, and creation needs a stack mapped inside the
+  process (the virtual-memory work), a second entry point (a loader concept the
+  image format lacks), and a scheduler that round-robins threads as well as
+  processes. Gate: `spawn_thread`, worth having because the platform otherwise
+  cannot use a second core for anything.
+- **Modules**: the obvious features are `pub use` and globs, and the SDK says
+  neither is needed — every symbol is called at its own path and there is no
+  facade to re-export *through*. A re-export earns its place only when a module
+  is a facade over another, and there is not one. Globs are refused more sharply:
+  a glob makes `white` a name whose origin is three files away, and it turns
+  "you misspelled it" into "it was never imported". Gate: a facade.
+- **Macros** have the most misleading "already half built" argument here. Step 90
+  gives the toolchain a token stream with comments, which is the substrate a
+  hygienic expander needs — and nothing evaluates anything at compile time. A
+  macro that cannot be evaluated at compile time is a function call, and a
+  function already is one; so this is either compile-time evaluation, or a call
+  with an extra name to grep for, or a preprocessor, which this language's own
+  omissions list rules out. Gate: a constant folder in the IR, which is worth
+  having because it is what makes `const` more than a named literal.
+
+`docs/lazen-syntax.md` section 13 no longer lists `match` as an omission and
+documents the four decisions, and the test pinning section 13 now checks the
+inexhaustive-`match` diagnostic instead of the old "no such feature" one. The
+old `P0102` stays defined and unused: it is a published code, and reusing it for
+something else would be worse than leaving it dead.
+
+1119 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
 
 ## Earlier milestones

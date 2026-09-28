@@ -37,6 +37,10 @@ use crate::lexer::{Token, TokenKind};
 pub mod codes {
     /// An expected token was not found.
     pub const EXPECTED: &str = "P0001";
+    /// A `match` arm's pattern was not something a Lazen pattern can be.
+    pub const MATCH_PATTERN: &str = "P0108";
+    /// A `match` was not total: it had no `else` arm, or nothing to match on.
+    pub const MATCH_EXHAUSTIVE: &str = "P0109";
     /// A `;` was expected.
     pub const EXPECTED_SEMICOLON: &str = "P0002";
     /// A `}` was expected.
@@ -46,6 +50,12 @@ pub mod codes {
     /// An `enum` declaration.
     pub const ENUM: &str = "P0101";
     /// A `match` expression.
+    ///
+    /// Step 92 made `match` part of the language, so nothing emits this any more.
+    /// It stays because the code is part of the published diagnostic list and a
+    /// code that a tool may have seen must not be reused for something else; the
+    /// two codes `match` can now fail with are `MATCH_PATTERN` and
+    /// `MATCH_EXHAUSTIVE`.
     pub const MATCH: &str = "P0102";
     /// `some` or `none`.
     pub const OPTIONAL: &str = "P0103";
@@ -223,9 +233,11 @@ impl<'a> Parser<'a> {
 
     /// Rejects a v1 omission that can appear where an expression is expected.
     ///
-    /// `match`, `some`, and `none` are ordinary identifiers as far as the lexer
-    /// is concerned, so without this a program naming a variable `match` would
-    /// get a confusing parse error instead of the omission it is.
+    /// `some` and `none` are ordinary identifiers as far as the lexer is
+    /// concerned, so without this a program naming a variable `none` would get a
+    /// confusing parse error instead of the omission it is. `match` is no longer
+    /// in this list: step 92 added it as a keyword with a meaning, so it has its
+    /// own arm in `parse_primary` rather than a diagnostic.
     fn reject_omission_word(&self) -> Option<StageError> {
         let token = self.peek();
         if !matches!(token.kind, TokenKind::Ident(_)) {
@@ -233,10 +245,6 @@ impl<'a> Parser<'a> {
         }
         let word = token.ident()?;
         let (code, reason) = match word {
-            "match" => (
-                codes::MATCH,
-                "Lazen v1 has no enums, so there is nothing to match",
-            ),
             "some" | "none" => (
                 codes::OPTIONAL,
                 "Lazen v1 has no `optional`; return an integer status and test it, as section 9 of docs/lazen-syntax.md shows",
@@ -382,13 +390,6 @@ impl<'a> Parser<'a> {
         match &token.kind {
             TokenKind::Ident(name) => {
                 let (code, message, help) = match name.as_str() {
-                    "match" => (
-                        codes::MATCH,
-                        String::from("`match` is not part of Lazen v1"),
-                        String::from(
-                            "Lazen v1 has no enums, so there is nothing to match; use `if` and `else`",
-                        ),
-                    ),
                     "some" | "none" => (
                         codes::OPTIONAL,
                         alloc::format!("`{name}` is not part of Lazen v1"),
@@ -904,9 +905,26 @@ impl<'a> Parser<'a> {
                 });
             } else if self.at(&TokenKind::Semi) {
                 let semi = self.advance();
-                statements.push(
-                    self.statement_from(expression, self.span(start, semi.span.end().as_u32())),
-                );
+                // A `match` in statement position is the binding and the chain, as
+                // two statements, exactly as `if` in statement position is a chain
+                // rather than a value. The difference matters: a `match` whose arms
+                // all `return` has no value, and a statement needs no value, so this
+                // is what lets a `match` do what an `if` does.
+                if let Some((name, value, binding_span, chain)) = split_match_block(&expression) {
+                    let span = self.span(start, semi.span.end().as_u32());
+                    statements.push(Stmt::Let {
+                        name,
+                        mutable: false,
+                        annotation: None,
+                        value,
+                        span: binding_span,
+                    });
+                    statements.push(Stmt::If { arms: chain, span });
+                } else {
+                    statements.push(
+                        self.statement_from(expression, self.span(start, semi.span.end().as_u32())),
+                    );
+                }
             } else if self.at(&TokenKind::CloseBrace) && tail_capable(&expression) {
                 tail = Some(Box::new(expression));
             } else {
@@ -1053,6 +1071,7 @@ impl<'a> Parser<'a> {
                 | TokenKind::AmpMut
                 | TokenKind::Star
                 | TokenKind::If
+                | TokenKind::Match
         )
     }
 
@@ -1443,6 +1462,7 @@ impl<'a> Parser<'a> {
                 let (arms, span) = self.parse_if_arms()?;
                 Ok(Expr::If { arms, span })
             }
+            TokenKind::Match => self.parse_match(),
             TokenKind::Question => Err(self.diagnostic(
                 codes::QUESTION,
                 "the `?` operator is not part of Lazen v1",
@@ -1522,6 +1542,192 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parses `match value { pattern => block, ..., else => block }`.
+    ///
+    /// This is not a new node in the tree. A `match` is `if value == pattern` with
+    /// the comparison written out, so it lowers through exactly the path an `if`
+    /// lowers through and gains no lowering, type rule, or IR operation of its own.
+    /// That is the point: a feature that needs its own representation in four places
+    /// is a feature that can disagree with itself in four places, and Lazen's arm
+    /// grammar is a comparison chain, so the honest implementation is to say so.
+    ///
+    /// The one thing a `match` adds over an `if` chain is that the scrutinee is
+    /// **written once and evaluated once**. The desugaring binds it to a local whose
+    /// name begins with `$`, and no Lazen identifier can contain a `$` — an
+    /// identifier is a letter or `_` followed by letters, digits, and `_` — so the
+    /// binding cannot capture a name from the program and the program cannot name it.
+    fn parse_match(&mut self) -> Result<Expr, StageError> {
+        let start = self.advance().span.start().as_u32();
+        let scrutinee = self.parse_expr()?;
+        let scrutinee_start = scrutinee.start();
+        let scrutinee_end = scrutinee.end();
+        self.expect(&TokenKind::OpenBrace)?;
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(self.too_deep(self.span(start, scrutinee_end)));
+        }
+        let binding = alloc::format!("$match_{start}");
+        let binding_span = self.span(scrutinee_start, scrutinee_end);
+        let name_of_scrutinee = || Expr::Path {
+            path: Path {
+                segments: vec![Name::new(binding.clone(), binding_span.clone())],
+                span: binding_span.clone(),
+            },
+            span: binding_span.clone(),
+        };
+        let mut arms: Vec<IfArm> = Vec::new();
+        let mut end = scrutinee_end;
+        let mut has_else = false;
+        loop {
+            if self.at(&TokenKind::CloseBrace) {
+                break;
+            }
+            if self.at_eof() {
+                return Err(self.unclosed_block_error(self.span(start, end)));
+            }
+            // A trailing comma between arms is allowed, as it is in a list.
+            if self.at(&TokenKind::Comma) {
+                self.advance();
+                continue;
+            }
+            let arm_start = self.peek().span.start().as_u32();
+            if self.at(&TokenKind::Else) {
+                if has_else {
+                    return Err(self.diagnostic(
+                        codes::EXPECTED,
+                        "a `match` has only one `else` arm",
+                        self.span(arm_start, arm_start),
+                        &["the second `else` arm can never be reached"],
+                        Some("the `else` arm is the last one, and it is required"),
+                        &[],
+                    ));
+                }
+                has_else = true;
+                self.advance();
+                self.expect(&TokenKind::FatArrow)?;
+                let body = self.parse_block()?;
+                end = body.span.end().as_u32();
+                arms.push(IfArm {
+                    condition: None,
+                    span: self.span(arm_start, end),
+                    body,
+                });
+                self.eat(&TokenKind::Comma);
+                continue;
+            }
+            if has_else {
+                return Err(self.diagnostic(
+                    codes::EXPECTED,
+                    "an arm cannot follow the `else` arm",
+                    self.span(arm_start, arm_start),
+                    &["the `else` arm is the last one"],
+                    Some("move the arm above the `else`"),
+                    &[],
+                ));
+            }
+            let pattern_start = self.peek().span.start().as_u32();
+            let pattern = self.parse_expr()?;
+            let pattern_end = pattern.end();
+            if !is_match_pattern(&pattern) {
+                return Err(self.diagnostic(
+                    codes::MATCH_PATTERN,
+                    "a `match` arm's pattern must be a whole number, a sign, or a name",
+                    self.span(pattern_start, pattern_end),
+                    &[
+                        "Lazen has no records and no enums, so there is nothing else a pattern could name",
+                    ],
+                    Some(
+                        "match on the integer that tags the value, and read the fields with arithmetic",
+                    ),
+                    &[],
+                ));
+            }
+            self.expect(&TokenKind::FatArrow)?;
+            let body = self.parse_block()?;
+            end = body.span.end().as_u32();
+            // A `bool` pattern is the condition, not a comparison. `==` is an
+            // integer operator in Lazen, so `flag == true` is not an expression
+            // that exists — but `if flag` is, and `true` as a pattern *means*
+            // "when the value is true". Writing the pattern as the test the
+            // language already has is what makes matching a `bool` work at all.
+            let comparison = match &pattern {
+                Expr::Bool { value: true, .. } => name_of_scrutinee(),
+                Expr::Bool { value: false, .. } => Expr::Unary {
+                    operator: UnaryOp::Not,
+                    operand: Box::new(name_of_scrutinee()),
+                    span: self.span(pattern_start, pattern_end),
+                },
+                _ => Expr::Binary {
+                    operator: BinaryOp::Compare(CompareOp::Equal),
+                    left: Box::new(name_of_scrutinee()),
+                    right: Box::new(pattern),
+                    span: self.span(pattern_start, pattern_end),
+                },
+            };
+            arms.push(IfArm {
+                condition: Some(comparison),
+                span: self.span(arm_start, end),
+                body,
+            });
+            if !self.eat(&TokenKind::Comma) && !self.at(&TokenKind::CloseBrace) {
+                return Err(self.diagnostic(
+                    codes::EXPECTED,
+                    "expected `,` or `}` after a `match` arm",
+                    self.span(arm_start, end),
+                    &["a `match` arm ends with a comma"],
+                    Some("add the comma, or move the arm onto its own line"),
+                    &[],
+                ));
+            }
+        }
+        self.expect(&TokenKind::CloseBrace)?;
+        self.depth -= 1;
+        if !has_else {
+            return Err(self.diagnostic(
+                codes::MATCH_EXHAUSTIVE,
+                "a `match` needs an `else` arm",
+                self.span(start, end),
+                &[
+                    "Lazen has no enums, so the compiler cannot know which arms are reachable",
+                ],
+                Some(
+                    "add `else => { }` for the values no arm names, the way an `if` needs its `else`",
+                ),
+                &[],
+            ));
+        }
+        if arms.len() < 2 {
+            return Err(self.diagnostic(
+                codes::MATCH_EXHAUSTIVE,
+                "a `match` needs at least one arm and an `else`",
+                self.span(start, end),
+                &["an `if` with an `else` and no `if` says the same thing"],
+                Some("write `if condition { } else { }` instead"),
+                &[],
+            ));
+        }
+        let end = self.span(start, end);
+        // The binding, then the comparison chain: the shape an `if` chain already
+        // has, with the scrutinee evaluated once in front of it.
+        Ok(Expr::Block {
+            block: Box::new(Block {
+                statements: vec![Stmt::Let {
+                    name: Name::new(binding, binding_span.clone()),
+                    mutable: false,
+                    annotation: None,
+                    value: scrutinee,
+                    span: binding_span.clone(),
+                }],
+                tail: Some(Box::new(Expr::If {
+                    arms,
+                    span: end.clone(),
+                })),
+                span: end.clone(),
+            }),
+            span: end,
+        })
+    }
+
     /// Parses `if` arms: one or more `if` arms and an optional `else`.
     fn parse_if_arms(&mut self) -> Result<(Vec<IfArm>, SourceSpan), StageError> {
         let start = self.peek().span.start().as_u32();
@@ -1563,6 +1769,55 @@ impl<'a> Parser<'a> {
 /// Parses a literal's digits, returning `None` when they do not fit in 128 bits.
 fn parse_int_value(digits: &str, radix: u32) -> Option<u128> {
     u128::from_str_radix(digits, radix).ok()
+}
+
+/// The two statements a `match` in statement position is, if that is what this is.
+///
+/// A `match` parses to a block holding one binding and a comparison chain. In value
+/// position that block *is* the value. In statement position it is a binding and an
+/// `if` — which is what lets a `match` whose arms all `return` be a statement, the
+/// way an `if` whose arms all `return` is.
+///
+/// The check is on the `$match_` prefix, which is sound rather than merely likely:
+/// the lexer cannot produce a name containing `$`, so no program can write a `let`
+/// that this mistakes for a desugared `match`.
+fn split_match_block(expression: &Expr) -> Option<(Name, Expr, SourceSpan, Vec<IfArm>)> {
+    let Expr::Block { block, .. } = expression else {
+        return None;
+    };
+    let [
+        Stmt::Let {
+            name,
+            mutable: false,
+            annotation: None,
+            value,
+            span,
+        },
+    ] = block.statements.as_slice()
+    else {
+        return None;
+    };
+    if !name.text.starts_with("$match_") {
+        return None;
+    }
+    let Some(Expr::If { arms, .. }) = block.tail.as_deref() else {
+        return None;
+    };
+    Some((name.clone(), value.clone(), span.clone(), arms.clone()))
+}
+
+/// Whether an expression is something a `match` arm can name.
+///
+/// A whole number, a sign, and a name. That is the whole list, and it is short
+/// because Lazen has no records and no enums: there is nothing to destructure,
+/// so a pattern can only be a value to compare against. Anything else in arm
+/// position is a mistake worth naming rather than a shape to try and accept.
+fn is_match_pattern(expression: &Expr) -> bool {
+    match expression {
+        Expr::Int { .. } | Expr::Bool { .. } | Expr::Path { .. } => true,
+        Expr::Unary { operator, .. } => matches!(operator, UnaryOp::Negate | UnaryOp::Not),
+        _ => false,
+    }
 }
 
 /// Whether an expression can be a block's tail.

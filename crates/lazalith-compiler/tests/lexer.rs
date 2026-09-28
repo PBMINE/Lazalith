@@ -498,3 +498,51 @@ fn a_non_type_suffix_is_rejected() {
     assert_eq!(lex_error_code("let n = 1usiz;"), codes::MALFORMED_INT);
     assert_eq!(lex_error_code("let n = 1u 8;"), codes::MALFORMED_INT);
 }
+
+#[test]
+fn a_dollar_sign_is_not_part_of_a_lazen_identifier() {
+    // A `match` binds its scrutinee to a `$match_<offset>` local, and this is
+    // what makes that binding safe: the lexer cannot produce a name containing
+    // `$`, so no program can name the binding, shadow it, or capture it. If a
+    // `$` ever became identifier text this would stop being true, and the
+    // hygiene argument for the desugaring would quietly become false too.
+    let code = lex_error_code("fn f() -> i32 { let $match_1 = 0; }");
+    assert_eq!(code, codes::UNKNOWN_CHARACTER);
+}
+
+#[test]
+fn match_and_arrow_are_one_token_each() {
+    // `match` is a keyword now, and `=>` is a single token: an arm's `=` and `>`
+    // are never lexed apart, so `match x { 1 = > {} }` is a diagnostic rather
+    // than a two-token arm.
+    assert_eq!(lex_ok("match"), vec![TokenKind::Match, TokenKind::Eof]);
+    assert_eq!(lex_ok("=>"), vec![TokenKind::FatArrow, TokenKind::Eof]);
+    assert_eq!(
+        lex_ok("=>="),
+        vec![TokenKind::FatArrow, TokenKind::Eq, TokenKind::Eof],
+        "`=>` then `=` is two tokens, and so is a malformed arm"
+    );
+}
+
+#[test]
+fn an_identifier_containing_match_is_still_one_name() {
+    // Adding a keyword must not take a name away: a program with a variable
+    // called `match_count` keeps working, because keyword matching is on the
+    // whole word.
+    assert_eq!(
+        lex_ok("match_count"),
+        vec![TokenKind::Ident("match_count".to_string()), TokenKind::Eof]
+    );
+}
+
+#[test]
+fn an_assignment_is_still_two_tokens() {
+    // `=` did not become `=>`'s neighbour by accident: the pair table must keep
+    // `=` and `==` as well as the new `=>`.
+    assert_eq!(lex_ok("="), vec![TokenKind::Eq, TokenKind::Eof]);
+    assert_eq!(lex_ok("=="), vec![TokenKind::EqEq, TokenKind::Eof]);
+    assert_eq!(
+        lex_ok("= ="),
+        vec![TokenKind::Eq, TokenKind::Eq, TokenKind::Eof]
+    );
+}

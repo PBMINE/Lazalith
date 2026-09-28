@@ -721,10 +721,12 @@ fn section_13_every_documented_omission_is_rejected_by_name() {
         "enum Colour { Red } fn main() -> i32 { 0 }",
         lazalith_compiler::parser::codes::ENUM,
     );
-    // match
+    // `match` itself is not an omission any more — step 92 added it — but an
+    // inexhaustive one still is, and it is refused by its own name rather than
+    // by a confusing parse error.
     rejects_with(
-        "fn main() -> i32 { match 1 { } 0 }",
-        lazalith_compiler::parser::codes::MATCH,
+        "fn main() -> i32 { match 1 { 0 => { 1 } } 0 }",
+        lazalith_compiler::parser::codes::MATCH_EXHAUSTIVE,
     );
     // optional
     rejects_with(

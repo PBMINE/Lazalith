@@ -786,3 +786,132 @@ fn a_str_borrow_reads_its_place_instead_of_discarding_it() {
         "a str borrow is a read of the str, not a unit value: {value:?}"
     );
 }
+
+// A `match` adds no type rule of its own, because it is an `if` chain: the arms
+// are `value == pattern` comparisons, and `==` already has a rule. These tests
+// are that claim, made checkable — a `match` is accepted exactly when the `if`
+// chain it stands for would be, and refused exactly when it would be.
+
+#[test]
+fn a_match_on_an_integer_is_an_if_chain_and_is_accepted() {
+    accepts(
+        r#"
+fn f(x: i32) -> i32 {
+    match x {
+        0 => { return 1; },
+        1 => { return 2; },
+        else => { return 3; },
+    };
+    0
+}
+"#,
+    );
+}
+
+#[test]
+fn a_match_on_a_bool_is_accepted() {
+    accepts(
+        r#"
+fn f(flag: bool) -> i32 {
+    match flag {
+        true => { return 1; },
+        false => { return 2; },
+        else => { return 3; },
+    };
+    0
+}
+"#,
+    );
+}
+
+#[test]
+fn a_match_on_a_named_integer_or_bool_is_accepted() {
+    accepts(
+        r#"
+const LIMIT: i32 = 4;
+fn f(x: i32) -> i32 {
+    match x {
+        LIMIT => { return 1; },
+        else => { return 2; },
+    };
+    0
+}
+"#,
+    );
+}
+
+#[test]
+fn a_matched_arms_common_type_is_the_functions_result_type() {
+    // A match in value position, so its arms' common type is the value it has.
+    accepts(
+        r#"
+fn f(x: i32) -> i64 {
+    match x {
+        0 => { 1i64 },
+        else => { 2i64 },
+    }
+}
+"#,
+    );
+    accepts(
+        r#"
+fn f(x: i32) -> i64 {
+    let y: i64 = match x {
+        0 => { 1i64 },
+        else => { 2i64 },
+    };
+    return y;
+}
+"#,
+    );
+}
+
+#[test]
+fn a_match_whose_arms_agree_on_nothing_is_refused_like_any_other_block() {
+    // The arms' common type is found by the same code that finds a block's, so
+    // a `match` with mismatched arms is refused for the same reason an `if` with
+    // mismatched arms is: there is no single value for the expression to have.
+    let rendered = rejects_with(
+        r#"
+fn f(x: i32) -> i64 {
+    match x {
+        0 => { 1i64 },
+        else => { "two" },
+    }
+}
+"#,
+        codes::MISMATCH,
+    );
+    assert!(rendered.contains("found `str`"), "{rendered}");
+}
+
+#[test]
+fn a_match_on_a_string_is_refused_because_a_pattern_is_not_a_string() {
+    // The `==` rule catches it, not a `match` rule: a string has no `==`.
+    rejects_with(
+        r#"
+fn f(x: &[u8]) -> i32 {
+    match x {
+        0 => { return 1; },
+        else => { return 2; },
+    }
+}
+"#,
+        codes::MISMATCH,
+    );
+}
+
+#[test]
+fn a_match_on_an_array_is_refused_because_arrays_have_no_equality() {
+    rejects_with(
+        r#"
+fn f(x: [i32; 4]) -> i32 {
+    match x {
+        0 => { return 1; },
+        else => { return 2; },
+    }
+}
+"#,
+        codes::MISMATCH,
+    );
+}

@@ -251,3 +251,37 @@ fn the_repository_s_own_example_program_survives_the_formatter() {
         "the formatter changed a program that was already in the style"
     );
 }
+
+// A `match` is desugared in the parser, and the formatter works on tokens, so
+// the two never meet. That is a deliberate arrangement: if the formatter printed
+// from the tree it would write a `match` back out as a binding and an `if` chain,
+// and a person who ran `lazen fmt` would get a different program in their file.
+// These tests are the check that it does not.
+
+#[test]
+fn a_match_is_formatted_in_place_and_keeps_its_arms() {
+    let formatted = check(
+        "fn f(x: i32) -> i32 {\n    match x {\n        0 => {\n            return 1;\n        },\n        else => {\n            return 2;\n        },\n    }\n}\n",
+    );
+    assert!(formatted.contains("match x {"), "{formatted}");
+    assert!(formatted.contains("=> {"), "{formatted}");
+    assert!(
+        !formatted.contains("$match"),
+        "the compiler's binding must never reach a file: {formatted}"
+    );
+}
+
+#[test]
+fn a_match_with_comments_and_a_trailing_comma_keeps_both() {
+    let formatted = check(
+        "fn f(x: i32) -> i32 {\n    match x {\n        // the first case\n        0 => {\n            return 1;\n        },\n        else => {\n            return 2;\n        },\n    }\n    return 0;\n}\n",
+    );
+    assert!(formatted.contains("// the first case"), "{formatted}");
+    assert!(formatted.contains("=> {"), "{formatted}");
+}
+
+#[test]
+fn a_one_line_match_is_left_alone_because_it_is_already_canonical() {
+    let source = "fn f(x: i32) -> i32 { match x { 0 => { return 1; }, else => { return 2; } } }\n";
+    check(source);
+}
