@@ -348,10 +348,26 @@ impl<D: Device> Controls<D> {
         }
         self.process = Some(process);
         self.thread = Some(thread);
-        // Taken *after* the load and the handoff and before anything else has
-        // run, so a reset returns the machine to the state the person started
-        // debugging in rather than to some arbitrary point in the middle of a run.
-        self.reset_point = Some(self.controller.snapshot_machine());
+        // Taken *after* the load and the handoff and before anything else has run, so
+        // a reset returns the machine to the state the person started debugging in
+        // rather than to some arbitrary point in the middle of a run.
+        //
+        // A whole-machine snapshot now has to be able to drive the machine, because a
+        // process being activated keeps its memory in the machine rather than in the
+        // process, and a snapshot that cannot see that cannot capture the program it
+        // is a snapshot of. A frontend that cannot take one reports it, the same way
+        // it reports a failed handoff.
+        match self.controller.snapshot_machine() {
+            Ok(snapshot) => self.reset_point = Some(snapshot),
+            Err(error) => {
+                self.record(Diagnostic::new(
+                    DiagnosticKind::Frontend,
+                    "gui-snapshot-failed",
+                    format!("the reset point could not be captured: {error}"),
+                ));
+                return Err(error);
+            }
+        }
         Ok(())
     }
 

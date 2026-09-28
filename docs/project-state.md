@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-29 (hardening: 9 clusters audited, 8 confirmed defects, 1257 tests)
+Last updated: 2026-09-29 (hardening: 10 clusters audited, 9 confirmed defects, 1262 tests)
 
 ## Where the roadmap stands
 
@@ -1743,14 +1743,15 @@ missing, which is the state a state machine is in.
 # HARDENING PHASE
 
 The first 100 steps are complete. This phase is an adversarial audit, and its record
-is `docs/hardening.md`. Nine clusters are done and **eight confirmed defects** have
-been found: seven in the C frontend, all the kind a green suite cannot see — a program
-using `unsigned int` ran and produced wrong answers, every `unsigned long` constant
-panicked the compiler, and one silently became zero — and one in the runtime, which is
-the graphics defect `docs/graphics-test.md` had recorded with a reproduction and a
-*wrong theory* for a whole cluster.
+is `docs/hardening.md`. Ten clusters are done and **nine confirmed defects** have been
+found: seven in the C frontend, all the kind a green suite cannot see — a program using
+`unsigned int` ran and produced wrong answers, every `unsigned long` constant panicked
+the compiler, and one silently became zero — one in the runtime, which is the graphics
+defect `docs/graphics-test.md` had recorded with a reproduction and a *wrong theory* for
+a whole cluster, and one in the debugger, where restoring a snapshot and pressing
+continue reported the program finished after a single instruction.
 
-Nineteen *test* defects were found alongside them, which is the phase.s more
+Twenty-two *test* defects were found alongside them, which is the phase.s more
 interesting result: on this platform the implementation has been more reliable than
 the tests describing it.
 
@@ -1827,7 +1828,7 @@ against itself and against the shared backend, and never against C.
 
 1189 tests pass, and fmt, Clippy, check, `nix flake check` and `nix build` are green.
 
-## H4, H2, H6, H7, H8, H12 — clean; H2 and H10 again — four more confirmed defects
+## H4, H2, H6, H7, H8, H12 — clean; H2, H3/H10/H11 again — five more
 
 `docs/hardening.md` has the full record. In summary:
 
@@ -1865,6 +1866,33 @@ reason — a stale hand-computed constant, a case whose values did not distingui
 behaviours it compared, a baseline taken before a legitimate write, and one assertion
 demanding a checksum the object format was never going to have. Deriving an expected
 value in the test rather than writing it down is now a stated convention.
+
+## H3, H11 — the debugger: a restored machine reported the program finished, having run nothing
+
+`crates/lazalith-debug/tests/snapshot.rs` checked that a snapshot carries what it says
+it carries, field by field. That is exactly the shape of test that cannot see a
+missing piece, so the new file asks the question a field check cannot: run to
+completion, restore, run again, same answer.
+
+It did not have one. The second run reported `Exit { code: 0 }` after **one
+instruction**. A user who restored a snapshot and pressed continue would have been
+told their program had finished, having watched it do nothing.
+
+Three layers, each found only by fixing the one above. A `ProcessSnapshot` documents
+itself as capturing "state, memory, threads and handles — all four, because a process
+is all four", and for a *running* process that is false: activating a process swaps
+its regions into the machine, so the process the scheduler holds has the other half of
+the swap and cloning it captures a process whose address space is not its own.
+`snapshot_machine` now releases the active context, captures, and activates it again,
+which is why it takes `&mut self` and returns a `Result`. Then the restored process
+claimed `Running` with a context nothing was standing behind, so the scheduler found
+nothing runnable; and the machine claimed the same context, so it could not be
+re-activated. The three claims have to be undone together.
+
+The first draft also compared the two runs.s *step counts* and they differed by 41,
+which looked like a lossy restore. Restoring twice and running twice shows runs two and
+three are identical: the difference is a one-off in the first run, not a loss in the
+restore. The assertion moved to the test that can answer it.
 
 ## H7, H8 — kernel and filesystem: clean
 
@@ -1906,7 +1934,7 @@ It was *documented*, with evidence and a theory, and the theory was what kept it
 alive. Asking "which of these two addresses is right" could not have found it; asking
 "read the bytes through each and see which holds the picture" did, immediately.
 
-1257 tests pass, and fmt, strict Clippy, check, `nix flake check` and `nix build` are
+1262 tests pass, and fmt, strict Clippy, check, `nix flake check` and `nix build` are
 green. `lazalith-c-runtime` and `lazalith-runtime` are dev-dependencies of
 `lazalith-c-compiler`, as they should be; they were briefly regular dependencies when
 the cross-frontend test was written.

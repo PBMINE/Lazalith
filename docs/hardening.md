@@ -278,6 +278,90 @@ reserved or sliced.
 
 ---
 
+## H3, H11 — IR and the debugger: one confirmed defect
+
+**New test:** `crates/lazalith-debug/tests/hardening_snapshot_run.rs`.
+
+`tests/snapshot.rs` checks that a snapshot carries what it says it carries: the program
+counter, the registers, the stack pointer, the process. Every one of those is a *field*
+check, and every field check has a blind spot — the thing that was never mentioned is
+the thing that was never captured.
+
+So the question asked here is the one the field checks cannot ask: **run the program to
+completion, restore the snapshot, run it again, and require the same answer.**
+
+### Defect 9 — a restored machine reported the program finished, having run nothing
+
+```text
+first  stopped Exit { code: 0 }  steps 34753
+second stopped Exit { code: 0 }  steps     1
+```
+
+The second run reported a successful exit after **one instruction**. A user who
+restored a snapshot and pressed continue would have been told their program had
+finished, having watched it do nothing at all. And the test passed the whole time,
+because every existing test checked fields and this failure is not a field.
+
+There were three layers to it, and each was found only by fixing the one above it.
+
+**One: a process captured while it is running has no memory.** `ProcessSnapshot`
+clones the process, and `ProcessSnapshot` documents itself as capturing "a process.s
+state, memory, threads and handles" — "all four, because a process is all four". That
+is false for a running process, and the reason is structural: activating a process
+*swaps* its regions into the machine and the machine.s own user regions into the
+process. So at every point a debugger can stop at, the process the scheduler holds has
+the other half of the swap, and cloning it captures a process whose address space is
+not its own. A snapshot that omitted the memory of whichever process happened to be
+running would restore a machine whose program reads somebody else.s bytes.
+
+**Fix:** `snapshot_machine` can now drive the machine. It releases the active context
+— which puts the memory back where the process can be asked for it — takes the
+snapshot, and activates the context again. The machine ends in exactly the state it
+started in. This is why its signature changed from `&self` to `&mut self`, and why it
+now returns a `Result`: a controller that could not be put back is a controller whose
+next `run` would be meaningless, and the caller has to hear about it.
+
+**Two: the restored process claimed to be running, and to own a context.**
+`Process::restore` restores a `Running` process, but the scheduler.s own `current`
+binding belongs to the run that just finished, and nothing in a restore re-establishes
+it. `next_index` only ever selects a `Ready` process, so the scheduler found nothing
+runnable, the kernel.s step did nothing, and `run` reported `Exit { code: 0 }` after a
+single step — which is the first symptom above. And a process that still claims the
+context it was activated on cannot be *re*-activated, so the fix is both: demote to
+`Ready` and forget the context.
+
+**Three: so does the machine.** The snapshot.s processor came back claiming the same
+context, and `activate_user_context` refuses a machine that already has one. So the
+three claims have to be undone together: the process.s state, the process.s context,
+and the machine.s.
+
+### And a question the test asked that turned out to be the wrong one
+
+The first draft compared the *step counts* of the two runs, and they differed by 41.
+That looked like a lossy restore, and it was not: restoring the snapshot twice and
+running twice shows the second and third runs retiring the *same* number. The
+difference is a one-off in the very first run, which begins before the process has
+been through a debugger-driven activation. The assertion was moved to the test that
+can actually answer it, and `a_restored_machine_runs_to_the_same_answer_as_the_original`
+compares the program.s *output* instead — the thing a person would look at.
+
+Two test defects here as well. The program used `0u32 | 1u32 | 2u32` for open flags,
+which is C bitwise-or and not Lazen, where there is no single `|`. And the first
+output comparison read the terminal.s whole cumulative buffer for both runs, which is
+a comparison that can only ever fail once the program prints anything and says nothing
+about the program; the second run.s own output is the tail, and that is what is
+compared now.
+
+### The language gap this hit twice
+
+Lazen has no `&mut [u8]` to `&[u8]` coercion, so every standard-library function that
+takes `&[u8]` is unreachable from a program holding a mutable array, and both this file
+and H10.s had to build a read-only view from an address to reach one. It is a loud
+failure — a diagnostic, not a wrong answer — so it is a gap rather than a defect, and
+it is recorded as one.
+
+---
+
 ## H7, H8 — kernel and filesystem: clean
 
 **New test:** `crates/lazalith-os/tests/hardening_filesystem.rs`.
@@ -485,11 +569,11 @@ Three more test defects here, all of the same family as H2's and H4's:
 
 | | before | after |
 | --- | --- | --- |
-| tests | 1176 | 1257 |
-| confirmed defects | — | 8 (7 in the C frontend; 1 in the runtime, the recorded graphics defect) |
-| test defects found and fixed | — | 19 |
-| clusters audited | — | 9 (H2 twice, H4, H5, H6, H7/H8, H9, H10, H12) |
-| new tests | — | 81 |
+| tests | 1176 | 1262 |
+| confirmed defects | — | 9 (7 in the C frontend, 1 in the runtime, 1 in the debugger) |
+| test defects found and fixed | — | 22 |
+| clusters audited | — | 10 (H2 twice, H3/H11, H4, H5, H6, H7/H8, H9, H10, H12) |
+| new tests | — | 86 |
 
 Seven of the eight confirmed defects are in the C frontend, and all seven were found by a
 *differential* or *property* test rather than by reading code. Nothing in the suite

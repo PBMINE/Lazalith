@@ -644,9 +644,93 @@ impl<D: Device> DebugController<D> {
     /// `snapshot`'s module documentation for the whole list. A guest cannot
     /// observe any of them, and a snapshot that carried host state would be a
     /// thing a frontend could restore into a shape the machine had never been in.
-    pub fn snapshot_machine(&self) -> MachineSnapshot {
-        let processes = self.kernel.scheduler().processes().to_vec();
-        MachineSnapshot::of(self.machine.processor(), self.machine.devices(), processes)
+    ///
+    /// A whole-machine snapshot has to be able to *drive* the machine, and the reason
+    /// is the one thing about a process that is not in the process.
+    ///
+    /// While a process is activated, its memory is not in the process. Activating it
+    /// swapped the process.s regions into the machine and the machine.s own user
+    /// regions into the process, so at every point a debugger can stop at, the
+    /// process the scheduler is holding has the *other* half of the swap. Cloning it
+    /// therefore captures a process whose address space is not its own — which is
+    /// what `ProcessSnapshot` claims to capture, and is not.
+    ///
+    /// So this quiesces the machine: the active context is released, which puts the
+    /// memory back where the process can be asked for it, the snapshot is taken, and
+    /// the context is activated again. The machine is in exactly the state it was in
+    /// before, and the snapshot is of a process that owns its own memory.
+    ///
+    /// That is a heavier operation than reading a few registers, and it is
+    /// correspondingly honest: a "whole machine" snapshot that quietly omitted the
+    /// memory of whichever process happened to be running would be a snapshot that
+    /// restores a machine whose program is reading somebody else.s bytes.
+    pub fn snapshot_machine(&mut self) -> Result<MachineSnapshot, DebugError> {
+        let active = self.machine.active_execution_context();
+        let Some(context) = active else {
+            let processes = self.kernel.scheduler().processes().to_vec();
+            return Ok(MachineSnapshot::of(
+                self.machine.processor(),
+                self.machine.devices(),
+                processes,
+            ));
+        };
+        let process_id = self
+            .kernel
+            .scheduler()
+            .active()
+            .map(|active| active.process_id)
+            .ok_or_else(|| {
+                DebugError::Snapshot(String::from(
+                    "the machine has an active context but the scheduler has no current process",
+                ))
+            })?;
+        // The processor's state is read before the release, because a release leaves
+        // the machine in supervisor state with no execution context and that is not
+        // what the snapshot is of.
+        let architectural = self.machine.architectural_state().clone();
+        // The machine and the kernel are destructured rather than reached through
+        // `self` twice, because the release needs both of them at once: a mutable
+        // borrow of `self.kernel` and a mutable borrow of `self.machine` overlap from
+        // the compiler's point of view when they go through the same `self`.
+        let Self {
+            machine, kernel, ..
+        } = self;
+        machine
+            .release_user_context(
+                kernel
+                    .scheduler_mut()
+                    .process_mut(process_id)
+                    .ok_or_else(|| {
+                        DebugError::Snapshot(String::from(
+                            "the active process is not one this kernel has",
+                        ))
+                    })?
+                    .memory_mut()
+                    .address_space_mut(),
+                context,
+            )
+            .map_err(|error| DebugError::Machine(Box::new(error)))?;
+        let processes = kernel.scheduler().processes().to_vec();
+        let snapshot = MachineSnapshot::of(machine.processor(), machine.devices(), processes);
+        // And the machine goes back to being the machine it was. A failure here is
+        // reported rather than swallowed: a controller that could not be put back is
+        // a controller whose next `run` would be meaningless, and the caller has to
+        // know that.
+        machine
+            .activate_user_context(
+                kernel
+                    .scheduler_mut()
+                    .process_mut(process_id)
+                    .ok_or_else(|| {
+                        DebugError::Snapshot(String::from("the active process has gone"))
+                    })?
+                    .memory_mut()
+                    .address_space_mut(),
+                architectural,
+                context,
+            )
+            .map_err(|error| DebugError::Machine(Box::new(error)))?;
+        Ok(snapshot)
     }
 
     /// Puts a whole machine back.
@@ -682,11 +766,49 @@ impl<D: Device> DebugController<D> {
                     ))
                 })?;
             process.restore(captured.process());
+            // A process captured *while it was running* is captured in state
+            // `Running`, because that is the state the scheduler puts it in when it
+            // activates it. The scheduler is not mid-activation here: its own
+            // `current` binding belongs to the run that has just finished, and
+            // nothing in a restore re-establishes it. So a process left in `Running`
+            // is a claim nothing is standing behind — and the consequence is not an
+            // error but something much worse: `next_index` only ever selects a
+            // `Ready` process, so the scheduler finds nothing runnable, the kernel's
+            // step does nothing, and `run` reports `Exit { code: 0 }` after a single
+            // step. A user who restored a snapshot and pressed continue would be told
+            // their program had finished, having watched it do nothing at all.
+            //
+            // So the restored process is demoted to `Ready`, which is the state a
+            // process is in between activations, and the scheduler is free to activate
+            // it again — which also re-establishes the user address space, since that
+            // is what activating a process does.
+            if process.state() == ProcessState::Running {
+                process
+                    .preempt()
+                    .map_err(|error| DebugError::Snapshot(format!("{error:?}")))?;
+            }
+            // And the execution context goes with it, for the same reason. A process
+            // that still claims the context it was activated on cannot be activated
+            // *again*, and a restore that leaves a process un-activatable has
+            // succeeded at restoring and failed at its only purpose.
+            process.clear_execution_context();
         }
         snapshot
             .cpu()
             .restore(self.machine.processor_mut())
             .map_err(DebugError::Snapshot)?;
+        // And the machine's own execution context goes with the process's, for the
+        // same reason and with the same consequence if it is missed. A snapshot is
+        // taken of a machine with a process *activated* on it, so the processor comes
+        // back claiming that context — and `activate_user_context` refuses a machine
+        // that already has one. The three claims have to be undone together: the
+        // process's state, the process's context, and the machine's.
+        if let Some(context) = self.machine.active_execution_context() {
+            self.machine
+                .processor_mut()
+                .trap_controller_mut()
+                .clear_execution_context(context);
+        }
         // The sessions follow the processes. Without this a program that had
         // exited when the snapshot was taken would come back with a *running*
         // process and a session that still said it had exited, so `run` would

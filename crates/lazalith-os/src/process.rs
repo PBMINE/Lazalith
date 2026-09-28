@@ -1049,7 +1049,15 @@ impl Process {
         }
     }
 
-    pub(crate) fn clear_execution_context(&mut self) {
+    /// Forgets which execution context this process is bound to.
+    ///
+    /// A process is bound to a context for as long as it is *activated* on the
+    /// machine, and a restore is not an activation: the machine.s binding belongs to
+    /// the run that has just finished. A process that came back from a snapshot still
+    /// claiming a context cannot be activated again, because `activate` refuses a
+    /// process that is already bound, and the consequence is a restore that looks
+    /// successful and leaves a machine that cannot be run.
+    pub fn clear_execution_context(&mut self) {
         self.execution_context = None;
     }
 
@@ -1098,7 +1106,13 @@ impl Process {
         &self.memory
     }
 
-    pub(crate) fn memory_mut(&mut self) -> &mut UserMemory {
+    /// The process's memory, for a caller that has to put something in it.
+    ///
+    /// A snapshot is the caller this exists for: while a process is activated its
+    /// memory is in the machine, and a snapshot that cannot see that cannot capture
+    /// the program it is a snapshot of. Activation and release stay inside the kernel
+    /// and are unchanged; this is only a door for the debugger.
+    pub fn memory_mut(&mut self) -> &mut UserMemory {
         &mut self.memory
     }
 

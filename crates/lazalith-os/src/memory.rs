@@ -303,7 +303,13 @@ impl UserMemory {
         &self.space
     }
 
-    pub(crate) fn address_space_mut(&mut self) -> &mut AddressSpace {
+    /// The address space, for a caller that has to swap it with a machine.s.
+    ///
+    /// A snapshot is the caller: while a process is activated its regions are in the
+    /// machine, so capturing a process means moving them back first, and that is this
+    /// accessor. Nothing else may swap them, because a region moved behind the
+    /// scheduler.s back would be a region the scheduler does not know about.
+    pub fn address_space_mut(&mut self) -> &mut AddressSpace {
         &mut self.space
     }
 

@@ -109,7 +109,7 @@ fn a_snapshot_round_trips_the_machine() {
     let mut controller = controller();
     advance(&mut controller);
 
-    let saved = controller.snapshot_machine();
+    let saved = controller.snapshot_machine().expect("a snapshot");
     let before = controller.registers();
     assert_eq!(
         saved.cpu().pc(),
@@ -159,12 +159,12 @@ fn a_snapshot_carries_the_whole_processor() {
     controller.step(PID).expect("the handoff");
     advance(&mut controller);
 
-    let saved = controller.snapshot_machine();
+    let saved = controller.snapshot_machine().expect("a snapshot");
     // The snapshot's view of the processor agrees with the machine's, at every
     // step of a run. A snapshot that dropped the frame stack would agree until
     // the first trap and disagree after it.
     for step in 0..200 {
-        let live = controller.snapshot_machine();
+        let live = controller.snapshot_machine().expect("a snapshot");
         assert_eq!(
             live.cpu().in_trap(),
             saved.cpu().in_trap(),
@@ -175,7 +175,7 @@ fn a_snapshot_carries_the_whole_processor() {
 
     // Now save the machine as it actually is, so the restore below is compared
     // against the same moment rather than against one two hundred steps earlier.
-    let saved = controller.snapshot_machine();
+    let saved = controller.snapshot_machine().expect("a snapshot");
     let before = controller.registers();
     controller.set_step_limit(2_000_000);
     controller.run(PID).expect("a run to completion");
@@ -200,7 +200,7 @@ fn a_snapshot_carries_the_process_s_memory() {
     let mut controller = controller();
     advance(&mut controller);
 
-    let saved = controller.snapshot_machine();
+    let saved = controller.snapshot_machine().expect("a snapshot");
     let saved_stack = controller.stack(8).expect("the stack is readable");
     let saved_sp = controller.registers().sp();
 
@@ -239,7 +239,7 @@ fn a_snapshot_records_whether_a_process_had_finished() {
     controller.set_step_limit(2_000_000);
     controller.run(PID).expect("a run to completion");
 
-    let saved = controller.snapshot_machine();
+    let saved = controller.snapshot_machine().expect("a snapshot");
     assert!(
         saved.processes()[0].finished(),
         "the snapshot knows it exited"
@@ -259,8 +259,8 @@ fn a_snapshot_records_whether_a_process_had_finished() {
 /// where there is a display to snapshot.
 #[test]
 fn a_snapshot_holds_one_entry_per_device() {
-    let controller = controller();
-    let saved = controller.snapshot_machine();
+    let mut controller = controller();
+    let saved = controller.snapshot_machine().expect("a snapshot");
     assert_eq!(
         saved.devices().len(),
         controller.device_count(),
@@ -278,7 +278,7 @@ fn a_snapshot_holds_one_entry_per_device() {
 fn a_snapshot_carries_no_host_state() {
     let mut controller = controller();
     advance(&mut controller);
-    let saved = controller.snapshot_machine();
+    let saved = controller.snapshot_machine().expect("a snapshot");
 
     // The terminal is host-side: a program writes to it and the bytes go to
     // whoever is showing them, but the guest cannot read them back. So the bytes
@@ -311,7 +311,7 @@ fn a_snapshot_carries_no_host_state() {
 #[test]
 fn a_snapshot_of_a_different_shape_is_refused() {
     let mut controller = controller();
-    let saved = controller.snapshot_machine();
+    let saved = controller.snapshot_machine().expect("a snapshot");
     assert!(
         controller.restore_machine(&saved).is_ok(),
         "a matching restore works"
@@ -320,8 +320,8 @@ fn a_snapshot_of_a_different_shape_is_refused() {
     // A machine with no processes at all, which is what a controller that was
     // booted and never given a program looks like. Its snapshot has the right
     // shape and the wrong number of processes.
-    let bare = bare();
-    let empty = bare.snapshot_machine();
+    let mut bare = bare();
+    let empty = bare.snapshot_machine().expect("a snapshot");
     assert_eq!(
         empty.process_count(),
         0,
@@ -338,7 +338,11 @@ fn a_snapshot_of_a_different_shape_is_refused() {
         other => panic!("expected a refusal, got {other:?}"),
     }
     assert_eq!(
-        controller.snapshot_machine().cpu().pc(),
+        controller
+            .snapshot_machine()
+            .expect("a snapshot")
+            .cpu()
+            .pc(),
         saved.cpu().pc(),
         "and the machine was not touched by the refused restore"
     );
