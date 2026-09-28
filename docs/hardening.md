@@ -278,6 +278,31 @@ reserved or sliced.
 
 ---
 
+## H1 — architecture: the widened door has exactly one caller
+
+The hardening phase widened two kernel accessors for the debugger, and a widened
+accessor is a hole in a rule rather than a detail of a fix — so the rule now has a
+fourteenth check.
+
+`Process::memory_mut` and `UserMemory::address_space_mut` were `pub(crate)` and became
+public, because a whole-machine snapshot has to move a running process.s memory out of
+the machine and back (defect 9). What makes the door safe is that **only the debugger
+walks through it**: swapping a process.s address space behind the scheduler.s back
+would put regions in the machine the scheduler does not know about, and the consequence
+is a process reading memory that is not its own.
+
+So the check is not "the accessor is public" — that is the fix — but "the accessor has
+exactly one caller outside the kernel". Verified to bite: adding the call site to the
+runtime.s source makes it fail with `left: {"lazalith-debug", "lazalith-runtime"}`.
+
+The needle is `.memory_mut()` together with `address_space_mut(` rather than the
+two-step chain, because `rustfmt` splits that chain across lines and a rule that
+formatting can defeat is not a rule. It also has to exclude the machine and memory
+crates, which reach *their own* address-space accessors, which are about a bus and are
+not this door.
+
+---
+
 ## H3, H11 — IR and the debugger: one confirmed defect
 
 **New test:** `crates/lazalith-debug/tests/hardening_snapshot_run.rs`.
@@ -569,11 +594,11 @@ Three more test defects here, all of the same family as H2's and H4's:
 
 | | before | after |
 | --- | --- | --- |
-| tests | 1176 | 1262 |
+| tests | 1176 | 1263 |
 | confirmed defects | — | 9 (7 in the C frontend, 1 in the runtime, 1 in the debugger) |
 | test defects found and fixed | — | 22 |
-| clusters audited | — | 10 (H2 twice, H3/H11, H4, H5, H6, H7/H8, H9, H10, H12) |
-| new tests | — | 86 |
+| clusters audited | — | 11 (H1, H2 twice, H3/H11, H4, H5, H6, H7/H8, H9, H10, H12) |
+| new tests | — | 87 |
 
 Seven of the eight confirmed defects are in the C frontend, and all seven were found by a
 *differential* or *property* test rather than by reading code. Nothing in the suite

@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-29 (hardening: 10 clusters audited, 9 confirmed defects, 1262 tests)
+Last updated: 2026-09-29 (hardening: 11 clusters audited, 9 confirmed defects, 1263 tests)
 
 ## Where the roadmap stands
 
@@ -1743,7 +1743,7 @@ missing, which is the state a state machine is in.
 # HARDENING PHASE
 
 The first 100 steps are complete. This phase is an adversarial audit, and its record
-is `docs/hardening.md`. Ten clusters are done and **nine confirmed defects** have been
+is `docs/hardening.md`. Eleven clusters are done and **nine confirmed defects** have been
 found: seven in the C frontend, all the kind a green suite cannot see — a program using
 `unsigned int` ran and produced wrong answers, every `unsigned long` constant panicked
 the compiler, and one silently became zero — one in the runtime, which is the graphics
@@ -1867,6 +1867,16 @@ behaviours it compared, a baseline taken before a legitimate write, and one asse
 demanding a checksum the object format was never going to have. Deriving an expected
 value in the test rather than writing it down is now a stated convention.
 
+## H1 — architecture: the widened door has exactly one caller
+
+The H11 fix widened two kernel accessors for the debugger, and a widened accessor is a
+hole in a rule rather than a detail of a fix. `Process::memory_mut` and
+`UserMemory::address_space_mut` were `pub(crate)` and became public, because a snapshot
+has to move a running process.s memory out of the machine. The rule now has a
+fourteenth check: **only the debugger reaches it**, because swapping an address space
+behind the scheduler.s back would put regions in the machine it does not know about.
+Verified to bite.
+
 ## H3, H11 — the debugger: a restored machine reported the program finished, having run nothing
 
 `crates/lazalith-debug/tests/snapshot.rs` checked that a snapshot carries what it says
@@ -1934,7 +1944,7 @@ It was *documented*, with evidence and a theory, and the theory was what kept it
 alive. Asking "which of these two addresses is right" could not have found it; asking
 "read the bytes through each and see which holds the picture" did, immediately.
 
-1262 tests pass, and fmt, strict Clippy, check, `nix flake check` and `nix build` are
+1263 tests pass, and fmt, strict Clippy, check, `nix flake check` and `nix build` are
 green. `lazalith-c-runtime` and `lazalith-runtime` are dev-dependencies of
 `lazalith-c-compiler`, as they should be; they were briefly regular dependencies when
 the cross-frontend test was written.

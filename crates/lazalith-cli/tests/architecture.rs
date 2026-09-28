@@ -411,6 +411,52 @@ fn guest_faults_and_emulator_bugs_are_distinguishable() {
     assert_eq!(names.len(), 3, "three kinds, three distinct names");
 }
 
+/// The hardening phase widened two kernel accessors for the debugger, and a widened
+/// accessor is a hole in a rule rather than a detail of a fix.
+///
+/// `Process::memory_mut` and `UserMemory::address_space_mut` were `pub(crate)` and are
+/// now public, because a whole-machine snapshot has to move a running process's
+/// memory out of the machine and back — and a process being activated keeps its
+/// regions in the machine, not in itself, so a snapshot cannot see the program it is
+/// a snapshot of without that door.
+///
+/// What makes the door safe is that **only the debugger walks through it.** Swapping a
+/// process's address space behind the scheduler's back would put regions in the
+/// machine that the scheduler does not know about, and the consequence of that is a
+/// process reading memory that is not its own. So the check is not "the accessor is
+/// public" — that is the fix — but "the accessor has exactly one caller outside the
+/// kernel", which is the invariant the fix could otherwise have quietly broken.
+#[test]
+fn only_the_debugger_reaches_the_address_space_mutators() {
+    let mut reach: BTreeSet<String> = BTreeSet::new();
+    for (name, path) in crates() {
+        // The kernel is the one place that is *supposed* to do this, so it is not a
+        // violation. Everything else is.
+        if name == "lazalith-os" {
+            continue;
+        }
+        for file in walk(&path.join("src")) {
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            // The machine and the memory crate reach *their own* accessors, which are
+            // about a bus's address space and are not this door, so the needle is the
+            // first step rather than the second. It is `.memory_mut()` on its own
+            // because a call this test cannot see is one `rustfmt` has split across
+            // two lines, and a rule that formatting can defeat is not a rule.
+            if text.contains(".memory_mut()") && text.contains("address_space_mut(") {
+                reach.insert(name.clone());
+            }
+        }
+    }
+    assert_eq!(
+        reach,
+        BTreeSet::from([String::from("lazalith-debug")]),
+        "only lazalith-debug may reach a process's address space outside the kernel, \
+         because only it has a reason to"
+    );
+}
+
 /// The crate source files whose contents match `wanted`.
 fn grep_crates(wanted: &dyn Fn(&Path, &str) -> bool) -> Vec<PathBuf> {
     let mut hits = Vec::new();
