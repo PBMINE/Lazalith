@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-28 (Steps 1–86 complete and verified)
+Last updated: 2026-09-28 (Steps 1–87 complete and verified)
 
 ## Where the roadmap stands
 
@@ -34,9 +34,10 @@ Step  83      complete: assembly, C and Lazen convergence
 Step  84      complete: property testing
 Step  85      complete: differential testing
 Step  86      complete: fuzzing
+Step  87      complete: deterministic replay
 ```
 
-The 1001 workspace tests all pass, including the 4 in
+The 1019 workspace tests all pass, including the 4 in
 `crates/lazalith-runtime/tests/window.rs` that build
 `examples/window/main.lz` from the repository and run it through the display and
 input drivers, and the 16 in `crates/lazalith-gui/tests/panels.rs` that run real
@@ -756,6 +757,59 @@ recording: a parser target counted a refusal as a failure when refusing malforme
 source is the correct answer, and an empty string table was treated as malformed
 input rather than as "there is no program", which has to produce a machine that
 stops at the start rather than a refusal to build one.
+
+## Step 87 — deterministic replay
+
+A run is reproducible from four things:
+
+```text
+binary          what the program is
+architecture    which machine it runs on
+initial state   where that machine starts
+input log       what the outside world did to it
+```
+
+`lazalith_debug::ReplaySession` takes exactly those four and produces a `Trace`.
+The same four twice give the same trace field for field; a state or a log written
+down and read back replays to itself; and `Trace::difference` names the first field
+two traces disagree about, because a `PartialEq` on a twelve-field struct reports
+*that* two runs differ, which is the one thing someone reproducing a bug does not
+need to be told twice.
+
+Three decisions in it are the interesting part.
+
+**Devices are not in the initial state.** The obvious design snapshots every device.
+This one does not, because a device is a *model of the outside world* and the outside
+world is not in the snapshot — the input log is. A device is a function of the input
+it was given and the virtual time it has been ticked, and the artifact carries both,
+so snapshotting a device would store a cache of something derivable and create a
+second source of truth to disagree with the first. What replaces it is stricter: a
+trace records how many events reached the program, so a replay that fed a device
+differently produces a different trace and is caught rather than assumed right.
+
+**Virtual time is one cycle per instruction.** A scheduler that advanced the clock by
+a host tick or a wall clock would make the trace depend on the machine it ran on,
+which is the one thing a reproduction must not do. There is a test that asserts
+`trace.time == trace.steps` for exactly this reason.
+
+**A log whose order is ambiguous is refused rather than sorted.** Two events on the
+same cycle could go either way, and a log that ordered them arbitrarily would replay
+into a *different* run than the one recorded — the worst failure available, because
+the reproduction would be confidently wrong. `InputLog::push` refuses an event that
+arrives before the last one, and the log is a list rather than a map.
+
+### Where it sits, and what that costs
+
+Below the kernel: a machine, a program image, and a log. No supervisor, no
+filesystem, no process table. That is deliberate — the kernel's own state would have
+to be in the artifact for the promise to hold, and until it is, a replay that
+included it would be a promise about something this implementation does not check.
+The initial state carries everything a *program* can observe: the processor, the
+trap vector, and every region's bytes and permissions.
+
+A by-product of writing it: `DeviceManager` gained `device_mut`. A manager whose
+devices could only be reached through a full-state restore had a gap in it — a host
+feeding an input device had to reconstruct a queue in order to append to it.
 
 
 ## Earlier milestones

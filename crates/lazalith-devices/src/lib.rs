@@ -224,6 +224,17 @@ impl<D: Device> DeviceManager<D> {
     pub fn device(&self, id: DeviceId) -> Result<&D, DeviceError> {
         Ok(&self.entry(id)?.device)
     }
+    /// A device, mutably.
+    ///
+    /// The counterpart to [`DeviceManager::device`], and the access a host needs to
+    /// feed one: an input device is fed by injection and a display is told what to
+    /// draw, and neither is a state restore. Rebuilding a device from its own
+    /// snapshot is the way to *put back* a state, not the way to act on a device,
+    /// and a host that had to do it that way would be reconstructing a queue in
+    /// order to append to it.
+    pub fn device_mut(&mut self, id: DeviceId) -> Result<&mut D, DeviceError> {
+        Ok(&mut self.entry_mut(id)?.device)
+    }
     pub fn address_len(&self, id: DeviceId) -> Result<u64, DeviceError> {
         Ok(self.entry(id)?.length)
     }

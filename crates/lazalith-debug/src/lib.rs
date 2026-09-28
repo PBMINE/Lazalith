@@ -53,14 +53,18 @@ extern crate alloc;
 
 mod controller;
 pub mod diagnostic;
+pub mod input_log;
 mod registers;
+mod replay;
 mod session;
 mod snapshot;
 
 pub use controller::{
     DebugController, Disassembly, RunOutcome, StackView, StepOutcome, StopReason,
 };
+pub use input_log::{InputLog, InputLogError, InputRecord};
 pub use registers::{REGISTER_COUNT, RegisterSnapshot, RegisterValue};
+pub use replay::{MachineState, ReplayError, ReplaySession, StateError, StateRegion, Stop, Trace};
 pub use session::{DebugSession, DebugSnapshot, ExecutionState, Watchpoint, WatchpointSize};
 pub use snapshot::{CpuSnapshot, DeviceSnapshot, MachineSnapshot, ProcessSnapshot};
 
