@@ -208,11 +208,19 @@ impl<'a> Lexer<'a> {
                 self.lex_punctuator(start);
             }
             if self.at == start {
-                // A one-byte advance is the only way this loop can end: every
-                // branch either consumes at least one byte or reports and
-                // consumes. Without it an unrecognised character would spin
-                // forever, which is a hang a person cannot diagnose.
-                self.at += 1;
+                // A one-character advance is the only way this loop can end: every
+                // branch either consumes at least one byte or reports and consumes.
+                // Without it an unrecognised character would spin forever, which is a
+                // hang a person cannot diagnose.
+                //
+                // *One character*, and not one byte, and that is the whole point of
+                // saying so. `at` is a byte offset and every span is built from one, so
+                // a byte-wise advance through a three-byte character leaves `at` in
+                // the middle of it — and the next token's span is then not a character
+                // boundary, which is a panic in `slice` rather than a diagnostic. A
+                // UTF-8 byte in a comment or a string is not exotic; a C file with one
+                // is a file somebody has.
+                self.at += self.character_width();
             }
         }
         let end = self.len();
@@ -775,13 +783,56 @@ impl<'a> Lexer<'a> {
         });
     }
 
+    /// How many bytes the character at `at` occupies.
+    ///
+    /// One for ASCII, which is every byte below `0x80`, and otherwise the length
+    /// UTF-8 gives the character starting here. The leading byte carries the
+    /// length in its top bits, so this reads the file's own encoding rather than
+    /// counting continuation bytes — and a truncated sequence at the end of a file
+    /// is one byte, because that is what it is.
+    fn character_width(&self) -> u32 {
+        let Some(byte) = self.peek(self.at) else {
+            return 1;
+        };
+        if byte < 0x80 {
+            return 1;
+        }
+        let width = match byte {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => 1,
+        };
+        // A sequence that claims a width it does not have is not a character. The
+        // lexer will report it as an unknown character, and stepping one byte is the
+        // only way to make progress past it.
+        let available = self.len().saturating_sub(self.at);
+        if available < width {
+            return 1;
+        }
+        let bytes = (0..width).map(|offset| self.peek(self.at + offset));
+        if bytes.clone().all(|byte| matches!(byte, Some(0x80..=0xbf))) {
+            width
+        } else {
+            1
+        }
+    }
+
     fn slice(&self, start: u32, end: u32) -> &str {
         let start = (start as usize).min(self.text.len());
         let end = (end as usize).min(self.text.len());
-        // A span is always inside the file, and a slice built from one is too.
-        // A multi-byte character is only ever reached at a character boundary,
-        // because every branch that advances does so by a whole character or by
-        // a token the grammar has already accepted.
+        // A span is always inside the file, and a slice built from one is too, as
+        // long as every advance moves by a whole character — which is what
+        // `character_width` is for. This is the second line of defence, and it is
+        // here because the first one is a property of *every* branch rather than of
+        // one: a span that landed inside a character would otherwise be a panic, and
+        // a panic in a lexer is a crash on a file somebody's editor produced.
+        //
+        // Rounding outwards keeps the offending bytes inside the slice, so a
+        // diagnostic about a multi-byte character still quotes the character rather
+        // than losing it.
+        let start = floor_boundary(self.text, start);
+        let end = ceil_boundary(self.text, end);
         &self.text[start..end]
     }
 
@@ -870,4 +921,20 @@ pub const KEYWORDS: &[&str] = &[
 /// Whether a name is a C keyword.
 pub fn is_keyword(name: &str) -> bool {
     KEYWORDS.contains(&name)
+}
+
+/// The largest character boundary at or below `index`.
+fn floor_boundary(text: &str, mut index: usize) -> usize {
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// The smallest character boundary at or above `index`.
+fn ceil_boundary(text: &str, mut index: usize) -> usize {
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index.min(text.len())
 }

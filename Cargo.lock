@@ -33,6 +33,7 @@ dependencies = [
  "lazalith-memory",
  "lazalith-os",
  "lazalith-os-abi",
+ "lazalith-properties",
  "lazalith-runtime",
  "lazalith-toolchain",
  "lazalith-types",
@@ -93,6 +94,7 @@ dependencies = [
  "lazalith-ir",
  "lazalith-isa",
  "lazalith-os-abi",
+ "lazalith-properties",
  "lazalith-types",
 ]
 
@@ -191,6 +193,7 @@ dependencies = [
  "lazalith-devices",
  "lazalith-diagnostics",
  "lazalith-isa",
+ "lazalith-properties",
  "lazalith-types",
 ]
 
@@ -264,6 +267,7 @@ dependencies = [
  "lazalith-isa",
  "lazalith-os",
  "lazalith-os-abi",
+ "lazalith-properties",
  "lazalith-types",
 ]
 
