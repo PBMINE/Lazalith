@@ -906,3 +906,51 @@ fn the_trap_vector_has_one_definition() {
          layout field instead, the way it already re-exports KERNEL_INITIAL_SP"
     );
 }
+
+// -- B7: the display backend boundary -------------------------------------------
+
+/// The display backend lives above the SDL FFI boundary, not inside it.
+///
+/// `lazalith-sdl3` has **no Lazalith dependencies at all**, and that is load-bearing
+/// rather than tidy: it is the whole auditable `unsafe` surface of the project, and its
+/// own documentation says it "knows nothing about machines, registers or guest memory".
+/// A display backend needs to know what a guest frame is, so putting it there would
+/// have made the FFI boundary guest-aware — and the moment SDL could see a `DisplayFrame`
+/// the claim that the unsafe surface contains no Lazalith logic stopped being true.
+#[test]
+fn the_sdl_ffi_boundary_does_not_know_about_guests() {
+    let found = dependencies("lazalith-sdl3");
+    assert!(
+        found.is_empty(),
+        "lazalith-sdl3 depends on {found:?}: that crate is the project's entire `unsafe` \
+         surface, and its value is that the unsafe can be audited in one file that has \
+         no Lazalith logic in it. A display backend needs to know what a guest frame is, \
+         so it belongs in lazalith-gui."
+    );
+}
+
+/// The guest-visible display device holds no backend, and cannot reach one.
+///
+/// The inverse of B5's rule, and it is the reason the two subsystems do not share a
+/// shape. A block device is *pushed to* — a guest's register write must reach storage
+/// during the write — so it holds a backend. A display is *pulled by* the host: a guest
+/// writes pixels into memory and rings a present register, and the frame is a
+/// description. If the device called a backend during `present`, one guest instruction
+/// would call into the host synchronously and a host that stopped answering would stall
+/// the machine with no fault and no timeout.
+#[test]
+fn the_display_device_holds_no_backend() {
+    let display =
+        std::fs::read_to_string(workspace().join("crates/lazalith-devices/src/display.rs"))
+            .expect("the display device reads");
+    let code = strip_comments(&display);
+    for forbidden in ["Box<dyn DisplayBackend", "DisplayBackend", "fn backend("] {
+        assert!(
+            !code.contains(forbidden),
+            "lazalith-devices/src/display.rs mentions `{forbidden}`: the display device is \
+             the guest's, and giving it a backend would make a host call happen inside a \
+             guest register write. The boundary for a display is the reverse of B5's, and \
+             that asymmetry is the design."
+        );
+    }
+}

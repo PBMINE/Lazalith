@@ -223,6 +223,16 @@ fn syscall_error(error: DisplayError) -> SyscallError {
         DisplayError::EmptyWindow | DisplayError::ReadOnlyRegister(_) => {
             SyscallError::InvalidArgument
         }
+        // A geometry that changed without a new open is a guest bug, and the guest is
+        // what this mapping is for: the syscall surface reports it as an invalid
+        // argument rather than hiding it, because a guest whose window size is not what
+        // it thinks is a guest whose drawing will be wrong.
+        // A host that returned the wrong number of bytes for a frame is the host.s bug,
+        // not the guest.s, but the guest sees a refusal either way 2014 and a guest that
+        // cannot see a frame is a guest that should be told its drawing is not landing.
+        DisplayError::ShortFrameRead { .. } | DisplayError::WindowGeometryMismatch { .. } => {
+            SyscallError::InvalidArgument
+        }
         DisplayError::WindowTooLarge { .. } | DisplayError::FramebufferOverflow { .. } => {
             SyscallError::ResourceExhausted
         }

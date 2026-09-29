@@ -152,6 +152,8 @@ jobs:
         run: nix develop --command cargo test -p lazalith-machine --test engine -- --nocapture
       - name: the device/backend boundary
         run: nix develop --command cargo test -p lazalith-devices --test backend -- --nocapture
+      - name: the display backend boundary
+        run: nix develop --command cargo test -p lazalith-devices --test graphics -- --nocapture
       - name: the VM lifecycle, reset and boot contract
         run: nix develop --command cargo test -p lazalith-vm --test lifecycle -- --nocapture
       - name: boot, linker and object-format suites

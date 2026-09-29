@@ -5,6 +5,7 @@ extern crate alloc;
 mod backend;
 mod console;
 mod display;
+mod graphics;
 pub mod host_input;
 pub mod input;
 mod storage;
@@ -20,6 +21,10 @@ pub use display::{
     REGISTER_FRAMEBUFFER, REGISTER_HEIGHT, REGISTER_LAST_PRESENT, REGISTER_PRESENT,
     REGISTER_PRESENT_COUNT, REGISTER_STATUS, REGISTER_WIDTH, STATUS_PRESENTED, frame_bytes,
     pixel_at, zeroed_framebuffer,
+};
+pub use graphics::{
+    DisplayBackend, DisplayBackendError, DisplayFrame, DisplayProfile, DisplayPump,
+    HeadlessDisplayBackend, frame_len, open_window, presented_geometry, pump_display,
 };
 pub use host_input::{
     HostAction, HostKey, HostScript, KEY_BACKSLASH, KEY_BACKSPACE, KEY_COMMA, KEY_DIGIT_FIRST,

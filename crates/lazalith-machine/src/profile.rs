@@ -47,7 +47,8 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{error::Error, fmt};
 use lazalith_devices::{
     BackendError, BlockDevice, ConsoleDevice, CopyOnWriteBlockBackend, Device, DeviceError,
-    DeviceId, DeviceManager, DisplayDevice, InputDevice, MemoryBlockBackend, TimerDevice,
+    DeviceId, DeviceManager, DisplayDevice, DisplayProfile, InputDevice, MemoryBlockBackend,
+    TimerDevice,
 };
 use lazalith_isa::{ControlRegister, ISA_VERSION};
 use lazalith_memory::{MemoryFault, MemoryRegion, RegionKind, RegionPermissions};
@@ -326,6 +327,15 @@ pub struct DeviceProfile {
     pub console_capacity: usize,
     /// The storage behind a block device. `None` for every other class.
     pub block: Option<BlockStorage>,
+    /// Which display architecture this device presents.
+    ///
+    /// §28 names three and only one exists. The field is here so a machine can *say*
+    /// which, which is different from being able to build it 2014 the same distinction B4
+    /// drew for `lza64-at-v1`, and for the same reason: a profile that named a VGA
+    /// display and validated would be a machine that cannot draw.
+    ///
+    /// `None` means the platform default, `DisplayProfile::Native`.
+    pub display: Option<DisplayProfile>,
 }
 
 impl DeviceProfile {
@@ -342,6 +352,7 @@ impl DeviceProfile {
             permissions,
             console_capacity: 0,
             block: None,
+            display: None,
         }
     }
 
@@ -358,6 +369,12 @@ impl DeviceProfile {
     /// field.
     pub const fn block_storage(&self) -> Option<BlockStorage> {
         self.block
+    }
+
+    /// The same entry, naming a display architecture.
+    pub const fn with_display_profile(mut self, display: DisplayProfile) -> Self {
+        self.display = Some(display);
+        self
     }
 
     /// The same entry, with the storage behind a block device.
@@ -687,6 +704,15 @@ impl MachineProfile {
                     address: device.address,
                 });
             }
+            if let Some(display) = device.display
+                && device.class == DeviceClass::Display
+                && !display.is_constructible()
+            {
+                return Err(ProfileError::UnconstructibleDisplay {
+                    id: device.id,
+                    profile: display,
+                });
+            }
             if device.class == DeviceClass::Block {
                 let storage = device.block_storage().ok_or(ProfileError::BlockStorage {
                     id: device.id,
@@ -947,6 +973,19 @@ pub enum ProfileError {
     },
     /// A device class this build has no constructor for.
     UnconstructibleDevice { class: DeviceClass, id: DeviceId },
+    /// A display architecture this build has no constructor for.
+    ///
+    /// §28 names three — native, VGA-compatible, and a modern framebuffer — and only
+    /// the native one is built. This is the refusal for the other two, and it is
+    /// deliberately specific: a caller who wrote `VgaCompatible` into a profile needs
+    /// to know that *the VGA display* is missing, not that the display class is
+    /// generally unavailable, and the two lead to different work.
+    UnconstructibleDisplay {
+        /// The device whose display architecture cannot be built.
+        id: DeviceId,
+        /// Which architecture was asked for.
+        profile: lazalith_devices::DisplayProfile,
+    },
     /// The host storage a block device asked for was refused.
     ///
     /// Distinct from `UnconstructibleDevice` because the class *is* constructible:
@@ -1055,6 +1094,13 @@ impl fmt::Display for ProfileError {
             }
             Self::UnconstructibleDevice { class, id } => {
                 write!(f, "this build cannot construct a {class} device for {id:?}")
+            }
+            Self::UnconstructibleDisplay { id, profile } => {
+                write!(
+                    f,
+                    "this build cannot construct a {profile} display for {id:?}; only the \
+                     native display architecture exists"
+                )
             }
             Self::Storage { id, source } => {
                 write!(f, "the storage for device {id:?} was refused: {source}")

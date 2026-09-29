@@ -848,3 +848,67 @@ fn a_copy_on_write_disk_is_buildable() {
         "the overlay is writable even though its base is not, and a guest can see that"
     );
 }
+
+// -- B7: the display profile ---------------------------------------------------
+
+/// A display device names its architecture, and the native one builds.
+#[test]
+fn a_native_display_profile_builds() {
+    let profile = MachineProfile::lza64_native_v1().with_device(
+        DeviceProfile::new(
+            DeviceId::new(5),
+            DeviceClass::Display,
+            PhysicalAddress::new(0x4003_0000),
+            RegionPermissions::new(true, true, false, true),
+        )
+        .with_display_profile(lazalith_devices::DisplayProfile::Native),
+    );
+    assert!(profile.validate().is_ok());
+    let machine = ProfiledMachine::from_profile(&profile).expect("a native display builds");
+    machine
+        .matches_profile(&profile)
+        .expect("and the machine is the one described");
+}
+
+/// The two display architectures §28 names but B7 does not build are refused.
+#[test]
+fn an_unbuilt_display_architecture_is_refused_by_name() {
+    for display in [
+        lazalith_devices::DisplayProfile::VgaCompatible,
+        lazalith_devices::DisplayProfile::ModernFramebuffer,
+    ] {
+        let profile = MachineProfile::lza64_native_v1().with_device(
+            DeviceProfile::new(
+                DeviceId::new(5),
+                DeviceClass::Display,
+                PhysicalAddress::new(0x4003_0000),
+                RegionPermissions::new(true, true, false, true),
+            )
+            .with_display_profile(display),
+        );
+        assert!(
+            matches!(
+                profile.validate(),
+                Err(ProfileError::UnconstructibleDisplay { profile: p, .. }) if p == display
+            ),
+            "a {display} display must be refused by name, so the caller knows it is the \
+             VGA display that is missing rather than that displays are unavailable"
+        );
+    }
+}
+
+/// A display with no architecture named gets the platform default.
+#[test]
+fn a_display_with_no_architecture_named_uses_the_native_one() {
+    let profile = MachineProfile::lza64_native_v1().with_device(DeviceProfile::new(
+        DeviceId::new(5),
+        DeviceClass::Display,
+        PhysicalAddress::new(0x4003_0000),
+        RegionPermissions::new(true, true, false, true),
+    ));
+    assert!(
+        profile.validate().is_ok(),
+        "naming no architecture means the native one, and a display that had to name it \
+         to be built would be a display most callers could not use"
+    );
+}

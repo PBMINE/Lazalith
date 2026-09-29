@@ -501,10 +501,33 @@ pub enum DisplayError {
     },
     /// A framebuffer address of zero was given.
     NullFramebuffer,
+    /// The host returned fewer bytes than the frame at this geometry needs.
+    ///
+    /// **Not `FramebufferOverflow`**, which is about a geometry that does not fit an
+    /// addressable size. This is the host breaking its side of the contract, and it
+    /// deserves its own name because the two are fixed by different people: one by the
+    /// device.s geometry check, the other by whoever wrote the `read`.
+    ShortFrameRead {
+        /// How many bytes the frame needs.
+        expected: u64,
+        /// How many the host gave.
+        found: usize,
+    },
     /// A present or geometry query with no window open.
     NoWindow,
     /// A register that only the device may write was written.
     ReadOnlyRegister(DeviceOffset),
+    /// A frame was handed to a backend whose window is a different size.
+    ///
+    /// **A refusal, not a re-open.** A backend that resized itself to match would hide a
+    /// guest that changed its geometry without asking, and the guest.s window would then
+    /// be a function of what the host felt like doing.
+    WindowGeometryMismatch {
+        /// The geometry the window was opened at.
+        window: (u64, u64),
+        /// The geometry of the frame.
+        frame: (u64, u64),
+    },
 }
 
 impl fmt::Display for DisplayError {
@@ -528,10 +551,18 @@ impl fmt::Display for DisplayError {
             Self::NullFramebuffer => {
                 write!(f, "a framebuffer cannot start at address zero")
             }
+            Self::ShortFrameRead { expected, found } => {
+                write!(f, "a {expected} byte frame was given {found} bytes")
+            }
             Self::NoWindow => write!(f, "no window is open"),
             Self::ReadOnlyRegister(offset) => {
                 write!(f, "register {} is written by the device", offset.as_u64())
             }
+            Self::WindowGeometryMismatch { window, frame } => write!(
+                f,
+                "the window is {}x{} and the frame is {}x{}",
+                window.0, window.1, frame.0, frame.1
+            ),
         }
     }
 }

@@ -39,10 +39,12 @@
 
 #![deny(missing_docs)]
 
+pub mod display;
 pub mod font;
 pub mod view;
 pub mod window;
 
+pub use display::{CLEAR, Sdl3DisplayBackend, framebuffer_bytes};
 pub use view::{
     Diagnostic, DiagnosticKind, Diagnostics, Emphasis, Line, Panel, Screen, Section, SourcePlace,
     View, ViewOptions,

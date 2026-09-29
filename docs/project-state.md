@@ -6789,3 +6789,161 @@ stage that puts a real display behind the B5 backend boundary.
 work now: a *file* backend over `BlockBackend` makes `lza64-virt-v1` real, and B5's
 invariant that a backend is never a guest interface is exactly the discipline a file
 backend needs.
+
+---
+
+# B7 — native display architecture
+
+`binstruction.md` §28, and §25's "Standard Computer Hardware → display". Preceded by
+`1ec4a70` (B6).
+
+## What was already there, confirmed
+
+- `DisplayDevice` with a real guest-visible register interface: width, height,
+  framebuffer address, present, present count, last present, ABI version, status.
+- `PresentedFrame`, `frame_bytes`, `pixel_at` — a frame is a *description* the host
+  resolves.
+- `lazalith-sdl3`, the project's entire `unsafe` surface, with **no Lazalith
+  dependencies at all**.
+- `lazalith-gui/src/view.rs`, which pulled frames and converted them with
+  `to_window_pixels` — correctly, and hard-wired to a window.
+
+## What changed
+
+### A `DisplayBackend` trait, in `lazalith-devices`
+
+`open` / `present` / `close`, `no_std`, taking a resolved `DisplayFrame` of geometry
+plus bytes. `HeadlessDisplayBackend` records geometry, a frame count and an FNV-1a
+checksum of the pixels, so a test can assert *what was drawn* rather than only that
+something was.
+
+### `Sdl3DisplayBackend`, in `lazalith-gui` — **not** in `lazalith-sdl3`
+
+The first attempt put it in `lazalith-sdl3` because that is where the SDL window lives.
+It was moved on reading that crate's own documentation:
+
+> "It has no Lazalith logic in it, knows nothing about machines, registers or guest
+> memory, and cannot execute an instruction."
+
+A display backend needs to know what a guest frame is. Putting it there would have made
+the FFI boundary guest-aware, and the moment SDL could see a `DisplayFrame` the claim
+that the unsafe surface contains no Lazalith logic would have stopped being true. So
+the trait is declared in `lazalith-devices` and implemented in `lazalith-gui`, which
+already depended on both. `the_sdl_ffi_boundary_does_not_know_about_guests` holds the
+crate's zero-dependency property shut.
+
+### `DisplayProfile`, and the two architectures that do not exist
+
+`Native`, `VgaCompatible`, `ModernFramebuffer`. Only `Native` is constructible.
+`DeviceProfile` gained `display: Option<DisplayProfile>`, and a profile naming one of
+the other two is refused with `ProfileError::UnconstructibleDisplay` **naming which
+architecture** — a caller who wrote `VgaCompatible` needs to know the VGA display is
+missing, not that displays are generally unavailable, because those lead to different
+work.
+
+§28 requires VGA/EGA to be researched from historical primary sources first, and that
+has not been done. So `VgaCompatible` carries no register map and no behaviour, and a
+test says so by name so that implementing it later is a deliberate deletion rather than
+an accident.
+
+## The design decision worth arguing about
+
+**A display device holds no backend, and that is the opposite of B5.**
+
+A block device *is pushed to*: a guest's register write has to reach the host's storage
+during the write, so the device holds a backend. A display is *pulled by* the host: a
+guest writes pixels into ordinary memory and rings a present register, and the frame is
+a description of where to look.
+
+So:
+
+- if the device called a backend during `present`, **one guest instruction would call
+  into the host synchronously**. A host that had stopped answering — a window being
+  dragged, a compositor that hung — would stall the machine with no fault and no
+  timeout, and a guest could trigger it with a single store;
+- pulling means the host renders on its own schedule, and a machine whose display nobody
+  is watching costs nothing at all.
+
+`pump_display` is therefore a free function the *host* calls, not a method on the
+device. `a_pump_does_not_change_the_device_s_own_state` checks that a pump does not
+move the present counter — if it did, the guest would see its own counter change because
+a window happened to be on screen.
+
+## Two error types, because of a derive
+
+`DisplayError` is `Copy` and every variant of it is a structural fact about the device.
+A backend failure is a fact about the *host* — SDL's own error text — and that is a
+`String`.
+
+The first attempt put `Backend { operation, detail: String }` into `DisplayError` and
+the compiler refused: `String` is not `Copy`. That was the right refusal. Putting a host
+message in a structural error would have given every geometry refusal a heap
+allocation it does not need, so there are now two types — `DisplayError` (Copy,
+structural) and `DisplayBackendError` (not Copy, carries host text), with
+`From<DisplayError>` for a backend reporting a device refusal.
+
+## A refusal that turned out to be misnamed
+
+A host `read` that returns fewer bytes than the frame needs was producing
+`FramebufferOverflow` — which is about a geometry that does not fit an addressable size.
+The two are fixed by different people: one by the device's geometry check, the other by
+whoever wrote the host's `read`. So `DisplayError::ShortFrameRead { expected, found }`
+exists, and `a_short_read_is_refused_before_the_backend_sees_it` asserts the backend is
+never handed a slice it would have to read past.
+
+## Invariants now checked rather than asserted
+
+| Invariant | Test |
+| --- | --- |
+| The SDL FFI boundary knows nothing about guests | `the_sdl_ffi_boundary_does_not_know_about_guests` |
+| The display device holds no backend | `the_display_device_holds_no_backend` |
+
+Both are claims about the *absence* of a thing, and both would pass on a rewrite that
+added a backend to the device or a `DisplayFrame` to the FFI crate.
+
+## Tests
+
+`crates/lazalith-devices/tests/graphics.rs`, 13 tests: the profile taxonomy, that a
+pump does not mutate the device, that a backend receives the geometry *and* the
+pixels (by checksum, so a frame of the right size with the wrong contents fails), that
+two different frames differ, that an unreadable framebuffer is an outcome rather than a
+backend failure, and that a closed window keeps what was last drawn.
+
+Three tests in `crates/lazalith-machine/tests/profile.rs` for the display profile.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1398 passed, 0 failed**
+- `nix flake check`, `nix build`, `actionlint` ✅
+
+## Limitations at the end of this stage
+
+1. **No VGA, and no modern framebuffer.** Named and refused. The VGA register map needs
+   the primary-source research §28 requires, and that is B27's work with the Linux
+   port.
+2. **`Sdl3DisplayBackend` is untested at runtime.** It is in a crate whose whole point
+   is to need a display device, so it cannot be tested in CI. The trait it implements
+   and the geometry handling it does are covered through `HeadlessDisplayBackend`; the
+   SDL calls themselves are not. That is a real gap and it is the crate's known cost.
+3. **One guest pixel format.** 4 bytes per pixel, `0xAARRGGBB` little-endian, which is
+   SDL's `RGBA32`, so `framebuffer_bytes` is a copy. A second guest format means a
+   second backend, not a branch in this one — and the copy is named so that the day the
+   format changes, the function to change is findable.
+4. **The GUI's `view.rs` still has its own `to_window_pixels`.** B7 added the backend
+   boundary and did not rewire the debugger's screen panel through it, so there are
+   two paths from a `PresentedFrame` to pixels. They agree today. Unifying them is
+   mechanical and is noted rather than done, because doing it would have meant changing
+   a panel that 1398 tests currently agree on.
+5. **`DisplayProfile` is per display device, not per machine.** A machine with two
+   displays could name two different architectures. That may be right; it has not been
+   argued either way.
+6. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B8, storage architecture** (§31). A *file* backend over B5's `BlockBackend` is a
+contained piece of work now that the boundary exists and its invariant is checked, and
+it is what makes `lza64-virt-v1` — which `docs/machine-profiles.md` §4 records as
+"not built, needs a storage backend" — into a real profile rather than a name.
