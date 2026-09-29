@@ -881,5 +881,80 @@ fn collect_debug(objects: &[ObjectFile], layout: &LinkedLayout) -> Result<DebugB
             });
         }
     }
-    DebugBlock::with_entries(files, entries).map_err(|_| LinkError::BadDebugBlock)
+    let mut block =
+        DebugBlock::with_entries(files, entries).map_err(|_| LinkError::BadDebugBlock)?;
+    collect_functions(objects, layout, &mut block)?;
+    Ok(block)
+}
+
+/// Records each defined function's name and body, for §17's "which function am I in".
+///
+/// **Built from the linked symbol table, not from the source.** The linker is the only
+/// stage that knows both a function's name and where its body ended up, so a debugger
+/// that wants a function boundary and a tool that guesses one from the nearest symbol
+/// are answering the same question two different ways, and only one of them is right
+/// at the boundary between two functions.
+///
+/// The end of a function is the start of the next one in address order, or the end of
+/// its section. Using the section end rather than the function's last byte means the
+/// last function in a section extends over the padding after it, which is a region no
+/// program counter is ever in — and it means a function is never reported as ending
+/// mid-instruction, which a size-based answer could do.
+///
+/// Only *text* symbols are recorded: a data symbol is not a function, and a debugger
+/// asked "which function?" about an address in `.data` should be told nothing.
+fn collect_functions(
+    objects: &[ObjectFile],
+    layout: &LinkedLayout,
+    block: &mut DebugBlock,
+) -> Result<(), LinkError> {
+    // (address, name, end of the section the symbol is in)
+    let mut found: Vec<(u64, String, u64)> = Vec::new();
+    for (object_index, object) in objects.iter().enumerate() {
+        let placement = match layout.placements.get(object_index) {
+            Some(placement) => placement,
+            None => continue,
+        };
+        for symbol in object.symbols() {
+            if !matches!(symbol.binding(), SymbolBinding::Global) {
+                continue;
+            }
+            let Some(section) = symbol.section() else {
+                continue;
+            };
+            let Some(placed) = placement.sections.get(section.get() as usize) else {
+                continue;
+            };
+            // A symbol in a section the linker placed at zero is data, or a `.bss`
+            // placeholder — the same reasoning the mappings use. A data symbol is not
+            // a function and a debugger asked "which function?" about an address in
+            // `.data` should be told nothing.
+            if placed.base == 0 && layout.bss_size > 0 {
+                continue;
+            }
+            let address = placed
+                .base
+                .checked_add(symbol.value())
+                .ok_or(LinkError::DataOverflow)?;
+            found.push((
+                address,
+                symbol.name().into(),
+                placed.base.saturating_add(placed.size),
+            ));
+        }
+    }
+    // Address order, so a function's end is the next one's start.
+    found.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    for (index, (start, name, section_end)) in found.iter().enumerate() {
+        let end = found
+            .get(index + 1)
+            .map(|(next, ..)| *next)
+            .unwrap_or(*section_end);
+        block.add_function(lazalith_os::debug::DebugFunction {
+            name: name.clone(),
+            start: *start,
+            end: end.max(*start),
+        });
+    }
+    Ok(())
 }

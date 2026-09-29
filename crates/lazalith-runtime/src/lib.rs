@@ -191,7 +191,29 @@ impl RuntimeProgram {
         objects
             .try_reserve(2)
             .map_err(|_| RuntimeError::Allocation)?;
-        objects.push(program.object().clone());
+        let mut object = program.object().clone();
+        // §17: the debug source the compiler produced is the *composed* unit, named
+        // for the user's file. Split it here rather than in the driver, because this is
+        // where every Lazen program is built — a split the driver had to remember to
+        // do would leave `RuntimeProgram`'s own images (and so every existing caller)
+        // resolving their line numbers into the standard library.
+        if !options.prelude.is_empty() {
+            if let Some(index) = object
+                .debug_sources()
+                .iter()
+                .position(|source| source.path() == options.source_path)
+            {
+                let at = composed_runtime_offset(&options.prelude, source);
+                object
+                    .split_debug_source(index, at, &options.source_path, LAZEN_RUNTIME_DEBUG_NAME)
+                    .map_err(|error| {
+                        RuntimeError::Image(lazalith_os::LzxError::DebugBlock {
+                            reason: alloc::format!("{error}"),
+                        })
+                    })?;
+            }
+        }
+        objects.push(object);
         Ok(Self {
             architecture: options.architecture,
             program,
@@ -287,6 +309,28 @@ pub fn compose(prelude: &str, program: &str) -> String {
     unit
 }
 
+/// The byte offset in a composed unit at which the *runtime* begins.
+///
+/// **B17's reason this exists.** `compose` is one text, and a compiler compiling it
+/// produces spans in it — so every span in the user's program is offset by the
+/// program itself, and every span in the runtime is offset by the program plus a
+/// blank line. That is fine for compiling and useless for debugging: the object's
+/// debug source is named for the user's file, so a line number resolves into the
+/// standard library while claiming to be in `hello.lz`.
+///
+/// The driver calls this and splits the object's debug source at the returned offset,
+/// which is what makes a debugger report the line the user wrote. The offset is
+/// *derived* rather than kept beside the text, so it cannot disagree with the text.
+pub fn composed_runtime_offset(prelude: &str, program: &str) -> u32 {
+    compose(prelude, program);
+    let program_end = if program.ends_with('\n') {
+        program.len()
+    } else {
+        program.len() + 1
+    };
+    u32::try_from(program_end + 1).unwrap_or(u32::MAX)
+}
+
 /// A diagnostic that has already been rendered, so a caller can print it without
 /// the compiler's own types.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -357,3 +401,10 @@ pub fn prelude_is_complete(named: &[&str]) -> bool {
     }
     found == named.len()
 }
+
+/// The name a Lazen standard library's half of a composed unit is recorded under.
+///
+/// `<lazalith-runtime>`, and the angle brackets are the point: this is a name for
+/// text with no file behind it, and a debugger that printed a path a user could open
+/// would be promising something that does not exist.
+pub const LAZEN_RUNTIME_DEBUG_NAME: &str = "<lazalith-runtime>";

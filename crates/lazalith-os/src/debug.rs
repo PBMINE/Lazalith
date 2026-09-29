@@ -37,13 +37,20 @@ use lazalith_types::{ByteOffset, LineColumn, SourceFile, SourceId, SourceManager
 pub const DEBUG_MAGIC: [u8; 8] = *b"LZXDBG01";
 
 /// The block's format version.
-pub const DEBUG_VERSION: u16 = 1;
+///
+/// **2** since B17 added the function table. The header grew by one word, so a version-1
+/// reader would read the entry count's neighbour as the file count and fail in a way that
+/// says nothing useful; the version check is the honest refusal.
+pub const DEBUG_VERSION: u16 = 2;
 
 /// The bytes one mapping takes: an address, a source, and a source range.
 const ENTRY_SIZE: usize = 20;
 
 /// The bytes a block's header takes, before any file or mapping.
-const HEADER_SIZE: usize = 20;
+const HEADER_SIZE: usize = 24;
+
+/// The bytes one function takes: a start, an end, and a length-prefixed name.
+const FUNCTION_OVERHEAD: usize = 16;
 
 /// The least a file costs: the two length words its name and text have.
 const MINIMUM_FILE_SIZE: usize = 8;
@@ -167,6 +174,35 @@ impl DebugFile {
     }
 }
 
+/// A function's name and the body it covers.
+///
+/// **A range, not an address.** §17 asks a debugger to map a guest PC to a function,
+/// and the honest question is "which body is this instruction in?" — not "which symbol
+/// is nearest", which is a different question and gives a different answer in the gap
+/// between one function and the next.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DebugFunction {
+    /// The qualified symbol name, as the linker knows it.
+    pub name: String,
+    /// The first address of the function's body.
+    pub start: u64,
+    /// The first address *after* the body.
+    ///
+    /// `u64::MAX` when the linker could not tell where the next function starts, which
+    /// is normal for the last one in a section. The lookup treats that as extending to
+    /// the end of the address space, and that is deliberate: a function whose end the
+    /// linker did not know is better described that way than as ending at its last
+    /// instruction.
+    pub end: u64,
+}
+
+impl DebugFunction {
+    /// Whether `address` is inside this function.
+    pub const fn contains(&self, address: u64) -> bool {
+        address >= self.start && address < self.end
+    }
+}
+
 /// One run of instructions and the source it came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DebugEntry {
@@ -196,6 +232,7 @@ impl DebugEntry {
 pub struct DebugBlock {
     files: Vec<DebugFile>,
     entries: Vec<DebugEntry>,
+    functions: Vec<DebugFunction>,
     sources: SourceManager,
 }
 
@@ -219,6 +256,7 @@ impl DebugBlock {
         Self {
             files: Vec::new(),
             entries: Vec::new(),
+            functions: Vec::new(),
             sources: SourceManager::new(),
         }
     }
@@ -261,6 +299,7 @@ impl DebugBlock {
         Ok(Self {
             files,
             entries,
+            functions: Vec::new(),
             sources,
         })
     }
@@ -278,6 +317,46 @@ impl DebugBlock {
     /// The mappings, in address order.
     pub fn entries(&self) -> &[DebugEntry] {
         &self.entries
+    }
+
+    /// The functions this block knows about, in address order.
+    pub fn functions(&self) -> &[DebugFunction] {
+        &self.functions
+    }
+
+    /// The function whose body contains `address`.
+    ///
+    /// **§17's "function"**, and it is answered from a range rather than from a
+    /// nearest-symbol search because a debugger asking "which function am I in?" means
+    /// "which function's body is this instruction in?", and those are different
+    /// questions at the boundary between two functions.
+    ///
+    /// A function with no known end — the linker could not tell where the next one
+    /// starts, which is normal for the last function in a section — extends to the end
+    /// of the address space, which is the same convention the entry sequence uses for
+    /// itself. A PC past the last function and in no mapping at all therefore names
+    /// nothing, rather than naming the last function in the image.
+    pub fn function_at(&self, address: u64) -> Option<&DebugFunction> {
+        let index = self
+            .functions
+            .partition_point(|function| function.start <= address);
+        index.checked_sub(1).and_then(|at| {
+            let function = &self.functions[at];
+            (address < function.end).then_some(function)
+        })
+    }
+
+    /// Records a function's name and body.
+    ///
+    /// **Sorted on insert**, because the lookup is a binary search and every producer
+    /// of this data is somewhere else in the tree. An unsorted table would answer
+    /// "no function" for a PC that is in one, which is the failure a debugger can least
+    /// afford: the code looks unlabelled rather than wrong.
+    pub fn add_function(&mut self, function: DebugFunction) {
+        let at = self
+            .functions
+            .partition_point(|existing| existing.start <= function.start);
+        self.functions.insert(at, function);
     }
 
     /// The source manager the offsets resolve against.
@@ -385,7 +464,12 @@ impl DebugBlock {
             .iter()
             .map(|file| 8 + file.name().len() + file.text().len())
             .sum();
-        HEADER_SIZE + file_bytes + self.entries.len() * ENTRY_SIZE
+        let function_bytes: usize = self
+            .functions
+            .iter()
+            .map(|function| FUNCTION_OVERHEAD + function.name.len())
+            .sum();
+        HEADER_SIZE + file_bytes + self.entries.len() * ENTRY_SIZE + function_bytes
     }
 
     /// Encodes the block.
@@ -402,6 +486,10 @@ impl DebugBlock {
             &mut out,
             u32::try_from(self.entries.len()).unwrap_or(u32::MAX),
         );
+        put_u32(
+            &mut out,
+            u32::try_from(self.functions.len()).unwrap_or(u32::MAX),
+        );
         for file in &self.files {
             put_bytes(&mut out, file.name().as_bytes());
             put_bytes(&mut out, file.text().as_bytes());
@@ -411,6 +499,11 @@ impl DebugBlock {
             put_u32(&mut out, entry.source);
             put_u32(&mut out, entry.offset);
             put_u32(&mut out, entry.length);
+        }
+        for function in &self.functions {
+            put_u64(&mut out, function.start);
+            put_u64(&mut out, function.end);
+            put_bytes(&mut out, function.name.as_bytes());
         }
         out
     }
@@ -432,6 +525,7 @@ impl DebugBlock {
         }
         let file_count = read_u32(bytes, 12) as usize;
         let entry_count = read_u32(bytes, 16) as usize;
+        let function_count = read_u32(bytes, 20) as usize;
         let mut at = HEADER_SIZE;
         let mut files = Vec::new();
         files
@@ -459,6 +553,12 @@ impl DebugBlock {
                 needed: entry_count.saturating_mul(ENTRY_SIZE),
             });
         }
+        if function_count.saturating_mul(FUNCTION_OVERHEAD) > remaining() {
+            return Err(DebugError::Truncated {
+                offset: at,
+                needed: function_count.saturating_mul(FUNCTION_OVERHEAD),
+            });
+        }
         for _ in 0..file_count {
             let name = read_bytes(bytes, &mut at)?;
             let text = read_bytes(bytes, &mut at)?;
@@ -480,13 +580,39 @@ impl DebugBlock {
             });
             at += ENTRY_SIZE;
         }
+        // §17's function table. Read after the mappings and before the trailing-bytes
+        // check, so a block with a function table is accepted and one with anything
+        // after the table is still refused.
+        let mut functions = Vec::new();
+        functions
+            .try_reserve_exact(function_count)
+            .map_err(|_| DebugError::Count {
+                what: "function",
+                value: function_count as u64,
+            })?;
+        for _ in 0..function_count {
+            let start = read_u64(bytes, at);
+            let end = read_u64(bytes, at + 8);
+            // The name follows the two words. `read_bytes` advances the cursor
+            // itself, so the two words are stepped over rather than consumed and the
+            // cursor is restored — a `?` on a call that both advances and can fail is
+            // how an off-by-two in an encoding hides.
+            let mut cursor = at + 16;
+            let name = read_bytes(bytes, &mut cursor)?;
+            at = cursor;
+            functions.push(DebugFunction { name, start, end });
+        }
         if at != bytes.len() {
             return Err(DebugError::TrailingBytes {
                 offset: at,
                 length: bytes.len() - at,
             });
         }
-        Self::with_entries(files, entries)
+        let mut block = Self::with_entries(files, entries)?;
+        for function in functions {
+            block.add_function(function);
+        }
+        Ok(block)
     }
 }
 

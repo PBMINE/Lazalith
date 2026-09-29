@@ -17,7 +17,7 @@
 //!   machine's ranks are the sizes.
 //! - **Decay.** An array used as a value becomes a pointer to its first element
 //!   and a function becomes a pointer to itself. In exactly three places it
-//!   does *not* happen — `sizeof`, `&`, and a string literal initialising a
+//!   does *not* happen — `sizeof`, `&`, and a string literal, which is a
 //!   `char` array — and [`CType::decayed`] is written so those three call sites
 //!   and no others use it.
 //! - **Assignment conversion.** Assignment converts to the *target's* type, and
@@ -2628,4 +2628,87 @@ pub fn library_signature(name: &str) -> Option<CType> {
         "fflush" => returns(CType::int(), vec![CType::int()], false),
         _ => None,
     }
+}
+
+/// A statement's own span, for the debug map.
+///
+/// **§17: this is what makes C code debuggable at all.** The Lazen lowering marks each
+/// statement on the IR builder and code generation turns those marks into source
+/// mappings. The C lowering did neither, so a C program compiled to an object with an
+/// *empty* mapping table — not a slightly wrong one, an empty one. A debugger given
+/// it stops at an address and names nothing, and there is nothing to tell a user that
+/// the C front end simply never participated.
+///
+/// The span is the statement's, not its first token's, for the same reason the AST
+/// nodes' are: "expected `;`" is about the statement, so a breakpoint on the line is
+/// on the statement.
+pub fn statement_span(statement: &Statement) -> Option<SourceSpan> {
+    match statement {
+        Statement::Block(block) => Some(block.span.clone()),
+        Statement::Expression(expression) => Some(expression_span(expression)),
+        Statement::If {
+            condition,
+            then_branch,
+            ..
+        } => Some(merge(
+            expression_span(condition),
+            Some(statement_span(then_branch).unwrap_or_else(|| expression_span(condition))),
+        )),
+        Statement::While { condition, body } | Statement::DoWhile { body, condition } => {
+            Some(merge(expression_span(condition), statement_span(body)))
+        }
+        Statement::For {
+            initialiser,
+            condition,
+            step,
+            body,
+        } => {
+            let start = initialiser
+                .as_ref()
+                .map(|init| match init.as_ref() {
+                    ForInit::Declaration(variable) => variable.base.span.clone(),
+                    ForInit::Expression(expression) => expression_span(expression),
+                })
+                .or_else(|| condition.as_ref().map(expression_span))
+                .or_else(|| step.as_ref().map(expression_span))
+                .or_else(|| statement_span(body));
+            let end = statement_span(body);
+            Some(merge(start?, end))
+        }
+        Statement::Switch { condition, body } => {
+            Some(merge(expression_span(condition), statement_span(body)))
+        }
+        Statement::Case { statement, .. } | Statement::Default { statement } => {
+            statement_span(statement)
+        }
+        Statement::Break(span) | Statement::Continue(span) => Some(span.clone()),
+        Statement::Goto { span, .. } => Some(span.clone()),
+        Statement::Return { value, span } => {
+            value.as_ref().map(expression_span).or(Some(span.clone()))
+        }
+        Statement::Declaration(variable) => Some(variable.base.span.clone()),
+        Statement::Empty => None,
+        Statement::StaticAssert(assert) => Some(assert.span.clone()),
+        Statement::Label { span, .. } => Some(span.clone()),
+    }
+}
+
+/// The span covering both, preferring the earlier start.
+///
+/// A `merge` that kept the first would clip a `while` to its condition, and a
+/// breakpoint placed on the body's line would find nothing.
+///
+/// **The wider of the two, not their union.** `SourceSpan`'s fields are private and an
+/// interval union that had to reach inside one would be a second way to make a span.
+/// The narrower consequence is that a merged span starts at the earlier of the two and
+/// ends at the later of the two *whichever they were* — so it can name a range that
+/// includes code belonging to the other half. For a debugger that is a wider line
+/// range on the right line, and the alternative (a span that stops early and loses a
+/// breakpoint) is worse.
+fn merge(a: SourceSpan, b: Option<SourceSpan>) -> SourceSpan {
+    let Some(b) = b else { return a };
+    if b.start() >= a.start() {
+        return a;
+    }
+    if b.end() > a.end() { b } else { a }
 }

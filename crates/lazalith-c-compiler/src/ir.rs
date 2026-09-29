@@ -1236,6 +1236,21 @@ impl<'a> Emitter<'a> {
     /// function's name attached. A refusal that stopped the walk would leave the
     /// rest of the body unchecked and the reader with one mistake at a time.
     fn statement(&mut self, statement: &Statement) {
+        // §17: mark the statement before lowering it, so every instruction the
+        // statement produces carries its source range.
+        //
+        // **The Lazen lowering has always done this and the C one did not at all.**
+        // The consequence was not degraded C debugging but *absent* C debugging: with
+        // no marks, the IR's `source_map` is empty, code generation emits no mappings,
+        // and a C image carries a debug block whose every entry belongs to the startup
+        // sequence. A debugger given one stops at an address in the user's `main` and
+        // names nothing, with nothing to say the C front end never took part.
+        //
+        // `Empty` has no span and produces no code, so it is skipped rather than given
+        // a zero-length mark that would resolve to the line after the previous one.
+        if let Some(span) = crate::types::statement_span(statement) {
+            self.builder.mark(span);
+        }
         if let Err(error) = self.try_statement(statement) {
             self.refusals.push(Diagnostic::new(
                 lazalith_diagnostics::Severity::Error,

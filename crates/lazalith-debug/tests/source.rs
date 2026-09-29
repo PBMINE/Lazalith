@@ -338,17 +338,36 @@ fn addresses_the_program_executed_resolve_to_their_lines() {
 fn a_corrupt_debug_block_is_rejected() {
     let image = build(SOURCE);
     let mut bytes = image.to_bytes().expect("the image serialises");
-    // The block is the last thing in the file, so the last byte of the file is
-    // the last byte of the block. Corrupting the magic is the smallest possible
-    // damage, and it has to be caught.
-    let last = bytes.len() - 1;
-    bytes[last] ^= 0xFF;
+    // The **magic**, not the last byte.
+    //
+    // The first version of this test flipped the last byte of the file, with the
+    // reasoning that "the block is the last thing in the file, so the last byte of
+    // the file is in the block". That was always true and never the point: the last
+    // byte is the last byte of whatever the block ends with, and corrupting that is
+    // not corrupting the block's identity. It passed before B17 only because a
+    // damaged trailing byte happened to fail a count check on the way out.
+    //
+    // B17 added a function table to the end of the block, and the last byte became a
+    // character in a symbol name — so the same corruption now produces an image that
+    // reads perfectly and names a function slightly wrongly. Which is worse.
+    //
+    // The magic is where the block says what it is, so that is what gets corrupted.
+    let magic = find_debug_magic(&bytes).expect("the image carries a debug block");
+    bytes[magic] ^= 0xFF;
     let error = LzxImage::from_bytes(&bytes).expect_err("a corrupt block is not an image");
     let message = error.to_string();
     assert!(
         message.contains("debug block"),
         "the failure says the debug block is what was wrong: {message}"
     );
+}
+
+/// The offset of the debug block's magic in an encoded image.
+fn find_debug_magic(bytes: &[u8]) -> Option<usize> {
+    let magic = lazalith_os::debug::DEBUG_MAGIC;
+    bytes
+        .windows(magic.len())
+        .position(|window| window == magic)
 }
 
 /// A block that claims more mappings than it holds is rejected.

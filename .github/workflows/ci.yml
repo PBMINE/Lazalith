@@ -176,6 +176,8 @@ jobs:
         run: nix develop --command cargo test -p lazalith-sysroot --test sysroot -- --nocapture
       - name: "B16: C, Lazen and assembly in one object pipeline"
         run: nix develop --command cargo test -p lazalith-driver --test interop -- --nocapture
+      - name: "B17: one debug-information pipeline for all three languages"
+        run: nix develop --command cargo test -p lazalith-debug --test languages -- --nocapture
 
   # Tier 3. Reproducibility: the same five checks the flake publishes, in the
   # same sandbox, on the same pinned nixpkgs that a developer's `nix flake check`

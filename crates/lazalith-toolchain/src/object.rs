@@ -1195,6 +1195,95 @@ impl ObjectFile {
     pub fn debug_mappings(&self) -> &[CodeMapping] {
         &self.debug_mappings
     }
+
+    /// Splits one debug source in two at a byte offset, rebasing the mappings.
+    ///
+    /// **This exists because a compiler composes its program with a runtime and a
+    /// debugger must not see the result.** A Lazen build is `program + stdlib`; a C
+    /// build is `program + libc`. Both are compiled as one text, so every span in the
+    /// program is offset by however many lines the runtime is — and the object's debug
+    /// source is named for the *user's* file while holding the runtime's text too. A
+    /// debugger reading that shows a line number from the standard library while
+    /// claiming to be in `hello.lz`, which is worse than showing nothing: it is
+    /// confidently wrong.
+    ///
+    /// So the split is done here, in the format that has the problem. The first source
+    /// is the part before `at` and the second is the part from `at` on; every mapping
+    /// that pointed into either half is rewritten to point at that half with its offset
+    /// relative to it. Line numbers then come out right in the file a user wrote.
+    ///
+    /// A mapping that *straddles* the boundary is placed in the first half and clipped,
+    /// because a run of instructions that begins before the split is part of the code
+    /// that begins before it, and truncating the second word of it would point at a
+    /// range the file does not have.
+    ///
+    /// The two new sources are named by the caller, because only the caller knows which
+    /// half is the user's program and which is the runtime.
+    pub fn split_debug_source(
+        &mut self,
+        index: usize,
+        at: u32,
+        first_name: &str,
+        second_name: &str,
+    ) -> Result<(DebugSourceIndex, DebugSourceIndex), ObjectError> {
+        let source = self
+            .debug_sources
+            .get(index)
+            .ok_or(ObjectError::InvalidDebug {
+                index,
+                reason: "there is no such debug source to split",
+            })?;
+        let text = source.text();
+        let at = at.min(text.len() as u32);
+        let split = text
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .find(|offset| *offset as u32 >= at)
+            .unwrap_or(text.len());
+        let split = u32::try_from(split).unwrap_or(u32::MAX);
+        if split == 0 {
+            return Err(ObjectError::InvalidDebug {
+                index,
+                reason: "the split offset is before the source's first character",
+            });
+        }
+        if split as usize >= text.len() {
+            return Err(ObjectError::InvalidDebug {
+                index,
+                reason: "the split offset is past the end of the source",
+            });
+        }
+        let (head, tail) = text.split_at(split as usize);
+        let head = DebugSource::new(first_name, head);
+        let tail = DebugSource::new(second_name, tail);
+        let first = DebugSourceIndex::new(index as u32);
+        self.debug_sources[index] = head;
+        self.debug_sources
+            .try_reserve(1)
+            .map_err(ObjectError::Allocation)?;
+        let second = DebugSourceIndex::new(index as u32 + 1);
+        self.debug_sources.push(tail);
+        for mapping in &mut self.debug_mappings {
+            if mapping.source.get() as usize != index {
+                continue;
+            }
+            let start = mapping.source_offset;
+            if start < split {
+                // In the head, possibly straddling: clipped to the head's length.
+                mapping.source = first;
+                let end = start.saturating_add(mapping.source_length);
+                mapping.source_length = end.min(split).saturating_sub(start);
+            } else {
+                // In the tail, rebased.
+                mapping.source = second;
+                mapping.source_offset = start - split;
+                let end = start.saturating_add(mapping.source_length);
+                mapping.source_length = end.saturating_sub(start);
+            }
+        }
+        Ok((first, second))
+    }
+
     pub fn code(&self) -> &[u8] {
         self.sections
             .iter()

@@ -8144,3 +8144,157 @@ ends re-export them.
 **B17, debugging all three languages** (§17) — one debug format covering C, Lazen and
 assembly, so a debugger can answer "which language is this line in?" without the
 answer being per-object guesswork.
+
+---
+
+# B17 — debugging all three languages (§17)
+
+## What this stage is
+
+§17 asks for one debug-information pipeline covering C, Lazen and LZA assembly, and
+for a mapping from guest PC to
+
+```text
+source file, line, column, function, LZA instruction
+```
+
+## What was already there
+
+**The format was right and had been built for one language.** `DebugSource` and
+`CodeMapping` exist in the object format, the assembler emits both, the linker gathers
+them into a `DebugBlock`, the image carries it, and `DebugController` can resolve a PC
+to a line and set a breakpoint on a line. None of that needed replacing.
+
+Three things were missing, and **none of them would have been found by a test that
+only used Lazen** — which is the whole reason the existing pipeline was not already
+the thing §17 asks for.
+
+## What was actually wrong
+
+### 1. C code had no debug information at all
+
+The Lazen lowering calls `mark()` on the IR builder once per statement, and code
+generation turns those marks into source mappings. **The C lowering did neither.**
+
+With no marks the IR's `source_map` is empty, so code generation emits no mappings, so
+a C image's debug block contains *nothing but the startup sequence*. Measured before
+the fix: **5 entries, all of them the startup**. After: **2641**, with mappings in the
+user's own file.
+
+This is not degraded C debugging. It is absent C debugging, and there was nothing in
+the system to say so — no error, no warning, no empty result that looked like a
+missing-symbol answer rather than a front end that never took part.
+
+### 2. Line numbers resolved into the runtime while claiming to be the user's file
+
+A Lazen build is `program + stdlib`; a C build is `libc + program`. Both compile as
+**one text**, so every span in the program is offset by the runtime.
+
+The debug source is named for the *user's* file and holds the runtime's text too. So
+`hello.lz` was a 36-byte program presented as a **3081-line** debug source, and a
+breakpoint on line 2 resolved to line 2 of the standard library. `hello.c` was a
+2-line program presented as 422 lines of libc.
+
+Confidently wrong, which is worse than silent. A debugger showing the wrong line is
+more expensive to debug than one showing none.
+
+**The fix is a split, in the toolchain, on the object.**
+`ObjectFile::split_debug_source` cuts a composed source in two at a byte offset and
+rebases every mapping that pointed at it. The two languages compose in **opposite
+orders** — `program + stdlib` versus `libc + program` — so each passes its own offset
+and its own names, in *text* order.
+
+One detail worth recording: `compose` puts a blank line between the program and the
+prelude, and it belongs to neither half. It goes to the **program's** half, because
+that keeps the *runtime's* line numbers exact, and an extra blank line at the end of a
+user's file is a far smaller lie than a standard library that is off by one
+everywhere.
+
+### 3. There was no "function"
+
+§17 lists it. The image carried no symbol table, so no stage above the VM could answer
+it without reaching back into the linker — and a debugger that did that would only work
+on the machine that linked the program.
+
+`DebugBlock` now carries a **function table**: name, start, end. The linker builds it
+from the linked symbol table, because the linker is the only stage that knows both a
+function's name and where its body ended up. `DebugBlock::function_at` answers from a
+**range**, not a nearest-symbol search: "which body is this instruction in?" is a
+different question from "which symbol is nearest", and the two disagree in the gap
+between two functions.
+
+The debug block's format version went **1 → 2**. The header grew by a word, and a
+version-1 reader would have read the entry count's neighbour as the file count and
+failed in a way that says nothing useful.
+
+## The boundary: still above the VM
+
+`DebugController::function_at` and `current_function` read the debug block and the
+canonical architectural state. `current_function` takes its PC from
+`machine.architectural_state().pc()` — the same PC the engine is executing — because a
+debugger reading a different PC would be answering about a machine that is not
+running. No register array, no device internals, no host-side symbol table.
+
+## Tests
+
+`crates/lazalith-debug/tests/languages.rs`, 6 tests, one per defect:
+
+- `lazen_source_maps_to_the_users_own_lines` — the file the debugger reads back is
+  byte-for-byte the text the user wrote, and the runtime is a *separate* source.
+- `c_source_maps_to_the_users_own_lines` — the case that had nothing at all.
+- `assembly_source_maps_to_its_own_lines` — `LI` on line 6 is line 6.
+- `a_guest_address_names_its_function` — the table exists, covers `fn.main` and a
+  standard-library function, and round-trips through the encoding.
+- `a_function_range_excludes_the_gap_after_it` — the byte after a function names
+  nothing rather than naming that function.
+- `all_three_languages_share_one_debug_block` — one block, one function table, all
+  three languages resolvable in it.
+
+### A test that stopped testing anything
+
+`a_corrupt_debug_block_is_rejected` flipped the **last byte** of the image, reasoning
+that "the block is last, so the last byte is in the block". That was always true and
+never the point — the last byte is the last byte of whatever the block ends with. It
+passed before only because a damaged trailing byte happened to fail a count check on
+the way out.
+
+B17 added a function table to the end of the block, the last byte became a character
+in a symbol name, and **the same corruption now produces an image that reads
+perfectly and names a function slightly wrongly.** It now corrupts the magic, which is
+where the block says what it is.
+
+### A test that found a real divergence
+
+The B14 byte-equivalence test (`lazcc` + `lazld` == `lazen build`, byte for byte)
+started failing — because the Lazen debug split was in the *driver* and not in
+`RuntimeProgram`, so `lazen build` and every existing `RuntimeProgram` caller
+produced different images. The split moved down to `RuntimeProgram::build`, where the
+composition happens. A split a caller has to remember to request is not a property of
+the build; it is a rule someone has to know.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1546 passed, 0 failed** (6 new)
+- `nix flake check`, `nix build`, `actionlint` ✅
+
+## Limitations at the end of this stage
+
+1. **No command-line debugger.** §18 names `lazdbg`; the API is complete and the
+   program still does not exist. Everything B17 added is API the CLI would call.
+2. **LZA instruction at a PC** was already answered by `disassemble` and
+   `instruction_at`; this stage added the *file, line, column and function* around it
+   and did not change the disassembly path.
+3. **C still cannot call Lazen** (B16's limitation), so a C program cannot be
+   `extern`-declared into a Lazen symbol and no C mapping names Lazen code by way of a
+   call. §22's C + assembly kernel interop depends on closing this.
+4. **No preprocessor**, so an object cannot `#include` a header that would declare a
+   foreign function for it.
+5. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B18, snapshot / replay / state infrastructure** — the state a snapshot must capture
+accounted for by what the stage actually needs, rather than by what is convenient to
+copy.

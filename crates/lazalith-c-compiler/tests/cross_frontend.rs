@@ -56,7 +56,12 @@ fn run_c(source: &str) -> (String, u32) {
         &lowered.frames,
         lowered.entry.as_deref(),
         &CodegenOptions::lz64("diff.c"),
-        source,
+        // **The composed unit, not the program.** The C runtime is compiled in front,
+        // so every span the lowering produced is an offset into `unit`. Passing
+        // `source` here was harmless while the C lowering emitted no marks at all;
+        // B17 made it emit them, and the spans then pointed past the end of the text
+        // handed here — which is the object model refusing the record, correctly.
+        &unit,
     )
     .unwrap_or_else(|error| panic!("the C program should generate: {error}"));
     let startup = lazalith_runtime::startup_object_for(config, "fn.c.main")

@@ -271,6 +271,15 @@
             lazld math.lzo bridge.lzo -o interop.lzx --entry fn.main
             test -s interop.lzx
 
+            # B17: a C object, a Lazen object and an assembly object, linked by
+            # the one linker into one image that carries source for all three.
+            printf "int from_c(void) { return 4; }\n" > lib.c
+            lazcc -c lib.c -o lib.lzo
+            printf ".arch lz64\n.entry _start\n.global _start\n.section .text\n_start:\n    LI r0, 0\n    RET\n" > tiny.la
+            lazas tiny.la -o tiny.lzo
+            lazld math.lzo tiny.lzo bridge.lzo -o b17.lzx --entry fn.main
+            test -s b17.lzx
+
             # B15: a target sysroot, written and then read back.
             lazen sysroot "$work/hosted-sysroot"
             for part in include/lazos/abi.h include/lazos/syscall.h \

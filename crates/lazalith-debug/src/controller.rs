@@ -595,6 +595,33 @@ impl<D: Device> DebugController<D> {
         self.debug.as_ref().and_then(|block| block.resolve(address))
     }
 
+    /// The function whose body contains `address`.
+    ///
+    /// **§17's "function", answered above the VM.** This reads the debug block the
+    /// linker wrote and nothing else: no register array, no machine internals, no
+    /// reaching past the image to a symbol table that is not in it. That is the same
+    /// boundary the rest of this controller holds, and it is why the function table
+    /// lives in the image at all — a debugger that reached into the host linker to
+    /// answer a question about a guest address would only work on the machine that
+    /// linked the program.
+    pub fn function_at(&self, address: u64) -> Option<&str> {
+        self.debug
+            .as_ref()?
+            .function_at(address)
+            .map(|function| function.name.as_str())
+    }
+
+    /// The function the process is in right now, and where in it.
+    ///
+    /// The PC is taken from the canonical architectural state rather than from a
+    /// register array, so this is the same PC the engine is executing — which is the
+    /// question B3 settled and the one a debugger that disagreed with would be
+    /// answering about a machine that is not running.
+    pub fn current_function(&self) -> Option<(&str, SourceLocation<'_>)> {
+        let pc = self.machine.architectural_state().pc().as_u64();
+        Some((self.function_at(pc)?, self.source_location()?))
+    }
+
     /// Sets a breakpoint on a line of a source file.
     ///
     /// The line is resolved through the debug table rather than through any

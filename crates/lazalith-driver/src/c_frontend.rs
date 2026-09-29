@@ -255,5 +255,41 @@ pub fn compile_c(text: &str, options: &CBuildOptions) -> Result<ObjectFile, Driv
             detail: error.to_string(),
         })
     })?;
-    Ok(program.object().clone())
+    let mut object = program.object().clone();
+    // §17: one debug-information pipeline, and it has to name the file a user wrote.
+    //
+    // A C build is `libc + program` compiled as one text, so every span in the program
+    // is offset by however much libc precedes it, and the debug source is named for
+    // the user's file while holding libc's text as well. A debugger reading that shows
+    // a line number from `libc` while claiming to be in `hello.c` — confidently wrong,
+    // which is worse than silent.
+    //
+    // The split is done in the toolchain, on the object, because that is where the
+    // mappings are and where the format is known. The offset is derived from the same
+    // composition the compiler was given, so it cannot disagree with it.
+    // The offset is derived from the same composition the compiler was given, so it
+    // cannot disagree with it, and the names are in *text* order: the C build is
+    // `libc + program`, so the runtime is the head. Getting that pair the wrong way
+    // round produces a debugger that is confidently right about the wrong file --
+    // every line number in `hello.c` would resolve into libc.
+    if !options.runtime.is_empty()
+        && let Some(index) = object
+            .debug_sources()
+            .iter()
+            .position(|source| source.path() == options.source_path)
+    {
+        let offset = u32::try_from(options.runtime.len() + 1).unwrap_or(u32::MAX);
+        object
+            .split_debug_source(index, offset, C_RUNTIME_NAME, &options.source_path)
+            .map_err(DriverError::Object)?;
+    }
+    Ok(object)
 }
+
+/// The name the C library's half of a composed unit is recorded under.
+///
+/// **Not `libc.c`,** which is the file name a sysroot gives it. This is the *debug
+/// source* for a build where the library is compiled in, and there is no file on disk
+/// behind it — a debugger that printed a path the user could open would be promising
+/// something that does not exist.
+pub const C_RUNTIME_NAME: &str = "<lazalith-c-runtime>";

@@ -249,6 +249,12 @@ pub fn assemble(name: &str, source: &str) -> Result<ObjectFile, DriverError> {
 /// and is the same composition `lazen build` performs — `tests/stages.rs` checks the
 /// two produce identical objects.
 pub fn lazen_object(source: &str, options: &BuildOptions) -> Result<ObjectFile, DriverError> {
+    // **No debug splitting here.** `RuntimeProgram::build` does it, because it is
+    // where every Lazen program is built: a split the driver had to remember would
+    // leave `RuntimeProgram`'s own images — and so every existing caller — resolving
+    // their line numbers into the standard library. The driver did it first, and the
+    // two answers disagreed until the split moved down to the stage that owns the
+    // composition.
     let program = RuntimeProgram::build(source, options).map_err(DriverError::Runtime)?;
     Ok(program.objects()[0].clone())
 }

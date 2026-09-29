@@ -124,6 +124,7 @@ dependencies = [
  "lazalith-cpu",
  "lazalith-devices",
  "lazalith-diagnostics",
+ "lazalith-driver",
  "lazalith-isa",
  "lazalith-machine",
  "lazalith-memory",
