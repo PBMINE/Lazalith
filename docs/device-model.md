@@ -84,8 +84,7 @@ guest-visible device          ← the front end. This exists.
   ↓
 Lazalith device model         ← this is the trait. This exists.
   ↓
-host backend                  ← SDL3, a file, a socket, a host audio API.
-                                 THIS DOES NOT EXIST.
+host backend                  ← §5, as of B5. `Backend` and `BlockBackend` exist.
 ```
 
 You cannot attach a *different* backend to different devices of the same machine
@@ -207,19 +206,26 @@ LZA expansion bus (§12's "a native Lazalith expansion bus may come before PCI")
 should be simpler, and PCI should arrive as a *compatibility profile* rather than
 as the platform's only way to attach a device.
 
-**The shape, as a proposal:**
+**The shape, as built in B5:**
 
 ```text
 Device (guest-visible)          the trait that exists today
     ↓
-Backend                         how the host's resources are used
-    ├── FileBackend             a path on the host
-    ├── SparseBackend           a sparse image
-    ├── CowBackend              a copy-on-write layer over another backend
-    ├── MemoryBackend           a buffer, for tests and for snapshots
-    ├── Sdl3DisplayBackend      the only host backend that exists today
-    └── HostInputBackend        scripted input, for deterministic replay
+BlockDevice                     the first device with a backend. §5.1
+    ↓
+BlockBackend                    sectors in, sectors out. No guest vocabulary.
+    ├── MemoryBlockBackend      a flat buffer, writable or read-only
+    ├── CopyOnWriteBlockBackend a sparse overlay over a read-only base
+    └── AbsentBlockBackend      no storage, and says which device asked
 ```
+
+`Backend` is the whole of it — `kind`, `identity`, `reset` — and `BlockBackend`
+adds `capacity`, `writable`, `read_sector`, `write_sector`. Four backends ship:
+`MemoryBlockBackend`, `CopyOnWriteBlockBackend`, `AbsentBlockBackend`, and the
+`CopyOnWriteBlockBackend` chain over a read-only memory base that
+`BlockStorage::CopyOnWrite` builds. `Sdl3DisplayBackend` and `HostInputBackend`
+from the earlier sketch are **still proposals**: the display and input devices have
+no backend, and §5 is a block-storage boundary first, not a general one.
 
 **Three rules**, in the order they matter:
 
@@ -235,12 +241,87 @@ Backend                         how the host's resources are used
    question of which faults are `Unmapped` and which are `Device` is settled per
    device.
 
+### 5.1 The block device
+
+The chain is real, and `BlockDevice` is its middle box. The transfer crosses it
+as **whole 512-byte sectors**, and a register access names a register in the
+device's own 64-byte window — never a sector, and never an offset into the disk.
+That is the whole of the translation, and `BlockDevice` has no accessor that
+returns the backend, so the only way a sector reaches the host is a command a
+guest issued.
+
+| Offset | Register | Access |
+| --- | --- | --- |
+| 0 | `BLOCK_REGISTER_CAPACITY` | read — sectors the storage holds |
+| 8 | `BLOCK_REGISTER_SECTOR` | read/write — the sector the next command applies to |
+| 16 | `BLOCK_REGISTER_COMMAND` | read/write — `COMMAND_READ`, `COMMAND_WRITE` |
+| 24 | `BLOCK_REGISTER_REMAINING` | read — bytes of the transfer not yet moved |
+| 32 | `BLOCK_REGISTER_DATA` | read/write — the data port |
+| 40 | `BLOCK_REGISTER_STATUS` | read — `READABLE`, `WRITABLE`, `FAILED`, `BUSY` |
+
+**Why a data port rather than guest memory.** `Device` gives a device
+`read`/`write` on registers and no access to guest memory, so a buffer-backed
+command would need a new method on the `Device` trait — a change to every device
+in the workspace, for one device's benefit. A port moves the same bytes using the
+contract that already exists, and it is the shape real port-I/O disks have for
+the same reason.
+
+**Three refusals worth naming**, because each is a case where the obvious
+alternative is a lie:
+
+- A data-port access past the end of the sector is **refused, not padded**. A short
+  read hands the guest bytes that were never stored, and a program cannot tell them
+  from data.
+- A write during a read is **refused, not ignored**. A guest that thought it was
+  writing would be silently losing those bytes.
+- A copy-on-write overlay over a **writable** base is **refused**. An overlay that
+  does not write through today is not copy-on-write; it is a stack of layers that
+  happens not to, and nothing would notice until a future backend that did.
+
+**Snapshots carry the device, not the disk.** 29 bytes: the selected sector, the
+failure flag, the storage's identity, and the direction and progress of any
+transfer. The storage itself is a host resource, and a machine snapshot that
+copied a 64 MiB disk would be holding a second copy of it — the same reason a
+display's snapshot excludes the framebuffer.
+
+Two things make that omission safe rather than silent:
+
+- the **identity** travels in the snapshot, so restoring onto a machine whose disk
+  is a different disk is a **refusal**, not a best effort;
+- the **transfer state** travels too. `Device::snapshot` returns `Vec<u8>` and so
+  cannot refuse, and a snapshot that refused would have to be lying about having
+  one. Instead the snapshot is a faithful record and `restore` is the strict half:
+  a snapshot taken mid-transfer records that it was, and restoring it is refused,
+  because a machine restored into a half-moved sector has a data port mid-sector
+  with nobody to finish it.
+
+### 5.2 What a backend is not, and where that is checked
+
+`Backend` and `BlockBackend` take no `DataAccess`, `PhysicalAddress`,
+`DeviceOffset`, `Privilege` or `CycleCount`. There is no `impl Device` for any
+backend. `BlockDevice` has no `backend()` accessor — only `backend_kind()`,
+which names a `BackendKind` and reaches no resource.
+
+Those four are claims about the *shape* of the code, and no behavioural test can
+observe the absence of a method: a rewrite that added `fn backend()` to the block
+device would pass every functional test in the workspace while breaking the thing
+the module is for. So they are checked by reading the source, in
+`crates/lazalith-cli/tests/architecture.rs` — `a_backend_is_not_a_device`,
+`a_backend_signature_carries_no_guest_vocabulary`,
+`no_device_exposes_the_backend_behind_it`, and `the_backend_layer_is_no_std`.
+
 ---
 
 ## 6. What is not here
 
-- **No storage, audio, network, USB, PCI or VGA.** Not "simplified": absent.
-- **No backend abstraction of any kind.** §5 is a proposal, and it is B5.
+- **No storage, audio, network, USB, PCI or VGA.** Not "simplified": absent —
+  except block storage, which B5 built as the §5 worked example.
+- **No file, sparse-image or socket backend.** §5's boundary is real; the backends
+  in it are `MemoryBlockBackend`, `CopyOnWriteBlockBackend` and
+  `AbsentBlockBackend`. A file backend is B8, and it belongs in a host crate
+  because `lazalith-devices` is `no_std`.
+- **No display or input backend.** `BlockDevice` is the first device with one.
+  `Sdl3DisplayBackend` and `HostInputBackend` remain proposals.
 - **No `lza64-virt-v1` or `lza64-at-v1`.** Both are nameable; both are refused.
   See `docs/machine-profiles.md` §4.
 - **No DMA, no MMU, no SMP, no power states.** See the tier tables.

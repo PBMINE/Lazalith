@@ -25,11 +25,11 @@
 //! rest of the Phase-I suite — the boot path, LazOS, the debugger, the whole
 //! toolchain — is unchanged and still green, which is the stronger evidence.
 
-use lazalith_devices::DeviceId;
+use lazalith_devices::{Device, DeviceId};
 use lazalith_isa::{DataSize, ISA_VERSION, Instruction, Opcode, Operand, encode};
 use lazalith_machine::{
-    Compatibility, DeviceClass, DeviceProfile, LZA64_LAYOUT, MachineProfile, ProfileError,
-    ProfileFamily, ProfileName, ProfiledMachine, RegionProfile,
+    BlockStorage, Compatibility, DeviceClass, DeviceProfile, LZA64_LAYOUT, MachineProfile,
+    ProfileError, ProfileFamily, ProfileName, ProfiledMachine, RegionProfile,
 };
 use lazalith_memory::{AddressSpace, RegionKind, RegionPermissions};
 use lazalith_types::{
@@ -551,7 +551,6 @@ fn an_executable_device_window_is_refused() {
 #[test]
 fn a_device_class_this_build_cannot_construct_is_refused() {
     for class in [
-        DeviceClass::Block,
         DeviceClass::Network,
         DeviceClass::Audio,
         DeviceClass::Serial,
@@ -700,4 +699,152 @@ fn peek_refused(machine: &ProfiledMachine, window: PhysicalAddress, offset: u64)
     machine
         .peek_memory(PhysicalAddress::new(window.as_u64() + offset), &mut out)
         .is_err()
+}
+
+// -- B5: a block device in the inventory ---------------------------------------
+
+/// A profile can name a block device, and the machine it builds answers on it.
+///
+/// This is the B4 refusal turned into a construction. `DeviceClass::Block` was
+/// `is_constructible() == false` through B4 and a profile naming one was refused; now
+/// the profile has to say what is behind the disk, and the machine has to be the
+/// machine the profile described.
+#[test]
+fn a_profile_can_build_a_block_device() {
+    let profile = MachineProfile::lza64_native_v1().with_device(
+        DeviceProfile::new(
+            DeviceId::new(7),
+            DeviceClass::Block,
+            PhysicalAddress::new(0x4000_7000),
+            RegionPermissions::new(true, true, false, true),
+        )
+        .with_block_storage(BlockStorage::Memory {
+            bytes: 8 * lazalith_devices::SECTOR_BYTES,
+        }),
+    );
+    assert!(
+        profile.validate().is_ok(),
+        "a block device with a disk is buildable"
+    );
+
+    let machine = ProfiledMachine::from_profile(&profile).expect("the profile builds a machine");
+    machine
+        .matches_profile(&profile)
+        .expect("the machine is the machine the profile described, window and all");
+    let device = machine
+        .devices()
+        .device(DeviceId::new(7))
+        .expect("the block device is in the machine");
+    assert_eq!(
+        device.address_len(),
+        lazalith_devices::BLOCK_REGISTER_BYTES,
+        "the mapped window is the size the device reports, so the bus and the device \
+         cannot disagree about how big it is"
+    );
+    let mut machine = ProfiledMachine::from_profile(&profile).expect("rebuilt");
+    assert_eq!(
+        machine
+            .devices_mut()
+            .device_mut(DeviceId::new(7))
+            .expect("the block device is in the machine")
+            .read(lazalith_devices::BLOCK_REGISTER_CAPACITY, DataSize::Double)
+            .expect("a capacity read"),
+        8,
+        "the guest sees the eight sectors the profile promised"
+    );
+}
+
+/// A block device the profile gave no disk to is refused.
+#[test]
+fn a_block_device_with_no_storage_is_refused() {
+    let profile = MachineProfile::lza64_native_v1().with_device(DeviceProfile::new(
+        DeviceId::new(7),
+        DeviceClass::Block,
+        PhysicalAddress::new(0x4000_7000),
+        RegionPermissions::new(true, true, false, true),
+    ));
+    assert!(
+        matches!(
+            profile.validate(),
+            Err(ProfileError::BlockStorage { id, .. }) if id == DeviceId::new(7)
+        ),
+        "a block device with nothing behind it is a promise the machine cannot keep, so \
+         it is refused rather than built with a dead disk"
+    );
+}
+
+/// A disk that is not a whole number of sectors is refused, not rounded.
+#[test]
+fn a_disk_that_is_not_a_whole_number_of_sectors_is_refused() {
+    for storage in [
+        BlockStorage::Memory { bytes: 513 },
+        BlockStorage::Memory { bytes: 0 },
+        BlockStorage::CopyOnWrite { base: 100 },
+    ] {
+        let profile = MachineProfile::lza64_native_v1().with_device(
+            DeviceProfile::new(
+                DeviceId::new(7),
+                DeviceClass::Block,
+                PhysicalAddress::new(0x4000_7000),
+                RegionPermissions::new(true, true, false, true),
+            )
+            .with_block_storage(storage),
+        );
+        assert!(
+            matches!(profile.validate(), Err(ProfileError::BlockStorage { .. })),
+            "a {storage:?} disk was accepted: rounding it down would give a guest a \
+             capacity the profile never promised"
+        );
+    }
+}
+
+/// Storage on a device that is not a block device is refused.
+#[test]
+fn storage_on_a_device_that_is_not_a_block_device_is_refused() {
+    let profile = MachineProfile::lza64_native_v1().with_device(
+        DeviceProfile::new(
+            DeviceId::new(7),
+            DeviceClass::Timer,
+            PhysicalAddress::new(0x4000_5000),
+            RegionPermissions::new(true, true, false, true),
+        )
+        .with_block_storage(BlockStorage::Memory {
+            bytes: lazalith_devices::SECTOR_BYTES,
+        }),
+    );
+    assert!(
+        matches!(profile.validate(), Err(ProfileError::BlockStorage { .. })),
+        "a timer with a disk is a profile that does not mean what it says"
+    );
+}
+
+/// A copy-on-write disk is buildable and presents a writable disk over a base.
+#[test]
+fn a_copy_on_write_disk_is_buildable() {
+    let profile = MachineProfile::lza64_native_v1().with_device(
+        DeviceProfile::new(
+            DeviceId::new(7),
+            DeviceClass::Block,
+            PhysicalAddress::new(0x4000_7000),
+            RegionPermissions::new(true, true, false, true),
+        )
+        .with_block_storage(BlockStorage::CopyOnWrite {
+            base: 8 * lazalith_devices::SECTOR_BYTES,
+        }),
+    );
+    assert!(profile.validate().is_ok());
+    let mut machine =
+        ProfiledMachine::from_profile(&profile).expect("a copy-on-write disk is buildable");
+    let device = machine
+        .devices_mut()
+        .device_mut(DeviceId::new(7))
+        .expect("the block device is in the machine");
+    let status = device
+        .read(lazalith_devices::BLOCK_REGISTER_STATUS, DataSize::Double)
+        .expect("a status read");
+    assert_ne!(
+        status & lazalith_devices::BLOCK_STATUS_WRITABLE,
+        0,
+        "the overlay is writable even though its base is not, and a guest can see that"
+    );
 }

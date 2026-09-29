@@ -51,7 +51,7 @@ Host implementations may change. Guest-visible semantics do not.
 | B2 | GitHub CI/CD and repository automation foundation | **done** — `.github/`, `docs/ci-cd.md` |
 | B3 | VM core / execution-engine boundary extraction | **done** — `Processor` + `ExecutionEngine`, tested |
 | B4 | machine profiles | **done** — heterogeneous device set, `MachineProfile`, `lza64-native-v1`; `docs/machine-profiles.md` |
-| B5 | device frontend/backend model separation | designed, not built — `docs/device-model.md` §5. **Next.** |
+| B5 | device frontend/backend model separation | **built.** `Backend` + `BlockBackend`, memory/COW/absent backends, `BlockDevice`, and a profile that names its disk. `docs/device-model.md` §5 |
 | B6 | common VM lifecycle / reset / boot contracts | **partly present**; see §4 |
 | B7 | native display architecture | **present**; §4 |
 | B8 | storage architecture | not started |
@@ -235,42 +235,48 @@ architecture → automation → VM abstraction → machine/device foundations
   → target-side OS → compatibility machine → Linux 0.01 port
 ```
 
-B1 through B4 are the first four links and are now done. The next link is **B5,
-the device frontend/backend split**, and the reason is dependency order rather
-than appeal:
+B1 through B5 are the first five links and are now done. The next link is **B6,
+the common VM lifecycle**, with B8 (storage) close behind it.
 
-- B5 needs a thing to attach backends to, and B4 built it. A profile is the
-  description of *what is attached*; a backend is *how it reaches the host*. B4
-  made the first exist and made the device set able to hold several kinds, which
-  is what a per-device backend requires. B5 first would have meant inventing that
-  description twice.
-- B8/B10/B11 (storage, audio, networking) each need somewhere to say "this
-  machine has a disk and this is its backend". That is the profile.
-- B13 (firmware/boot profiles) is *defined* by the profile, not alongside it.
-- B19 (the VM manager) exists to create, configure and run profiles. A management
-  API with nothing to manage is a wrapper over `LazalithMachine::new`.
-- B27 (`lza64-at-v1`) is a profile plus a compatibility device set, and it is
-  three stages away from the Linux port that consumes it.
+**What B5 built, and why it was built as one block device.** The boundary itself is
+two traits — `Backend` and `BlockBackend` — and a boundary is only worth anything
+once something stands on it, so B5 built the smallest complete thing that could: a
+block device over memory, copy-on-write and absent backends. §26's example chain
+end to end, with 34 tests. Audio, networking and the rest of §26's device list are
+still proposals, and `docs/device-model.md` §5 says which.
 
-So B5 is next, and its first question is the one B4 deliberately left open: **a
-backend is a host resource, and nothing in the platform yet distinguishes a host
-resource from a device register.** `docs/device-model.md` §5 has the proposed shape
-and the three rules it has to obey — a backend is never a guest interface, a
-snapshot names the device's state and not the backend's, and a backend that cannot
-do something a guest asked for says so as a device fault rather than emulating
-badly.
+**The question B5 answered** is the one B4 deliberately left open: *a backend is a
+host resource, and nothing in the platform distinguished a host resource from a
+device register.* Now three things do, and all three are checked mechanically
+rather than asserted in prose:
 
-Two things B4 left open on purpose, because they belong to B5 rather than to a
-profile: **PIO** (`binstruction.md` §25 lists a PIO map as a profile property and
-LZA has none — `docs/linux-0.01-port.md` §3.2 makes it the largest single item in
-that port), and **whether a profile has an on-disk encoding** (a serialised
-profile is a management API's input, and that API is B19).
+- no backend signature takes `DataAccess`, `PhysicalAddress`, `DeviceOffset`,
+  `Privilege` or `CycleCount` — the two address spaces stay in their own units;
+- no backend implements `Device`, so no backend has a window and a guest can never
+  reach the storage behind one;
+- no device has a getter for its backend.
+
+Those are properties of code *shape*, and no behavioural test can see the absence
+of a method — a rewrite that added `fn backend()` would pass all 1360 tests while
+breaking the point of the module. So `crates/lazalith-cli/tests/architecture.rs`
+reads the source for them.
+
+**B4's two open questions, one of which B5 deliberately did not answer.** **PIO**
+(`binstruction.md` §25 lists a PIO map as a profile property and LZA has none —
+`docs/linux-0.01-port.md` §3.2 makes it the largest single item in that port) is
+still open. The block device's data port is a *register* in an MMIO window, not a
+port in a PIO space, and naming it "port" would make the two indistinguishable in a
+profile. Whether LZA gains a PIO space is an architectural decision belonging to
+the device model. **Whether a profile has an on-disk encoding** remains B19's
+question, because a serialised profile is a management API's input and that API
+does not exist yet.
 
 **B2 changed the cost of everything that follows.** A new subsystem now has to add
-its tests to a job rather than to a developer's memory. B4 did this: the
-`architecture` job in `.github/workflows/ci.yml` now names the profile round trip
-and the geometry tests individually, so a failure reads as a profile failure
-rather than as "a test failed somewhere". The next session should do the same.
+its tests to a job rather than to a developer's memory. B4 and B5 both did this: the
+`architecture` job in `.github/workflows/ci.yml` now names the profile round trip,
+the geometry tests, the execution-engine boundary and the device/backend boundary
+individually, so a failure reads as a boundary failure rather than as "a test failed
+somewhere". The next session should do the same.
 
 ---
 

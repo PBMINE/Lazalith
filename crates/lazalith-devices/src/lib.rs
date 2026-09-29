@@ -2,11 +2,17 @@
 
 extern crate alloc;
 
+mod backend;
 mod console;
 mod display;
 pub mod host_input;
 pub mod input;
+mod storage;
 pub mod timer;
+pub use backend::{
+    AbsentBlockBackend, Backend, BackendError, BackendIdentity, BackendKind, BlockBackend,
+    CopyOnWriteBlockBackend, MemoryBlockBackend, SECTOR_BYTES,
+};
 pub use console::{CONSOLE_REGISTER_BYTES, ConsoleDevice};
 pub use display::{
     DISPLAY_ABI_VERSION, DisplayDevice, DisplayError, MAX_DIMENSION, PIXEL_BYTES, PresentedFrame,
@@ -29,6 +35,12 @@ pub use input::{
     REGISTER_LAST_CAPACITY, REGISTER_LAST_COUNT, REGISTER_PENDING,
     REGISTER_POLL as INPUT_REGISTER_POLL, REGISTER_STATUS as INPUT_REGISTER_STATUS,
     STATUS_INJECTED,
+};
+pub use storage::{
+    BLOCK_ABI_VERSION, BLOCK_REGISTER_BYTES, BLOCK_REGISTER_CAPACITY, BLOCK_REGISTER_COMMAND,
+    BLOCK_REGISTER_DATA, BLOCK_REGISTER_REMAINING, BLOCK_REGISTER_SECTOR, BLOCK_REGISTER_STATUS,
+    BLOCK_SNAPSHOT_BYTES, BLOCK_STATUS_BUSY, BLOCK_STATUS_FAILED, BLOCK_STATUS_READABLE,
+    BLOCK_STATUS_WRITABLE, BlockDevice, BlockError, COMMAND_READ, COMMAND_WRITE,
 };
 pub use timer::{REGISTER_CYCLES as TIMER_REGISTER_CYCLES, TIMER_REGISTER_BYTES, TimerDevice};
 
@@ -66,6 +78,15 @@ pub enum DeviceError {
         /// How many bytes were offered.
         found: usize,
     },
+    /// A block device refused an operation.
+    ///
+    /// Its own variant, holding a [`BlockError`] rather than a `BackendError`,
+    /// because "the sector is past the end of the disk" and "you asked for the wrong
+    /// register" are different facts and a caller that has to match on one of them
+    /// should be able to. The host storage's own reason is carried *inside*
+    /// `BlockError::Storage` rather than flattened away, so a guest-visible fault
+    /// still says whether the disk was read-only or the base refused a write.
+    Block(crate::BlockError),
 }
 
 impl fmt::Display for DeviceError {

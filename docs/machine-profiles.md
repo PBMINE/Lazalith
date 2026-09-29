@@ -205,21 +205,65 @@ machine boots and then misbehaves. That is a round trip, not a construction.
 
 ## 7. What B4 is not, and what is next
 
-**Not built:** `lza64-virt-v1`, `lza64-at-v1`, storage, audio, networking, hot-plug,
-a device *backend* layer, and any change to the `Device` trait itself.
+**Not built by B4:** `lza64-virt-v1`, `lza64-at-v1`, storage, audio, networking,
+hot-plug, a device *backend* layer, and any change to the `Device` trait itself.
 
 **B4's two halves, and both are done:**
 1. a heterogeneous device set — `impl Device for Box<dyn Device>`;
 2. a profile that describes one, with a round-trip check.
 
-**What the next stage is.** B5 is the device **frontend/backend** split
+**What the next stage was.** B5 is the device **frontend/backend** split
 (`binstruction.md` §26), and the profile is what it attaches to: a profile says
 which devices a machine has, and a backend says how each one reaches the host's
-resources. `docs/device-model.md` §5 has the proposed shape and the three rules it
-has to obey.
+resources. `docs/device-model.md` §5 has the shape and the three rules it obeys.
 
-**Two open questions B4 deliberately did not answer**, both recorded rather than
-guessed:
+---
+
+## 7a. B5: a profile names the storage too
+
+`DeviceClass::Block` was `is_constructible() == false` through B4, and a profile
+naming one was refused. B5 built the backend layer, so a profile can now name a
+block device — and a `DeviceProfile` gained one per-class fact alongside
+`console_capacity`:
+
+| Class | Field | Meaning |
+| --- | --- | --- |
+| `Block` | `block: Some(BlockStorage::Memory { bytes })` | a flat image of `bytes` |
+| `Block` | `block: Some(BlockStorage::CopyOnWrite { base })` | a sparse overlay over a read-only `base` |
+
+**The storage is a field on the device, not a second profile section.** A profile
+that listed devices in one place and their storage in another could describe a
+machine where a device had no storage, and the disagreement would not be a build
+error — it would be a machine that boots and then reads a disk that is not there.
+
+**Four refusals**, each because the alternative builds a machine that is not the one
+described:
+
+- a block device with `block: None` — a promise with nothing behind it;
+- a disk of zero bytes;
+- a disk that is not a whole number of 512-byte sectors, **refused rather than
+  rounded**: rounding 513 bytes down to one sector would give a guest a capacity the
+  profile never promised;
+- `block: Some(..)` on a device that is not a `Block` — a timer with a disk is a
+  profile that does not mean what it says.
+
+**The backend is built and moved into the device**, so the machine holds the storage
+once, behind the device. A machine that also held the backend beside the device
+would be holding the disk twice, and the copy beside it would be the one that went
+stale.
+
+**An overlay presents its base's capacity.** A copy-on-write layer is not a way to
+make a disk bigger, and a profile wanting a bigger disk names a bigger base. The
+refusal that matters here is `BackendError::WritableBase`: an overlay over a
+writable base is a stack of layers that happens not to write through today, and
+nothing would notice until a future backend that did. `BlockStorage::CopyOnWrite`
+builds its base read-only *by construction* rather than trusting a caller to.
+
+---
+
+## 8. Two open questions B4 deliberately did not answer
+
+Both recorded rather than guessed, and neither is settled by B5:
 
 - **PIO.** `binstruction.md` §25 lists "MMIO/PIO map" as a profile property, and
   LZA has no port I/O at all. `docs/linux-0.01-port.md` §3.2 makes this the single
@@ -227,6 +271,12 @@ guessed:
   gains a PIO space is an architectural decision, and it belongs with the device
   model rather than with a profile that would have to describe something that does
   not exist.
+
+  B5 did **not** answer it, and deliberately: the block device's `BLOCK_REGISTER_DATA`
+  is a *register* in an MMIO window, not a port in a PIO space. A future PIO space
+  would be a separate address space on `Bus`, and reusing the word for a register
+  would make the two indistinguishable in a profile.
+
 - **A profile *file*.** A profile is a Rust value here. Whether there is an
   on-disk encoding — and therefore something a third party could ship — is B19's
   question, because a serialised profile is a management API's input and the

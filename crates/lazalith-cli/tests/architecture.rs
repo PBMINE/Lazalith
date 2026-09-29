@@ -1,15 +1,24 @@
-//! Step 99: the architecture review, as thirteen checks.
+//! Step 99: the architecture review, as a list of properties that are checked.
 //!
 //! The step lists thirteen properties the finished platform must have. A review that
-//! reads as prose and concludes "the layers look right" is worth about as much as the
-//! last time somebody drew a dependency diagram, so every property here is checked
+//! reads as prose and concludes "the layers look right" is worth about as much as
+//! the last time somebody drew a dependency diagram, so every property here is checked
 //! mechanically instead — most of them by reading the manifests, because dependency
 //! direction is a property of the manifests and nothing else.
 //!
-//! The ones that cannot be checked by reading a manifest are checked by *using* the
-//! thing: assembly reaching a low-level instruction, Lazen's syscalls all resolving
-//! through one table, and the two kinds of failure being different values rather than
-//! two spellings of the same one.
+//! The ones that cannot be checked by reading a manifest are checked two other ways:
+//! by *using* the thing (assembly reaching a low-level instruction, Lazen's syscalls
+//! all resolving through one table, and the two kinds of failure being different
+//! values rather than two spellings of the same one), and by reading the source of
+//! the boundary itself.
+//!
+//! That last kind is new in B5, and it is worth naming why it belongs here. The
+//! device/backend boundary is a claim about the *shape* of the code — a backend is not
+//! a device, a backend signature has no guest vocabulary, a device has no getter for
+//! its storage — and no behavioural test can observe the absence of a method. A
+//! rewrite that added `fn backend()` to the block device would pass every functional
+//! test in the workspace while breaking the thing the whole module is for. These
+//! checks are the only ones that would notice.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -618,6 +627,179 @@ fn a_device_manager_can_hold_more_than_one_kind_of_device() {
         text.contains("impl Device for Box<dyn Device>"),
         "an erased device must be a device, or a profile's device inventory \
          describes machines that cannot be built"
+    );
+}
+
+// -- B5: the device/backend boundary ------------------------------------------
+
+/// Rust source of a crate, comments stripped, for the two files that make up the
+/// device and the backend it holds.
+///
+/// The device file is checked on its own where the rule is about a device; the two
+/// together where it is about the boundary as a whole.
+fn item_at(text: &str, start: usize) -> &str {
+    let open = text[start..]
+        .find('{')
+        .map(|at| start + at)
+        .unwrap_or_else(|| panic!("no item at offset {start}"));
+    let mut depth = 0usize;
+    for (index, byte) in text[open..].bytes().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &text[start..open + index + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("the item at offset {start} has no closing brace");
+}
+
+/// Rust source of one file with its comments removed.
+///
+/// Needed because the boundary is *discussed* in the doc comments — `backend.rs`
+/// says in prose that there is no `fn backend(&self)` — and a source check that
+/// matched its own documentation would be checking nothing. Only line comments are
+/// stripped, which is sufficient here and is stated rather than hidden: neither
+/// module has a `//` inside a string literal.
+fn strip_comments(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(at) => &line[..at],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A backend is a host resource, not a guest window, and one type cannot be both.
+///
+/// `binstruction.md` §26's diagram has three boxes and the middle one is a
+/// *translation*. A backend that is also a `Device` has a mapped window, a bus, and
+/// therefore a guest that can reach the host storage behind it — which is the exact
+/// boundary B5 exists to put in place. Checking the source rather than the behaviour
+/// is the only way to see this: a backend with a window still works.
+#[test]
+fn a_backend_is_not_a_device() {
+    let path = workspace().join("crates/lazalith-devices/src/backend.rs");
+    let text = std::fs::read_to_string(&path).expect("the backend module reads");
+    for impl_block in text.split("impl").skip(1) {
+        let trait_name = impl_block
+            .split("for")
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        assert_ne!(
+            trait_name, "Device",
+            "a backend implements Device, so the storage behind it is a guest window"
+        );
+    }
+}
+
+/// The backend traits' signatures have no guest vocabulary in them.
+///
+/// The two address spaces in this design are `DeviceOffset` (where in a register
+/// window) and `sector` (where in a disk), and they are not the same unit and not
+/// interchangeable. A backend method that took a `DeviceOffset` or a `DataAccess`
+/// would be a method that could be handed a guest address, and from there the
+/// distinction is one refactor from gone.
+#[test]
+fn a_backend_signature_carries_no_guest_vocabulary() {
+    let path = workspace().join("crates/lazalith-devices/src/backend.rs");
+    let text = std::fs::read_to_string(&path).expect("the backend module reads");
+    for trait_name in ["pub trait Backend", "pub trait BlockBackend"] {
+        let start = text
+            .find(trait_name)
+            .unwrap_or_else(|| panic!("{trait_name} is not there"));
+        let body = item_at(&text, start);
+        for forbidden in [
+            "DataAccess",
+            "PhysicalAddress",
+            "DeviceOffset",
+            "Privilege",
+            "CycleCount",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the {trait_name} signature mentions {forbidden}: a backend call names \
+                 storage, so guest vocabulary in its signature is how the two address \
+                 spaces get confused for one"
+            );
+        }
+    }
+}
+
+/// No *device* hands back the backend it holds.
+///
+/// The device owns the storage and exposes no route to it. Without this rule a
+/// `backend()` accessor is the smallest possible change that turns a host resource
+/// into a guest interface, and it would be added to a debugging helper by someone
+/// mid-task with a test to pass.
+///
+/// `storage.rs` only, and deliberately: `CopyOnWriteBlockBackend::base()` returns a
+/// `&dyn BlockBackend`, and that is a *backend's* accessor rather than a device's.
+/// The host is entitled to ask what its own storage is sitting on, and the guest is
+/// not — and the difference is exactly which struct the method is on. A backend that
+/// a device could reach one would be caught here, because this file is the only place
+/// the backend lives.
+#[test]
+fn no_device_exposes_the_backend_behind_it() {
+    let path = workspace().join("crates/lazalith-devices/src/storage.rs");
+    let text = strip_comments(&std::fs::read_to_string(&path).expect("the block device reads"));
+    for accessor in [
+        "fn backend(",
+        "fn storage(",
+        "-> &dyn BlockBackend",
+        "-> Box<dyn BlockBackend",
+        "-> &dyn Backend",
+        "-> Box<dyn Backend",
+    ] {
+        assert!(
+            !text.contains(accessor),
+            "the block device exposes `{accessor}`: a getter for the backend is a door, \
+             and the boundary is arranged so a host resource cannot become a guest \
+             interface one refactor after nobody is looking"
+        );
+    }
+    // The device does say what kind of storage it is, which is a diagnostic and
+    // reaches no resource. Held here so the deliberate exception is a decision
+    // rather than something the check above happened to permit.
+    assert!(
+        text.contains("fn backend_kind("),
+        "the block device no longer reports its storage kind; if that was deliberate, \
+         say so here rather than losing the diagnostic quietly"
+    );
+}
+
+/// The backend layer is `no_std`, so a file backend belongs to a host crate.
+///
+/// `lazalith-devices` runs on a target with no `std`. A backend that opened a file
+/// would make the whole device crate unbuildable there, which is why B8's file
+/// backend is a host-side implementation of the same trait rather than a new method
+/// on this one.
+#[test]
+fn the_backend_layer_is_no_std() {
+    let path = workspace().join("crates/lazalith-devices/src/backend.rs");
+    let text = std::fs::read_to_string(&path).expect("the backend module reads");
+    for forbidden in ["std::fs", "std::io", "std::net", "extern crate std"] {
+        assert!(
+            !text.contains(forbidden),
+            "the backend layer uses {forbidden}: a host resource reached by a syscall \
+             does not belong in a crate the ISA target links, and the fix is a host \
+             implementation of the trait, not a std call here"
+        );
+    }
+    let manifest = std::fs::read_to_string(workspace().join("crates/lazalith-devices/Cargo.toml"))
+        .expect("the device manifest reads");
+    assert!(
+        !manifest.contains("lazalith-sdl3"),
+        "the device crate must not depend on a host windowing library: a block device \
+         has no window"
     );
 }
 

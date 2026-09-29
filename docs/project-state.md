@@ -6417,3 +6417,167 @@ Two things the next session should carry forward, both learned here:
 - **Do not add a rule the platform does not have.** The W^X refusal was a
   reasonable-sounding policy that the memory model never adopted, and it cost a
   test to discover.
+
+---
+
+# B5 — the device frontend/backend model separation
+
+`binstruction.md` §26. Preceded by `3b7cadb` (B4). The stage that answers B4's
+left-open question: *a backend is a host resource, and nothing in the platform
+distinguished a host resource from a device register.*
+
+## What was already there, confirmed
+
+- `Device` with ten methods, and `DeviceManager<D>` holding one concrete `D`.
+- B4's `impl Device for Box<dyn Device>`, which is what lets a profile's device
+  inventory be *held* and not merely described.
+- `DeviceError` with eleven variants and no notion of a host resource.
+- `DeviceClass::Block` in `lazalith-machine`, nameable and unconstructible.
+
+## What changed
+
+### `Backend` and `BlockBackend`, in `crates/lazalith-devices/src/backend.rs`
+
+`Backend` is `kind`, `identity`, `reset`. `BlockBackend` adds `capacity`,
+`writable`, `read_sector`, `write_sector`. Three implementations:
+
+- `MemoryBlockBackend` — a flat buffer, writable or `read_only()`.
+- `CopyOnWriteBlockBackend` — a sparse `BTreeMap` overlay over a read-only base.
+  Reads fall through; writes allocate; the base is never touched.
+- `AbsentBlockBackend` — refuses everything and names the device that asked.
+
+`BackendIdentity` is a `u64` from an `AtomicU64` counter, not a pointer: a pointer
+would make the identity mean "where this was allocated", which is host layout
+leaking into something a snapshot compares.
+
+### `BlockDevice`, in `crates/lazalith-devices/src/storage.rs`
+
+The §26 chain end to end. A 64-byte register window, a data port, and whole 512-byte
+sectors crossing the boundary. The translation is the whole of it: a register names
+an offset in the *device*, a backend call names a *sector*, and nothing here lets
+one become the other.
+
+### `BlockStorage`, in `crates/lazalith-machine/src/profile.rs`
+
+`DeviceProfile` gained `block: Option<BlockStorage>` next to `console_capacity`, and
+`DeviceClass::Block` became constructible. `BlockStorage::CopyOnWrite` builds its
+base read-only by construction, so the `WritableBase` refusal cannot be reached by
+accident from a profile.
+
+## Invariants now checked rather than asserted
+
+Four of them, in `crates/lazalith-cli/tests/architecture.rs`, and they are a
+different kind of check from the other twenty-one:
+
+| Invariant | Test |
+| --- | --- |
+| A backend is not a device | `a_backend_is_not_a_device` |
+| A backend signature carries no guest vocabulary | `a_backend_signature_carries_no_guest_vocabulary` |
+| No device exposes the backend behind it | `no_device_exposes_the_backend_behind_it` |
+| The backend layer is `no_std` | `the_backend_layer_is_no_std` |
+
+**These are the four that could not be written any other way.** A `BlockDevice` with
+a public `backend()` method behaves identically to one without it. Every functional
+test in the workspace would pass. The boundary §26 asks for is a property of the
+*shape* of the code, and absence is not observable by running the program — so it is
+checked by reading the source, which is why `strip_comments` exists in that file: the
+boundary is also *discussed* in the doc comments, and a check that matched its own
+documentation would check nothing.
+
+## Five real bugs, none of them caught by compiling
+
+Recorded because each was invisible by inspection and every one of them shipped into
+a build that compiled, passed `clippy`, and looked finished.
+
+1. **A read transfer never completed.** `take` set `moved` but never returned the
+   device to `Idle`, so `BLOCK_STATUS_BUSY` stayed set for the life of the machine
+   and every subsequent command was refused as `Busy`. A device that reads a sector
+   and then refuses every further command is not a device that works.
+2. **`Transfer::remaining` reported 512 when idle.** It was derived as
+   `SECTOR_BYTES - moved`, and `Idle` contributes a `moved` of zero — so a device
+   waiting for a command reported a full sector outstanding. A program that polls
+   `BLOCK_REGISTER_REMAINING` before issuing a command waits for a transfer that
+   never started. The idle case is now a separate arm rather than the arithmetic one.
+3. **The snapshot encoding did not match its decoder.** `BLOCK_SNAPSHOT_BYTES` said
+   24; the encoder wrote 29. Every restore failed with `SnapshotShape`. Found
+   immediately, because the constant and the encoder were written in different
+   places — which is itself the lesson.
+4. **`AbsentBlockBackend::kind` returned `BackendKind::Memory`.** A diagnostic
+   reported a dead disk as a memory disk of zero sectors. It now has its own
+   `BackendKind::Absent`.
+5. **The data port was readable during a write.** `validate_read` allowed
+   `BLOCK_REGISTER_DATA` whenever a transfer was in flight, and `in_flight()` is
+   true for a *write* too — so a read mid-write consumed the port, turned the write
+   into a read, and discarded the bytes the guest had already given **with no fault
+   raised anywhere**. The gate is now `Transfer::Reading { .. }` specifically.
+
+   This one was found by reading rather than by a failing test, which is the reason
+   the test was then written and **verified to fail** with the fix reverted: it
+   reports exactly one failure, `reading_the_data_port_during_a_write_is_refused`, and
+   passes with the fix. A test that has never been seen to fail is not evidence.
+
+A sixth was a *design* bug rather than a logic one: the block device's registers
+were exported as `REGISTER_CAPACITY`, `REGISTER_SECTOR`, `REGISTER_STATUS` and so
+on, and **`REGISTER_STATUS` already existed** in two other device modules. `lib.rs`
+had been papering over it with an alias, and my first test run failed on
+`ReadUnsupported` because the test imported the *display's* `REGISTER_STATUS`. They
+are now `BLOCK_REGISTER_*` and `BLOCK_STATUS_*`.
+
+## One thing this session got wrong
+
+**I added a `backend_kind()` accessor and then wrote a test forbidding
+`fn backend_kind(`.** Both are defensible — a kind reaches no resource — and having
+them disagree in the same commit meant neither had been decided. The test was
+right that this must be a decision rather than an accident, and wrong to make the
+decision by accident. The accessor survives, the test asserts it deliberately, and
+the architecture test now *requires* it be there so a future removal has to be
+explicit.
+
+## Limitations at the end of this stage
+
+1. **Block storage is the only backend.** `Sdl3DisplayBackend` and
+   `HostInputBackend` from the original §5 sketch remain proposals. The boundary is
+   general; the first thing standing on it is a disk.
+2. **No file or sparse-image backend.** `MemoryBlockBackend` is a buffer and a COW
+   overlay is a `BTreeMap`. B8, in a host crate, because `lazalith-devices` is
+   `no_std`.
+3. **The overlay presents its base's capacity.** A copy-on-write layer is not a way
+   to make a disk bigger. `BlockStorage::CopyOnWrite { base }` has no size of its
+   own, and adding one would mean a growth policy that §31 does not specify.
+4. **The data port moves 8 bytes per access** and refuses anything crossing the end
+   of the sector. There is no sub-word or burst access, because `DataSize::Double`
+   is the only shape the `Device` trait has for a window.
+5. **No `lza64-virt-v1` profile.** A block device is buildable; a *profile* that
+   has one is B8's, because it needs a file backend to be worth having.
+6. **`TimerDevice::peek` is still wrong**, unchanged from B4. Recorded, not fixed:
+   it is a separate defect and folding it in here would have made the B5 diff
+   unreadable.
+7. **No PIO address space.** B4's question survives, deliberately. The block
+   device's data port is a *register* in an MMIO window, not a port in a PIO space,
+   and calling it "port" makes the two indistinguishable in a profile.
+8. **`BootImage::machine_setup` still refuses a non-empty device manager.** The two
+   machine-construction paths remain side by side, as in B4.
+9. **aarch64-linux still unchecked**, and no cold `nix flake check` timing was taken.
+
+## Next stage
+
+**B6, the common VM lifecycle / reset / boot contracts** — which is where the two
+machine paths recorded in limitation 8 get united, and where the trap vector noted
+in B4's limitation 8 belongs.
+
+**B8, storage architecture**, is the other candidate and the more attractive: a
+file backend over the boundary B5 just built is a contained piece of work, and it
+is what turns `lza64-virt-v1` from a nameable profile into a real one.
+
+## Two things the next session should carry forward
+
+- **A constant and the code that produces it belong in the same place.** Limitation 3
+  in the bugs above was a mismatch between `BLOCK_SNAPSHOT_BYTES` and the encoder
+  that had to agree with it, written 300 lines apart. Nothing checks that but a
+  test that exercises both, and that test existed only because the boundary work
+  was tested at all.
+- **Check the names a new device exports before exporting them.** `REGISTER_STATUS`
+  already existed twice, and the collision was invisible until a test imported the
+  wrong one. `rustc` cannot catch two constants with the same meaning in different
+  modules; a person can, in about ten seconds, by looking at what else is called
+  that.

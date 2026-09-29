@@ -46,8 +46,8 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::{error::Error, fmt};
 use lazalith_devices::{
-    ConsoleDevice, Device, DeviceError, DeviceId, DeviceManager, DisplayDevice, InputDevice,
-    TimerDevice,
+    BackendError, BlockDevice, ConsoleDevice, CopyOnWriteBlockBackend, Device, DeviceError,
+    DeviceId, DeviceManager, DisplayDevice, InputDevice, MemoryBlockBackend, TimerDevice,
 };
 use lazalith_isa::ISA_VERSION;
 use lazalith_memory::{MemoryFault, MemoryRegion, RegionKind, RegionPermissions};
@@ -233,7 +233,7 @@ impl DeviceClass {
     pub const fn is_constructible(self) -> bool {
         matches!(
             self,
-            Self::Console | Self::Timer | Self::Display | Self::Input
+            Self::Console | Self::Timer | Self::Display | Self::Input | Self::Block
         )
     }
 }
@@ -241,6 +241,60 @@ impl DeviceClass {
 impl fmt::Display for DeviceClass {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// What is behind a block device, when the profile names one.
+///
+/// `binstruction.md` §26's example is a *chain*: a guest block device over a host
+/// storage backend, and §31 asks for raw, sparse and copy-on-write. A profile
+/// says which chain a machine has, because which chain it has is a property of the
+/// machine — a machine with a copy-on-write overlay and a machine with a writable
+/// flat image behave differently for the same guest program, and a caller
+/// assembling a machine has to be able to name the difference.
+///
+/// It is a field on the device rather than a separate profile section because a
+/// profile that listed devices in one place and their storage in another could
+/// describe a machine where a device had no storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockStorage {
+    /// A flat image of `bytes`, held by the host and writable.
+    Memory {
+        /// How many bytes the image holds. A whole number of sectors.
+        bytes: u64,
+    },
+    /// A sparse overlay over a read-only image of `base` bytes.
+    ///
+    /// Reads fall through to the base where a sector has not been written; writes
+    /// allocate in the overlay and the base is never modified. The overlay presents
+    /// the base's capacity — an overlay is not a way to make a disk bigger, and a
+    /// profile that wanted a bigger disk should name a bigger base.
+    CopyOnWrite {
+        /// How many bytes the read-only base holds. A whole number of sectors.
+        base: u64,
+    },
+}
+
+impl BlockStorage {
+    /// The whole number of sectors this storage presents.
+    pub const fn sectors(&self) -> u64 {
+        match *self {
+            Self::Memory { bytes } => bytes / lazalith_devices::SECTOR_BYTES,
+            Self::CopyOnWrite { base } => base / lazalith_devices::SECTOR_BYTES,
+        }
+    }
+
+    fn build(self) -> Result<Box<dyn lazalith_devices::BlockBackend>, BackendError> {
+        match self {
+            Self::Memory { bytes } => Ok(Box::new(MemoryBlockBackend::new(bytes)?)),
+            Self::CopyOnWrite { base } => {
+                // The base is read-only *by construction*, and that is what makes
+                // the chain copy-on-write rather than a stack of layers that
+                // happens not to write through.
+                let base = MemoryBlockBackend::new(base)?.read_only();
+                Ok(Box::new(CopyOnWriteBlockBackend::new(Box::new(base))?))
+            }
+        }
     }
 }
 
@@ -261,6 +315,8 @@ pub struct DeviceProfile {
     pub permissions: RegionPermissions,
     /// Console output capacity in bytes. Unused by other classes.
     pub console_capacity: usize,
+    /// The storage behind a block device. `None` for every other class.
+    pub block: Option<BlockStorage>,
 }
 
 impl DeviceProfile {
@@ -276,12 +332,31 @@ impl DeviceProfile {
             address,
             permissions,
             console_capacity: 0,
+            block: None,
         }
     }
 
     /// The same entry, with a console output capacity.
     pub const fn with_console_capacity(mut self, capacity: usize) -> Self {
         self.console_capacity = capacity;
+        self
+    }
+
+    /// The storage this device names, if it is a block device.
+    ///
+    /// Returns `None` for every other class, so a caller that has a device entry and
+    /// wants its storage has to ask the right question rather than reach for a
+    /// field.
+    pub const fn block_storage(&self) -> Option<BlockStorage> {
+        self.block
+    }
+
+    /// The same entry, with the storage behind a block device.
+    ///
+    /// The counterpart to `with_console_capacity`: the other per-class fact a
+    /// device entry can carry that a caller has to be able to name.
+    pub const fn with_block_storage(mut self, block: BlockStorage) -> Self {
+        self.block = Some(block);
         self
     }
 }
@@ -577,6 +652,34 @@ impl MachineProfile {
                     address: device.address,
                 });
             }
+            if device.class == DeviceClass::Block {
+                let storage = device.block_storage().ok_or(ProfileError::BlockStorage {
+                    id: device.id,
+                    detail: "a block device with no storage behind it",
+                })?;
+                let bytes = match storage {
+                    BlockStorage::Memory { bytes } | BlockStorage::CopyOnWrite { base: bytes } => {
+                        bytes
+                    }
+                };
+                if bytes == 0 {
+                    return Err(ProfileError::BlockStorage {
+                        id: device.id,
+                        detail: "a block device with a zero-byte disk",
+                    });
+                }
+                if bytes % lazalith_devices::SECTOR_BYTES != 0 {
+                    return Err(ProfileError::BlockStorage {
+                        id: device.id,
+                        detail: "a disk that is not a whole number of 512-byte sectors",
+                    });
+                }
+            } else if device.block.is_some() {
+                return Err(ProfileError::BlockStorage {
+                    id: device.id,
+                    detail: "only a block device has storage",
+                });
+            }
         }
         for (index, device) in self.devices.iter().enumerate() {
             for other in &self.devices[index + 1..] {
@@ -631,8 +734,26 @@ impl MachineProfile {
                 DeviceClass::Timer => Box::new(TimerDevice::new()),
                 DeviceClass::Display => Box::new(DisplayDevice::new()),
                 DeviceClass::Input => Box::new(InputDevice::new()),
+                DeviceClass::Block => {
+                    // The backend is built here and moved into the device, so the
+                    // device is the only thing the machine holds. A machine that
+                    // also held the backend would be holding the storage twice:
+                    // once behind the device and once beside it, and the copy beside
+                    // it would be the one that went stale.
+                    let backend = device
+                        .block_storage()
+                        .ok_or(ProfileError::BlockStorage {
+                            id: device.id,
+                            detail: "a block device with no storage behind it",
+                        })?
+                        .build()
+                        .map_err(|source| ProfileError::Storage {
+                            id: device.id,
+                            source,
+                        })?;
+                    Box::new(BlockDevice::new(backend))
+                }
                 DeviceClass::Serial
-                | DeviceClass::Block
                 | DeviceClass::Network
                 | DeviceClass::Audio
                 | DeviceClass::Other => {
@@ -712,11 +833,8 @@ const fn device_window_length(device: &DeviceProfile) -> u64 {
         DeviceClass::Timer => lazalith_devices::TIMER_REGISTER_BYTES,
         DeviceClass::Display => lazalith_devices::DISPLAY_REGISTER_BYTES,
         DeviceClass::Input => lazalith_devices::INPUT_REGISTER_BYTES,
-        DeviceClass::Serial
-        | DeviceClass::Block
-        | DeviceClass::Network
-        | DeviceClass::Audio
-        | DeviceClass::Other => 0,
+        DeviceClass::Block => lazalith_devices::BLOCK_REGISTER_BYTES,
+        DeviceClass::Serial | DeviceClass::Network | DeviceClass::Audio | DeviceClass::Other => 0,
     }
 }
 
@@ -779,6 +897,24 @@ pub enum ProfileError {
     },
     /// A device class this build has no constructor for.
     UnconstructibleDevice { class: DeviceClass, id: DeviceId },
+    /// The host storage a block device asked for was refused.
+    ///
+    /// Distinct from `UnconstructibleDevice` because the class *is* constructible:
+    /// this is the storage refusing, which is a fact about the disk and not about
+    /// the build.
+    Storage {
+        /// The device whose storage was refused.
+        id: DeviceId,
+        /// What the storage said.
+        source: BackendError,
+    },
+    /// A block device with no storage, or with storage that is not a whole number
+    /// of sectors.
+    ///
+    /// A refusal rather than a rounding, because a disk of 513 bytes does not become
+    /// a disk of one sector by being rounded down: a guest would see a capacity the
+    /// profile never promised.
+    BlockStorage { id: DeviceId, detail: &'static str },
     /// The machine was built, but it is not the machine the profile describes.
     ///
     /// A round-trip mismatch, and the reason it is a distinct case is that it is
@@ -870,6 +1006,12 @@ impl fmt::Display for ProfileError {
             Self::UnconstructibleDevice { class, id } => {
                 write!(f, "this build cannot construct a {class} device for {id:?}")
             }
+            Self::Storage { id, source } => {
+                write!(f, "the storage for device {id:?} was refused: {source}")
+            }
+            Self::BlockStorage { id, detail } => {
+                write!(f, "the storage for device {id:?} is not usable: {detail}")
+            }
             Self::ProfileMismatch { detail } => {
                 write!(
                     f,
@@ -898,6 +1040,7 @@ impl Error for ProfileError {
             Self::Device { source, .. } => Some(source),
             Self::DeviceMapping { source, .. } => Some(source),
             Self::Memory { source, .. } => Some(source),
+            Self::Storage { source, .. } => Some(source),
             Self::Machine(source) => Some(source),
             _ => None,
         }

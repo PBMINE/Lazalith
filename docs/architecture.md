@@ -145,10 +145,32 @@ and the check is named so you can run it yourself.
 | **A machine holds its processor and its engine apart** | `a_machine_holds_the_processor_and_the_engine_apart` | source |
 | **The machine's geometry has one definition, and it is a literal** | `the_machine_geometry_is_defined_once` | source |
 | **A device manager can hold more than one kind of device** | `a_device_manager_can_hold_more_than_one_kind_of_device` | source |
+| **A backend is not a device** | `a_backend_is_not_a_device` | source |
+| **A backend signature carries no guest vocabulary** | `a_backend_signature_carries_no_guest_vocabulary` | source |
+| **No device exposes the backend behind it** | `no_device_exposes_the_backend_behind_it` | source |
+| **The backend layer is `no_std`** | `the_backend_layer_is_no_std` | source and manifests |
 
-All twenty are in `crates/lazalith-cli/tests/architecture.rs` and run under
+All twenty-two are in `crates/lazalith-cli/tests/architecture.rs` and run under
 `cargo test -p lazalith-cli --test architecture`. CI runs that suite as its own
 job — see `docs/ci-cd.md`.
+
+**That count was wrong before this stage, and worth flagging.** The previous
+revision of this line said twenty when the file held eighteen tests. A number
+written in prose about a file it does not describe drifts silently and looks
+authoritative, which is worse than not having it — so: twenty-two is what the last
+full run reported, and if a `#[test]` is added or removed, this line is now wrong
+until somebody recounts. The list above is the durable part; the count is a
+convenience.
+
+**The last four are a different kind of check from the rest, and that is the
+point.** Every row above it is about something *observable* — a dependency, a value,
+a build. These four are about the *absence* of a thing: no `impl Device` for a
+backend, no `DataAccess` in a signature, no `backend()` getter. Absence cannot be
+observed by running the program, because a `BlockDevice` with a public `backend()`
+method behaves identically to one without it — it just also hands the host's disk to
+whoever asks. So they are checked by reading the source, and they exist because the
+whole point of `binstruction.md` §26's three-box model is a boundary that nothing
+in the code will automatically maintain.
 
 ---
 
