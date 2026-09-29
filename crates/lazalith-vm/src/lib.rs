@@ -62,12 +62,16 @@
 extern crate alloc;
 
 mod boot;
+mod boot_profile;
 mod error;
 mod snapshot;
 mod state;
 mod vm;
 
 pub use boot::{BootAgreement, BootHandoff};
+pub use boot_profile::{
+    BootChain, BootProfile, BootProfileError, ChainStage, FirmwareProfile, MAX_FIRMWARE_BYTES,
+};
 pub use error::VmError;
 pub use snapshot::VmSnapshot;
 pub use state::BootStage;

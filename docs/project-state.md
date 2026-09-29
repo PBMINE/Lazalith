@@ -7680,3 +7680,141 @@ uses `NoDevice` as a type, never as a value, and the test says so.
 **B13, firmware / boot profiles** (§34). Small, and it uses what B6 built: a profile that
 records *where* firmware lives and what the boot chain is, without implementing any
 firmware — §34 says "Do not implement them during this architecture pass."
+
+---
+
+# B13 — firmware / boot profiles
+
+`binstruction.md` §34. Preceded by `da2332b` (B12). New module:
+`crates/lazalith-vm/src/boot_profile.rs`.
+
+## What was already there, confirmed
+
+- B6's `Vm::boot`, `BootAgreement`, and `BootImage::boot_into` — the *execution* half of
+  the chain.
+- `LZA64_LAYOUT`, with the ROM window, the kernel load address and the initial stack
+  pointer.
+
+## No firmware was implemented, and that is §34's instruction
+
+§34 draws the chain and then says "Do not implement them during this architecture pass."
+So nothing here is firmware. What is here is **the shape of the chain** — which
+architecture a machine has, where it lives, where it hands off, and what the two
+architectures that do not exist are called.
+
+| Architecture | Here |
+| --- | --- |
+| `Minimal` — one boot ROM, the current image format | **buildable** |
+| `BiosLike` — BIOS-compatible, with services and a boot menu | named, refused |
+| `UefiLike` — variables, services, multiple boot entries | named, refused |
+
+**Why two are refused rather than partially built.** A firmware that claims BIOS
+compatibility and implements a third of it is worse than one that does not exist: a
+guest probing for the other two thirds gets wrong answers. A guest that finds a
+BIOS-compatible firmware and finds none of BIOS behaves like a machine with no firmware
+and hangs; a guest that finds none at all says so.
+
+This is now a **pattern**, not a one-off: B4's `lza64-at-v1`, B5's unbuilt backends,
+B7's unimplemented VGA, B8's unbuilt controllers, B9's unimplemented PS/2, B11's absent
+host backends and now B13's two firmwares. **Naming an unimplemented compatibility
+surface is worth doing; pretending to implement part of it is not.** Every one of them
+has a test that asserts the unbuildable thing is *unbuildable*, so implementing it later
+is a deliberate deletion rather than an accident.
+
+## A profile, not a type per firmware
+
+Three firmware architectures, three machines? That would be three copies of every
+question asked about booting. B6 already found the alternative: the firmware is *bytes a
+caller supplies*, and the machine is a profile plus a check. A profile naming a firmware
+architecture is a machine that knows what it is booting — one fact.
+
+`BootChain` makes the chain legible without inventing a second image format: the
+bootloader is a **stage inside** the firmware's ROM, because Phase-I's `BootImage` is a
+ROM containing a bootloader.
+
+## A duplication B4's architecture test caught, correctly
+
+This file first defined its own `LazLayout` — five numbers copied from `LZA64_LAYOUT` —
+on the reasoning that "a boot profile should be checkable by a caller that has the
+numbers and not the machine."
+
+**B4's `the_machine_geometry_is_defined_once` refused it, and the test was right.**
+`lazalith-vm` already depends on `lazalith-machine`, so the layering argument bought
+nothing and the cost was a second copy of the machine's numbers. `BootProfile::for_layout`
+now takes `&MachineLayout` and the numbers are read from `LZA64_LAYOUT`.
+
+This is the second time in three stages that a checked architecture invariant beat a
+tidy-looking refactor, and the third time a "duplication" turned out to be one. The
+lesson is that the architecture suite is not paperwork.
+
+## A real bug: window against payload
+
+`validate` compared `rom_length` (the **window**: 512 KiB) against
+`MAX_FIRMWARE_BYTES` (the **payload limit**: 508 KiB), so **every machine with a default
+layout was refused** for a ROM one byte larger than its payload allowance.
+
+They are different numbers about different things. The window is where the ROM is
+mapped; the payload limit is how much of it may hold. `validate` now checks the window
+(against the address space) and `BootProfile::image_fits(bytes)` checks the image. The
+test says so in its name.
+
+## The other refusals
+
+- **An entry outside its own ROM** is refused, not clamped. Clamping would execute the
+  firmware from the start of its ROM while the profile claimed another entry, and nothing
+  would notice which one ran — and an entry pointing at the kernel would execute a kernel
+  that had not been loaded.
+- **A step limit of zero** is refused. It would declare the firmware stuck before running a
+  single instruction — a profile that cannot boot rather than one that boots quickly.
+- **`has_writable_variables()` is `false` for all three, and that is the definition.** A
+  writable variable store is what distinguishes a BIOS-like or UEFI-like firmware from a
+  ROM. `Minimal` has a ROM, and a ROM is not writable — the same reason B4's profile maps
+  the boot ROM read-only. The question is answered `false` because the answer is a fact
+  about the architecture rather than a missing feature.
+
+## A name collision, and what it taught
+
+B13's chain stage wanted to be `BootStage`, which is B6's `Cold`/`Booted` lifecycle
+stage. Two different things, same name, in the same crate. It is now `ChainStage` — and
+it is *more* accurate, because it is a stage of the chain rather than the machine's
+lifecycle position.
+
+This is the **second** time this run has hit it (B5's `Display` snapshot name versus
+`DisplayDevice`). Both times the fix was a more specific name rather than a rename of the
+older one, and both times the compiler found it immediately because two modules were
+re-exported from one root.
+
+## Tests
+
+`crates/lazalith-vm/tests/boot_profile.rs`, 11 tests. The ones that matter:
+`a_firmware_that_is_not_implemented_is_refused_by_name` (the refusal names *which*
+firmware, because "BIOS is missing" and "firmware is missing" are different work),
+`an_entry_outside_the_rom_is_refused_rather_than_clamped`,
+`an_image_larger_than_the_payload_limit_is_refused`, and
+`no_firmware_has_writable_variables_and_that_is_the_definition`.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1509 passed, 0 failed**
+- `nix flake check`, `nix build`, `actionlint` ✅
+
+## Limitations at the end of this stage
+
+1. **No firmware**, by §34. `BootProfile` describes it; nothing produces it.
+2. **`BootProfile` is not yet in `MachineProfile`.** It is a validated standalone value and
+   B6's `Vm::boot` does not read it, so a machine is not yet described by a boot profile
+   — only by a machine profile and a boot image. Joining them is the obvious next piece.
+3. **No boot services, no firmware variables, no boot entries.** Those are what
+   `BiosLike` and `UefiLike` are *for*, and they are refused.
+4. **The step limit is a bound, not a timeout.** Virtual time does not advance for firmware
+   on its own, so a firmware that loops forever loops forever unless a step limit stops
+   it. B6's `BootError::BootStepLimit` already relies on this.
+5. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B14, GCC-like toolchain separation** (§18) — the first stage that is about the
+*toolchain* rather than the machine, and the first that §14 and §15's "C is a
+first-class target" depends on.
