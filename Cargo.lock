@@ -288,6 +288,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazalith-storage"
+version = "0.1.0"
+dependencies = [
+ "lazalith-devices",
+ "lazalith-types",
+]
+
+[[package]]
 name = "lazalith-toolchain"
 version = "0.1.0"
 dependencies = [

@@ -90,6 +90,24 @@ pub enum BackendKind {
     /// says "memory backend, 0 sectors" describes a disk that exists and is empty.
     /// The difference is the whole of what `Absent` is for.
     Absent,
+    /// A file on the host, addressed as a flat image of sectors.
+    ///
+    /// B8. "Raw" is the QEMU sense 2014 the file *is* the disk, byte for byte, with no
+    /// header and no allocation index 2014 so it can be mounted, dd-ed, and replaced by a
+    /// partition table by hand.
+    RawImage,
+    /// A file plus an allocation index, so unwritten sectors occupy nothing.
+    ///
+    /// B8. Its own kind because it is not a raw image: a raw image of a 64 GiB disk with
+    /// three sectors written is 64 GiB on the host, and a sparse one is 1.5 KiB. A
+    /// diagnostic that called it a raw image would be wrong about where the space went.
+    SparseImage,
+    /// A named copy-on-write layer over another backend, which can be discarded.
+    ///
+    /// B8, for §31.s "snapshot layers". Distinct from `CopyOnWrite` because a COW backend
+    /// is a *device* that was built that way, while a snapshot layer is something a
+    /// running machine can acquire and drop.
+    SnapshotLayer,
 }
 
 impl BackendKind {
@@ -98,6 +116,9 @@ impl BackendKind {
             Self::Memory => "memory",
             Self::CopyOnWrite => "cow",
             Self::Absent => "absent",
+            Self::RawImage => "raw-image",
+            Self::SparseImage => "sparse-image",
+            Self::SnapshotLayer => "snapshot-layer",
         }
     }
 
@@ -159,6 +180,21 @@ pub enum BackendError {
     /// first change to a backend that flushes through. Refusing at construction
     /// makes the promise checkable instead of aspirational.
     WritableBase,
+    /// The storage exists but is not usable: a file the host could not reach, a
+    /// device that went away, an image whose index and data disagree.
+    ///
+    /// **Not `Corrupt`, and the difference is who is at fault.** `Corrupt` is the data
+    /// being wrong; this is the data never being reachable. A guest told `Corrupt`
+    /// would reasonably conclude its image was damaged, and might go looking for a
+    /// backup of a disk that is fine and merely unmounted.
+    ///
+    /// Neither names a path, a filename or an errno: a guest error message that
+    /// contained the host.s directory layout would hand the guest the host.s disk
+    /// layout. The host detail is in `StorageError`, for the host.
+    Unavailable,
+    /// The storage holds data that does not make sense: an image whose length is not
+    /// a whole number of sectors, or whose allocation index disagrees with its data.
+    Corrupt,
 }
 
 impl fmt::Display for BackendError {
@@ -178,6 +214,8 @@ impl fmt::Display for BackendError {
                 write!(f, "a sector is {expected} bytes, and {found} were offered")
             }
             Self::WritableBase => f.write_str("a copy-on-write overlay needs a read-only base"),
+            Self::Unavailable => f.write_str("the storage could not be reached"),
+            Self::Corrupt => f.write_str("the storage holds data that does not make sense"),
         }
     }
 }

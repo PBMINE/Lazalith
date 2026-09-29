@@ -954,3 +954,63 @@ fn the_display_device_holds_no_backend() {
         );
     }
 }
+
+// -- B8: the storage boundary ---------------------------------------------------
+
+/// B5's rule at the layer where it is most load-bearing: a host file is not a guest
+/// interface.
+///
+/// `lazalith-storage` holds `std::fs::File` values. The test is that nothing in it lets
+/// a guest or a generic device reach one — the backends implement `BlockBackend`, whose
+/// signatures have no `DeviceOffset`, no `PhysicalAddress` and no `DataAccess`, and
+/// which return nothing but bytes and a `BackendError`.
+#[test]
+fn the_storage_backends_take_no_guest_vocabulary() {
+    let path = workspace().join("crates/lazalith-storage/src");
+    for name in ["raw.rs", "sparse.rs", "snapshot.rs"] {
+        let text = strip_comments(
+            &std::fs::read_to_string(path.join(name))
+                .unwrap_or_else(|e| panic!("{name} reads: {e}")),
+        );
+        for forbidden in [
+            "DataAccess",
+            "PhysicalAddress",
+            "DeviceOffset",
+            "Privilege",
+            "impl Device for",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "lazalith-storage/src/{name} mentions `{forbidden}`. A storage backend is \
+                 reached by sector number, and nothing in this crate may be reached by a \
+                 guest: B5's rule is that a host resource is not a device, and a file is \
+                 the sharpest case of that."
+            );
+        }
+    }
+}
+
+/// A guest-visible refusal never names a host path, a filename, or an errno.
+///
+/// This is checked here rather than in the storage crate because it is a property of
+/// the *conversion*, and the conversion is where a leak would be introduced: the host
+/// gets a `StorageError` carrying a full path, and the guest gets a `BackendError`
+/// carrying two words.
+#[test]
+fn a_backend_error_cannot_name_a_host_path() {
+    let text = strip_comments(
+        &std::fs::read_to_string(workspace().join("crates/lazalith-devices/src/backend.rs"))
+            .expect("the backend module reads"),
+    );
+    // Every variant of `BackendError` is something a guest can be told about, so none
+    // of them may carry a path or an OS error.
+    for forbidden in ["PathBuf", "std::path", "std::io::Error", "io::Error"] {
+        assert!(
+            !text.contains(forbidden),
+            "BackendError mentions `{forbidden}`. Every variant of it is reachable from \
+             a register access and is therefore guest-visible; a variant carrying a path \
+             or an errno would hand the guest the host's filesystem layout. The host \
+             detail belongs in StorageError, which the guest never sees."
+        );
+    }
+}

@@ -6947,3 +6947,184 @@ Three tests in `crates/lazalith-machine/tests/profile.rs` for the display profil
 contained piece of work now that the boundary exists and its invariant is checked, and
 it is what makes `lza64-virt-v1` — which `docs/machine-profiles.md` §4 records as
 "not built, needs a storage backend" — into a real profile rather than a name.
+
+---
+
+# B8 — storage architecture
+
+`binstruction.md` §31, and §25's "Standard Computer Hardware → block storage".
+Preceded by `356ba46` (B7). New crate: `crates/lazalith-storage`.
+
+## What was already there, confirmed
+
+- B5's `BlockBackend` trait, and `MemoryBlockBackend` / `CopyOnWriteBlockBackend` /
+  `AbsentBlockBackend`.
+- B5's `BlockDevice`, with the 64-byte register window and the data port.
+- `BlockStorage` on a machine profile, so a profile can name a disk.
+
+**None of it touched a host file.** Every backend B5 built was in memory, which was
+deliberate — `lazalith-devices` is `no_std` — but it also meant "storage" meant "a
+buffer", and §31 asks for raw images, sparse images and snapshot layers.
+
+## What changed
+
+### `lazalith-storage`: three backends that need a filesystem
+
+| Backend | Kind | On disk |
+| --- | --- | --- |
+| `RawImageBackend` | `RawImage` | the file *is* the disk, byte for byte |
+| `SparseImageBackend` | `SparseImage` | a header, then a `[sector][data]` record per written sector |
+| `SnapshotLayer` | `SnapshotLayer` | nothing — it is in memory over another backend |
+
+`BackendKind` gained `RawImage`, `SparseImage` and `SnapshotLayer`. Three new kinds
+rather than one `File`, because they are not interchangeable: a raw image of a 64 GiB
+disk with three sectors written is 64 GiB on the host and a sparse one is 1.5 KiB, and a
+diagnostic that called them both "file" would be wrong about where the space went.
+
+### A sparse image reserves its first sector
+
+A sparse image's byte 0 is a magic word, not the disk's byte 0. That is what stops a
+raw image and a sparse one being confused: `a_raw_image_is_the_disk_byte_for_byte`
+checks that a raw image's sector 3 is at byte 1536 with nothing before it, and
+`a_sparse_image_refuses_a_raw_file_and_a_capability_mismatch` checks that pointing a
+sparse backend at a raw file is refused rather than reading a magic word where a
+partition table belongs.
+
+The index is **not a separate file**. It is rebuilt on open by walking the
+`[sector][data]` records, so a sparse image is not held hostage to a second file that
+could be lost or desynchronised. A repeated sector number on that walk is
+`IndexMismatch`, detected at open rather than discovered later as a sector that reads
+back as somebody else's data.
+
+### `SnapshotLayer`, and why it is not B5's copy-on-write
+
+B5's `CopyOnWriteBlockBackend` is how a backend is *built*: a profile says "copy on
+write" and the overlay exists from the start. A `SnapshotLayer` is what a *running*
+machine takes — writes go here, the base is untouched, and dropping the layer puts the
+machine back on the base with every write since gone.
+
+Two properties that are tested rather than asserted:
+
+- **a discarded layer refuses.** It does not answer with zeroes. A discarded layer that
+  returned zeroes would look exactly like a fresh disk, and a machine restored onto one
+  would be a machine that had silently lost its writes.
+- **`renew()` mints a new identity.** A layer reused after being discarded has the same
+  `BackendIdentity` as the machine snapshot that recorded it, so restoring that snapshot
+  would be *accepted* and would put a different set of writes in place. That is the
+  exact failure B5's identity rule exists to prevent, and it is the reason `renew`
+  exists.
+
+The layer requires a **read-only base** for the same reason B5's overlay does: a layer
+over a writable base is not a snapshot, because discarding it would not discard
+anything.
+
+### The guest controllers §31 names, none of them built
+
+`controllers::BlockController` is `IdeAta`, `VirtIoBlock`, `NvMe`, and
+`is_buildable()` is `false` for all three. §31 says "do not implement all at once", and
+the three are not variants of one thing: a guest driver, a register map, a set of
+guest-visible semantics, and a different set for each.
+
+**The middle box of §31's chain is deliberately empty.** It reads:
+
+```text
+guest block device
+ ↓
+controller/device model
+ ↓
+host storage backend
+```
+
+The first box is B5's `BlockDevice` and the last is this crate. The middle box — a
+*controller* — is absent, and that is a decision rather than an omission: `BlockDevice`
+already is the thing a guest driver talks to, and adding a controller on top of it would
+mean a guest-visible device whose only job is to be another guest-visible device. The
+controller belongs with a compatibility machine (B27) or a virtio-style device, where it
+is the attachment point that actually needs a bus.
+
+## Two new `BackendError` variants, and why
+
+`Unavailable` and `Corrupt`. Both are needed because a host failure has to reach a guest
+as *something*, and the existing variants were all about arithmetic:
+
+- `Unavailable` — the storage could not be reached. **Not `Corrupt`**, because a guest
+  told its image was corrupt would conclude the data was damaged and go looking for a
+  backup of a disk that is fine and merely unmounted.
+- `Corrupt` — the storage holds data that does not make sense: a length that is not a
+  whole number of sectors, an index that disagrees with its data.
+
+Neither names a path, a filename or an errno. `StorageError` in `lazalith-storage` holds
+all of that and is never guest-visible, and
+`a_backend_error_cannot_name_a_host_path` holds the rule down.
+
+## Invariants now checked rather than asserted
+
+| Invariant | Test |
+| --- | --- |
+| The storage backends take no guest vocabulary | `the_storage_backends_take_no_guest_vocabulary` |
+| A `BackendError` cannot name a host path | `a_backend_error_cannot_name_a_host_path` |
+
+The second is the one worth having. Every variant of `BackendError` is reachable from a
+register access, so a variant carrying a `PathBuf` would hand the guest the host's
+directory layout — which is why the conversion in `From<StorageError> for BackendError`
+collapses to two facts and the host detail stays behind.
+
+## Tests
+
+`crates/lazalith-storage/tests/storage.rs`, 21 tests. The ones that matter:
+
+- `a_raw_image_is_the_disk_byte_for_byte` reads the file with `std::fs` rather than
+  through the backend. A test that read it through the backend would pass even if the
+  layout were wrong, because both sides would be wrong together.
+- `a_sparse_image_occupies_only_what_was_written` asserts `bytes_on_disk() < capacity`.
+  This is the property most likely to break: an implementation that wrote zeroes for
+  holes would pass every functional test and be 64 GiB on disk.
+- `rewriting_a_sector_does_not_grow_the_image` — seven writes to one sector is still one
+  sector, because a loop that rewrites one sector would otherwise make the image grow
+  once per iteration.
+- `discarding_a_layer_puts_the_machine_back_on_the_base` and
+  `a_renewed_layer_has_a_different_identity`.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1421 passed, 0 failed**
+- `nix flake check`, `nix build`, `actionlint` ✅
+
+## Limitations at the end of this stage
+
+1. **No guest controller.** IDE/ATA, VirtIO-blk and NVMe are all named and unbuilt, so
+   there is no guest-visible way to reach a disk. §31's middle box is empty by decision
+   (above), and the controllers are empty by §31's own instruction.
+2. **`lza64-virt-v1` is still not buildable**, which `docs/machine-profiles.md` §4 has
+   said since B4. B8 made a file backend exist; it did not make a profile that can name
+   one, because `BlockStorage` has no file variant. That is the obvious next piece and
+   is B8's remaining half.
+3. **A sparse image's index is in memory, proportional to allocated sectors.** A bitmap
+   would be 1 bit per sector — 8 MiB for a 64 GiB disk — and would be better for a
+   mostly-full image. `BTreeMap` is better for the common mostly-empty case and worse
+   for the other. The trade is documented on the type and neither is right.
+4. **The index is rebuilt by walking, not stored.** That is robust against a lost index
+   file and O(allocated) on open. A stored index would be O(1) on open and would need its
+   own consistency protocol.
+5. **No `flush`-on-drop, no fsync, no write barriers.** Every write is `write_all` plus
+   `flush`, which is a userspace flush, not an `fsync`. A host that loses power can lose
+   a sector. Correct durability is not in §31 and is not here.
+6. **A raw image refuses to shrink rather than truncating.** A caller that wants a
+   smaller disk must use a new file. This is deliberate and tested, but it means
+   "resize this image" has no API.
+7. **`SnapshotLayer` is in a `std` crate and needs no `std`.** Documented, and it is a
+   placement judgement rather than a necessity.
+8. **PIO still does not exist.** Unchanged since B4. A guest controller — IDE/ATA above
+   all — needs a port space, so B12 and B27 both depend on that question being answered.
+9. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B9, input architecture** (§30). `InputDevice` exists from Phase-I and B4's profile can
+name one, but — like the display before B7 — it has no backend, and §30 asks for input
+and USB as a pair.
+
+**B8's remaining half** is smaller and would finish §31: a `BlockStorage::File` variant
+so `lza64-virt-v1` becomes a profile a caller can actually build.
