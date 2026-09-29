@@ -63,6 +63,7 @@ extern crate alloc;
 
 mod boot;
 mod boot_profile;
+mod coverage;
 mod error;
 mod snapshot;
 mod state;
@@ -71,6 +72,10 @@ mod vm;
 pub use boot::{BootAgreement, BootHandoff};
 pub use boot_profile::{
     BootChain, BootProfile, BootProfileError, ChainStage, FirmwareProfile, MAX_FIRMWARE_BYTES,
+};
+pub use coverage::{
+    CapturedState, Coverage, CpuState, DETERMINISTIC_ITEMS, Determinism, DeviceState,
+    EXTERNAL_ITEMS, RECORDED_ITEMS, ReplayGuarantee, StateCoverage, StateItem, coverage_inventory,
 };
 pub use error::VmError;
 pub use snapshot::VmSnapshot;

@@ -684,6 +684,21 @@ impl<D: Device> LazalithMachine<D> {
     pub const fn interrupts(&self) -> &InterruptController {
         &self.interrupts
     }
+
+    /// The interrupt controller, mutably.
+    ///
+    /// **This is a snapshot restore's accessor, and that is the only intended use.**
+    ///
+    /// Every other mutation of the pending set goes through `raise_interrupt`, which is
+    /// the machine's step and is where an interrupt is *delivered*. That distinction
+    /// is the reason this accessor exists rather than being folded into the step: a
+    /// restore has to put back the promises the machine made to itself — the
+    /// interrupts it was about to take and had not — and that is not a delivery, so it
+    /// must not go through the path that performs one. Making it a separate, mutable
+    /// accessor keeps the fact that only a restore writes this set directly.
+    pub const fn interrupts_mut(&mut self) -> &mut InterruptController {
+        &mut self.interrupts
+    }
     /// The resume point of the last trap that was entered, or `None` if none has.
     ///
     /// See the field for why this is not the machine's program counter.

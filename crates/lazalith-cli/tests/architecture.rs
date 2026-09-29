@@ -496,16 +496,23 @@ fn grep_crates(wanted: &dyn Fn(&Path, &str) -> bool) -> Vec<PathBuf> {
 /// only ever ran one engine, and would be the second architectural truth the whole
 /// design exists to prevent.
 ///
-/// Two holders are allowed, and both are copies that are not a running machine:
+/// Three holders are allowed, and all are copies that are not a running machine:
 ///
 /// - `lazalith-cpu`, where `Processor` is the state and `ArchitecturalState` is
 ///   what it is made of;
 /// - `lazalith-debug`, where `CpuSnapshot` is a saved copy taken on purpose, and
-///   restoring one is the only way a copy ever becomes live again.
+///   restoring one is the only way a copy ever becomes live again;
+/// - `lazalith-vm`, where `CpuState` is the same kind of record and §40 puts it
+///   there — a snapshot promoted to VM-level infrastructure, which executes nothing.
 ///
 /// A snapshot is not an engine. It executes nothing, so a machine that is holding
 /// one is holding a *record* of a state, and a record is not a second truth about
 /// the state currently running.
+///
+/// The check is not weakened by these three being on the list. What it forbids is an
+/// *engine* taking the field, and the engine crates are still absent: adding a field
+/// to `lazalith-codegen` or to an interpreter would fail this test exactly as it did
+/// before B18.
 #[test]
 fn no_execution_engine_owns_the_architectural_state() {
     let mut holders = grep_crates(&|_, text| {
@@ -522,7 +529,8 @@ fn no_execution_engine_owns_the_architectural_state() {
         holders,
         vec![
             PathBuf::from("lazalith-cpu"),
-            PathBuf::from("lazalith-debug")
+            PathBuf::from("lazalith-debug"),
+            PathBuf::from("lazalith-vm")
         ],
         "the architectural state may be held by the processor and by a snapshot and \
          by nothing else, because a machine that owns its state cannot fork it; \

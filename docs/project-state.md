@@ -8298,3 +8298,177 @@ the build; it is a rule someone has to know.
 **B18, snapshot / replay / state infrastructure** — the state a snapshot must capture
 accounted for by what the stage actually needs, rather than by what is convenient to
 copy.
+
+---
+
+# B18 — snapshot / replay / state infrastructure (§40)
+
+## What this stage is
+
+§40 says to promote snapshots to VM-level infrastructure, investigate the coverage of
+nine pieces of state, and **document which host-backed devices are
+deterministic/snapshot-safe**. The last clause is a request for a *document*, and the
+finding of this stage is that a document is the wrong artifact for a claim that can be
+made to disagree with the code. So the claim is data, and the document is generated
+from it.
+
+The other finding is that the existing snapshot module was wrong about the clock.
+
+## The virtual clock was excluded for a reason that does not hold
+
+`lazalith-debug/src/snapshot.rs` states its rule as "only guest-visible state belongs
+in a machine snapshot" and then lists the machine's virtual clock as excluded, on the
+grounds that it is:
+
+```text
+host bookkeeping about how the machine got here
+```
+
+Those two sentences contradict each other. The clock is the most guest-visible state
+on the machine: it is what a `time` syscall returns and what a `sleep` is measured
+against. `LazalithMachine::restore_time` already existed *because* the clock matters to
+anything that is not the CPU, and a snapshot that dropped it restored a machine at a
+different virtual time, so the same program read a different clock after a restore
+than it had before.
+
+**The clock and the pending interrupt set are now captured**, in
+`lazalith_vm::CapturedState`:
+
+- the clock, because a guest reads it;
+- the pending interrupts, because a pending interrupt is a promise the machine has
+  made to itself that it will take one, and dropping it silently removes an interrupt
+  the guest would have received.
+
+The debug module's exclusion table is corrected rather than deleted, and it now draws
+the distinction that decides the case: **the clock is in because a guest can see it,
+the instruction count is out because a guest cannot.**
+
+## The device clocks are a different question, and the answer is already right
+
+Every device also keeps an `elapsed` clock, and **not one of the six puts it in its
+snapshot**. That looks like the same mistake one level down. It is not, and the
+distinction is worth recording because it is the kind of thing that gets "fixed"
+wrongly:
+
+- the machine's clock is guest-visible, so dropping it changes what a program reads;
+- a device's `elapsed` is set by `tick` and **reported by no register on any device**,
+  so no guest instruction can observe it. Each device says so in its own `snapshot` —
+  the input device's is explicit, and the console's explains that its registers are
+  write-only from the guest's side, which is why its snapshot is legitimately empty.
+
+The rule the devices were already following is the right one and this stage's claim is
+the same rule: **capture what the guest can see.** A device that started reporting
+`elapsed` through a register would have to add it to its snapshot in the same change.
+
+## The coverage account is an inventory, not prose
+
+`lazalith_vm::StateItem` is §40's nine items as an enum. Each one has:
+
+- a `Coverage` — `Captured`, `Checked` or `External`;
+- a `Determinism` — `Intrinsic`, `Recorded` or `External`.
+
+`coverage_inventory()` returns the nine rows, and `Display` renders the table the
+document is written from. Three choices in it are worth stating:
+
+**`Checked` is not `Captured`, and the difference is the point.** The machine
+configuration is checked on restore and refused if it differs, rather than copied into
+every snapshot. It is the same for every snapshot of the same machine, and copying it
+would be a second place for it to be wrong. A captured item can be *changed* by a
+restore and a checked one cannot.
+
+**`ReplayGuarantee` is not a `bool`.** §40 asks which host-backed devices are
+deterministic, and a boolean would answer "yes" for a machine whose CPU is exact and
+whose network is accidental — which is the answer that gets trusted for the CPU and
+wrong about for the network. The type instead carries the three lists and `covers()`
+treats `External` as *not* covered. Its array lengths are counted from the inventory
+in a `const fn`, so reclassifying an item is a recompile error in the type rather than
+an `assert!` that fires the first time somebody asks for a guarantee.
+
+**Storage and network are `External` because they are backed by the host**, and that
+is the honest answer rather than a gap: a storage device is a host filesystem and a
+network device is a host socket. Recording what those hosts *answered* is the work
+that would turn them from `External` into `Recorded`, and it is not done.
+
+## The CPU state is held whole, not copied field by field
+
+`CpuState` holds the canonical `ArchitecturalState` and the processor's execution
+state, rather than a `pc`, an `sp` and an array of registers of its own. A snapshot
+type that copied the parts would be a *second* description of the machine's registers,
+and the one thing a snapshot must never be is a place a register can be added to and
+forgotten. Holding the state itself makes that impossible: a new register is in the
+snapshot the day it is in the machine.
+
+Device state is carried opaquely for the same reason in the other direction — each
+device encodes itself, and the VM layer never decodes a device's private layout.
+
+## A test that found a real gap, and one that found nothing
+
+Two of the tests were written because the mutation check they came from had not been
+run yet.
+
+**The device restore was not tested.** `a_device_state_is_restored_not_just_counted`
+asserts on the restored *bytes*, not on the device count. A count assertion passes
+against an implementation that copies the count and drops the state, because the count
+is right either way. The first version of this test checked the count and passed
+against a `restore` that had been reduced to `let _ = &states;` — a real gap, found by
+removing the device restore and watching nothing fail. It now uses a **display**,
+because the console's snapshot is legitimately empty and a test on it could not
+distinguish "restored" from "nothing to restore".
+
+**The console's empty snapshot is not a gap.** Reading all six devices' `snapshot`
+implementations, the console is the one whose doc comment was not visible from the
+function signature alone; it does carry the reasoning, and it is the same reasoning as
+the audio and network devices' excluded ring and queue. A first pass reported this as a
+missing rationale and that report was wrong.
+
+Every mutation in this stage was checked by removing the thing it claims to cover:
+
+| mutation | test that failed |
+| --- | --- |
+| clock not restored | 3 tests |
+| pending interrupts not restored | 1 test |
+| device state not restored | 1 test |
+| architecture check skipped | 1 test |
+
+## The architecture test's allowlist grew, and why that is not a weakening
+
+`no_execution_engine_owns_the_architectural_state` scans the workspace for a field
+named `architectural` and asserts only the processor and a snapshot hold one.
+`CpuState` is a new holder, so the test failed.
+
+`lazalith-vm` is added to the allowlist with the reason: it is a *record* that executes
+nothing, which is the same category as `lazalith-debug`'s `CpuSnapshot`, and §40 puts
+snapshots in the VM layer. The check is not weakened — verified by adding an
+`architectural:` field to `lazalith-codegen` and confirming the test still fails with
+`left: [... "lazalith-codegen" ...]`.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1565 passed, 0 failed** (19 new)
+- `nix flake check`, `nix build` ✅
+- `actionlint` not run: B18 changed no workflow file, and this flake's devShell does
+  not provide it.
+
+## Limitations at the end of this stage
+
+1. **No replay, and no migration.** §40 names five capabilities; this stage implements
+   snapshot, restore and clone. `ReplayGuarantee` is the *account* of what a replay
+   could promise, not a replay.
+2. **Storage and network answers are not recorded**, so they stay `External` and a
+   replay says nothing about them. This is the single largest gap between the
+   inventory and a truthful `replay`.
+3. **Debug state is `Recorded` but the recording lives in `lazalith-debug`**, not in
+   the VM layer. The inventory names the item and its classification; the input log
+   has not been moved.
+4. **Memory and processes are not in `CapturedState`.** The device set here is the
+   machine's own devices; `lazalith-debug`'s `ProcessSnapshot` still holds process
+   memory, threads and handles. §40's `memory` row is therefore covered by two types
+   in two crates rather than one.
+5. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B19, VM manager / management API** (§41 and the roadmap) — a management layer above
+VM Core, with no direct access to CPU registers, devices or engine-private state.

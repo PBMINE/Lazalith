@@ -11,12 +11,26 @@
 //! | --- | --- |
 //! | a device's elapsed clock | a device ticks against it, but nothing in the register file reports it and no guest instruction can observe it |
 //! | a console's emitted output | a console hands bytes to a *host*; its registers are write-only from the guest's side, so its output is not the guest's to see again |
-//! | the machine's instruction count and its virtual clock | host bookkeeping about how the machine got here |
+//! | the machine's instruction count | host bookkeeping about how the machine got here, and no guest can read it |
 //! | a framebuffer's pixels | those belong to the guest, and they are in the process's memory — a snapshot that copied them would hold a second copy of every one, which is the thing the display device's design refuses to be |
+//!
+//! **The virtual clock used to be on that list, and it was wrong.** It was excluded
+//! here as "host bookkeeping about how the machine got here", in a file whose rule is
+//! that only guest-visible state belongs in a snapshot — and the clock is the most
+//! guest-visible state there is: it is what `time` returns and what `sleep` is measured
+//! against. A snapshot that dropped it restored a machine at a different virtual time,
+//! so the same program read a different clock after a restore than before.
+//!
+//! It is not excluded any more. The machine's clock and its pending interrupts are
+//! captured by [`lazalith_vm::CapturedState`], which is where §40 puts them; the
+//! instruction count stays out, because unlike the clock no guest can read it. The
+//! distinction between those two is the whole rule: **the clock is in because a guest
+//! can see it, the instruction count is out because a guest cannot.**
 //!
 //! What *is* included is everything a guest can observe or affect: the
 //! architectural registers, the trap frame a program is stopped in, each device's
-//! registers, and each process's state, memory, threads and handles.
+//! registers, the machine's virtual clock and its pending interrupts, and each
+//! process's state, memory, threads and handles.
 //!
 //! # Why these are clones and not encodings
 //!
@@ -176,9 +190,17 @@ impl ProcessSnapshot {
 
 /// A whole machine: its processor, its devices, and its processes.
 ///
-/// The type a debug session saves and restores. It holds no clock, no terminal
-/// output and no filesystem, because none of those is a guest's to see; see the
-/// module documentation for the whole list and why each is excluded.
+/// The type a debug session saves and restores. It holds no terminal output and no
+/// filesystem, because neither is a guest's to see; see the module documentation for
+/// the whole list and why each is excluded.
+///
+/// **It holds no clock either, and that is a division of labour rather than an
+/// omission.** A debugger is a *client* of the machine, and §40 puts the machine's own
+/// state in [`lazalith_vm::CapturedState`], which holds the CPU, the devices, the
+/// virtual clock and the pending interrupts. So this type holds the parts a debug
+/// session adds — the processes, their memory, their threads and their handles — and
+/// leaves the machine's own state to the type that owns it. Two snapshot types that
+/// both claimed the clock would be two places for it to be wrong.
 #[derive(Clone, Debug)]
 pub struct MachineSnapshot {
     cpu: CpuSnapshot,
