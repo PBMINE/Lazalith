@@ -457,4 +457,21 @@ impl<D: Device> DeviceManager<D> {
         self.clock = clock;
         Ok(())
     }
+
+    /// Sets virtual time outright, forwards or backwards.
+    ///
+    /// **The restore path, and a trap if used alone.** `tick` only moves time
+    /// forward, so a machine snapshot could not be put back into a machine that had
+    /// moved on since — and a snapshot that can only be restored into a machine at or
+    /// before its own time is barely a snapshot. Devices already rewind: each one's
+    /// `restore` writes its elapsed count straight back, so `DeviceManager` refusing to
+    /// rewind was an inconsistency rather than a policy.
+    ///
+    /// It does **not** tick any device. A device's own elapsed count is restored by its
+    /// `restore`, from its own snapshot bytes, and ticking it here as well would apply
+    /// the same interval twice. So the rule is: restore the devices, then set the
+    /// clock, and do not do it the other way round.
+    pub fn set_clock(&mut self, elapsed: CycleCount) {
+        self.clock = VirtualClock::at(elapsed);
+    }
 }

@@ -819,3 +819,90 @@ fn walk(root: &Path) -> Vec<PathBuf> {
     }
     found
 }
+
+// -- B6: the VM lifecycle boundary --------------------------------------------
+
+/// `binstruction.md` §9 names six things a VM core must not depend on, and this is
+/// that list, checked against the VM layers rather than described.
+///
+/// It is a separate test from `the_cpu_does_not_depend_on_sdl3` because the layers
+/// differ: that one covers the instruction decoder and its foundations, and this one
+/// covers the lifecycle that B6 added *above* the machine. A window library reaching
+/// the VM lifecycle would put a host GUI inside a machine's reset path, which is
+/// somewhere no host GUI has ever belonged.
+#[test]
+fn the_vm_core_depends_on_no_host_subsystem() {
+    for layer in [
+        "lazalith-vm",
+        "lazalith-machine",
+        "lazalith-boot",
+        "lazalith-cpu",
+        "lazalith-devices",
+        "lazalith-memory",
+        "lazalith-isa",
+        "lazalith-types",
+    ] {
+        let found = dependencies(layer);
+        for forbidden in ["lazalith-sdl3", "lazalith-gui", "lazalith-ui"] {
+            assert!(
+                !found.contains(forbidden),
+                "{layer} depends on {forbidden}: §9 says the VM core must not depend \
+                 on a GUI toolkit or a windowing framework, and a reset path that can \
+                 open a window is a reset path that can block on one"
+            );
+        }
+    }
+}
+
+/// The machine must not depend on the boot image, and the VM lifecycle is the join.
+///
+/// B6's reason this is checked rather than assumed: `Vm::boot` needs both a
+/// `MachineProfile` and a `BootImage`, and the tempting place to put that is inside
+/// `lazalith-machine`. It would compile, and it would make the architectural machine
+/// depend on the ROM format — so a change to the image format would become a change
+/// to the machine's API, and the machine would no longer be usable without a boot
+/// image. The join is a separate crate for exactly that reason.
+#[test]
+fn the_machine_does_not_know_what_a_boot_image_is() {
+    let found = dependencies("lazalith-machine");
+    assert!(
+        !found.contains("lazalith-boot"),
+        "lazalith-machine depends on lazalith-boot: the architectural machine must not \
+         know the firmware format. The join belongs in lazalith-vm, which is above both."
+    );
+
+    // And the dependency really is one-way: the lifecycle knows both.
+    let vm = dependencies("lazalith-vm");
+    assert!(
+        vm.contains("lazalith-boot") && vm.contains("lazalith-machine"),
+        "lazalith-vm must depend on both, or it cannot join a profile and an image"
+    );
+}
+
+/// The trap vector is defined once, in the layout.
+///
+/// B4 recorded this as a limitation — "the trap vector is still set after construction
+/// by each caller rather than being in the profile" — and B6 closed it by putting the
+/// vector in `MachineLayout`. This holds the closing shut: a second definition in the
+/// boot crate would give two machines a profile-derived vector and a boot-derived one,
+/// and the disagreement would appear as a guest that faults somewhere nobody chose.
+#[test]
+fn the_trap_vector_has_one_definition() {
+    let profile =
+        std::fs::read_to_string(workspace().join("crates/lazalith-machine/src/profile.rs"))
+            .expect("the profile module reads");
+    let boot = std::fs::read_to_string(workspace().join("crates/lazalith-boot/src/lib.rs"))
+        .expect("the boot crate reads");
+
+    assert!(
+        profile.contains("pub trap_vector: u64"),
+        "the layout should carry the trap vector, or B4's recorded limitation is back"
+    );
+    // A `const TRAP_VECTOR` in the boot crate would be a second definition. A
+    // re-export of the layout's field is the opposite and is allowed.
+    assert!(
+        !boot.contains("const TRAP_VECTOR"),
+        "lazalith-boot defines its own TRAP_VECTOR: re-export lazalith_machine's \
+         layout field instead, the way it already re-exports KERNEL_INITIAL_SP"
+    );
+}

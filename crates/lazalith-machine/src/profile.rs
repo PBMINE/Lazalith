@@ -49,7 +49,7 @@ use lazalith_devices::{
     BackendError, BlockDevice, ConsoleDevice, CopyOnWriteBlockBackend, Device, DeviceError,
     DeviceId, DeviceManager, DisplayDevice, InputDevice, MemoryBlockBackend, TimerDevice,
 };
-use lazalith_isa::ISA_VERSION;
+use lazalith_isa::{ControlRegister, ISA_VERSION};
 use lazalith_memory::{MemoryFault, MemoryRegion, RegionKind, RegionPermissions};
 use lazalith_types::{
     ArchitectureConfig, CycleCount, InstructionAddress, PhysicalAddress, VirtualAddress, WordWidth,
@@ -83,6 +83,14 @@ pub struct MachineLayout {
     pub kernel_image_length: u64,
     /// The stack pointer a kernel starts with.
     pub kernel_initial_sp: u64,
+    /// Where a trap lands: the supervisor entry point a fault or a syscall goes to.
+    ///
+    /// Part of the layout rather than a field a caller sets on a built machine,
+    /// because B4 recorded that it was the one piece of the interrupt model a
+    /// profile could not express 2014 and an interrupt vector that only exists after
+    /// construction is an interrupt vector whose value depends on who constructed the
+    /// machine. A guest faulting before anyone set it has nowhere to go.
+    pub trap_vector: u64,
     /// Where physical RAM starts.
     pub physical_ram_start: u64,
     /// How much physical RAM there is.
@@ -105,6 +113,7 @@ pub const LZA64_LAYOUT: MachineLayout = MachineLayout {
     kernel_load_address: 0x0010_0000,
     kernel_image_length: 0x0008_0000,
     kernel_initial_sp: 0x0018_f000,
+    trap_vector: 0x0000_0800,
     physical_ram_start: 0x0010_0000,
     physical_ram_length: 0x0031_0000,
 };
@@ -521,6 +530,24 @@ impl MachineProfile {
         self
     }
 
+    /// The same profile, on a different machine layout.
+    ///
+    /// The layout is the *shape* of the machine — where its ROM is, where a kernel
+    /// loads, where its RAM starts — as opposed to the regions and devices that fill
+    /// it. A profile that changes its layout has usually changed what machine it is
+    /// for, and the regions added before the change may no longer fit it.
+    ///
+    /// This exists as a builder rather than a public field because the regions and
+    /// devices a profile carries are not re-validated against the new layout. A caller
+    /// that swaps the layout under a populated profile gets a profile that
+    /// `validate` will refuse if the two disagree, and one it will not refuse if they
+    /// happen not to — which is the honest behaviour for a value that is meant to be
+    /// built by hand.
+    pub fn with_layout(mut self, layout: MachineLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
     /// Declares what kind of compatibility hardware this machine presents.
     ///
     /// Declaring `At` does not make a machine buildable. It is here so
@@ -557,6 +584,14 @@ impl MachineProfile {
     /// The stack pointer a kernel starts with.
     pub fn kernel_stack_pointer(&self) -> VirtualAddress {
         VirtualAddress::new(self.layout.kernel_initial_sp)
+    }
+
+    /// Where a trap lands on this machine.
+    ///
+    /// Read from the layout rather than stored, so the vector a profile reports and
+    /// the vector a machine is handed cannot be two different values from two places.
+    pub const fn trap_vector(&self) -> InstructionAddress {
+        InstructionAddress::new(self.layout.trap_vector)
     }
 
     /// Everything wrong with this profile, or `Ok(())`.
@@ -718,8 +753,69 @@ impl MachineProfile {
     /// device: `Box<dyn Device>` is a `Device`, so the rest of the machine is
     /// written once and does not know which is which.
     pub fn machine_setup(&self) -> Result<MachineSetup<Box<dyn Device>>, ProfileError> {
+        let config = self.name().architecture();
+        let devices = self.build_devices()?;
+        let mut regions = Vec::new();
+        regions
+            .try_reserve_exact(self.regions.len())
+            .map_err(|_| ProfileError::Allocation)?;
+        for region in &self.regions {
+            let length = usize::try_from(region.length).unwrap_or(0);
+            let built = match region.kind {
+                RegionKind::Rom => {
+                    // Empty on purpose: `lza64_native_v1` says the profile describes
+                    // the machine and a boot image is not the machine, so the ROM
+                    // window exists and holds nothing until firmware is installed.
+                    //
+                    // Which is also why it is mapped **read-only**: the guest cannot
+                    // write its own firmware, and a profile-built machine has no way to
+                    // install any. B6 boots a machine by building it from the *image's*
+                    // memory and this profile's devices, because a read-only ROM is a
+                    // window and not a place firmware arrives.
+                    let mut bytes = alloc::vec::Vec::new();
+                    bytes
+                        .try_reserve_exact(length)
+                        .map_err(|_| ProfileError::Allocation)?;
+                    bytes.resize(length, 0);
+                    MemoryRegion::rom(config, region.start, &bytes, region.permissions)
+                }
+                RegionKind::Ram => {
+                    MemoryRegion::ram(config, region.start, region.length, region.permissions)
+                }
+            }
+            .map_err(|source| ProfileError::Memory {
+                start: region.start,
+                source,
+            })?;
+            regions.push(built);
+        }
+        Ok(MachineSetup {
+            config,
+            devices,
+            regions,
+            pc: self.reset_vector(),
+            sp: self.kernel_stack_pointer(),
+            status: 0,
+            initial_time: CycleCount::new(0),
+        })
+    }
+
+    /// The devices of this profile, and nothing else.
+    ///
+    /// B6 made this necessary and the reason is the boot contract. A boot image owns a
+    /// machine.s *memory* 2014 a kernel image, a kernel stack and a user region with the
+    /// OS.s own permissions, which are not the same permissions a profile.s flat RAM
+    /// has 2014 and it refuses a device manager outright, because a boot image does not
+    /// know what devices a machine has. A profile owns its *devices*.
+    ///
+    /// So a machine that both boots and has devices is assembled from the two, and this
+    /// is the half of it that comes from the profile. `machine_setup` is the other
+    /// half: the whole profile-built machine, for a caller that does not need an image.
+    ///
+    /// Validates first, so a profile that could not be built as a whole is refused here
+    /// too rather than producing a device set that a later `map_device` would reject.
+    pub fn build_devices(&self) -> Result<DeviceManager<Box<dyn Device>>, ProfileError> {
         self.validate()?;
-        let config = self.name.architecture();
         let mut devices = DeviceManager::new();
         for device in &self.devices {
             let built: Box<dyn Device> = match device.class {
@@ -770,53 +866,7 @@ impl MachineProfile {
                     source,
                 })?;
         }
-        let mut regions = Vec::new();
-        regions
-            .try_reserve(self.regions.len())
-            .map_err(|_| ProfileError::Allocation)?;
-        for region in &self.regions {
-            let built = match region.kind {
-                RegionKind::Ram => {
-                    MemoryRegion::ram(config, region.start, region.length, region.permissions)
-                }
-                // A ROM region is built empty and filled by the boot path. The
-                // bytes are firmware, and firmware is not part of the machine — a
-                // profile says where the firmware window is, and the image says
-                // what is in it.
-                RegionKind::Rom => {
-                    let length = usize::try_from(region.length).map_err(|_| {
-                        ProfileError::RegionOutOfRange {
-                            start: region.start,
-                            length: region.length,
-                            source: lazalith_types::WidthError::AddressOutOfRange {
-                                value: region.start.as_u64(),
-                                width: config.word_width(),
-                            },
-                        }
-                    })?;
-                    let mut bytes = alloc::vec::Vec::new();
-                    bytes
-                        .try_reserve_exact(length)
-                        .map_err(|_| ProfileError::Allocation)?;
-                    bytes.resize(length, 0);
-                    MemoryRegion::rom(config, region.start, &bytes, region.permissions)
-                }
-            }
-            .map_err(|source| ProfileError::Memory {
-                start: region.start,
-                source,
-            })?;
-            regions.push(built);
-        }
-        Ok(MachineSetup {
-            config,
-            devices,
-            regions,
-            pc: self.reset_vector(),
-            sp: self.kernel_stack_pointer(),
-            status: 0,
-            initial_time: CycleCount::new(0),
-        })
+        Ok(devices)
     }
 }
 
@@ -1074,6 +1124,12 @@ impl LazalithMachine<Box<dyn Device>> {
                 })?;
         }
         machine.reset();
+        // The interrupt model is part of the profile, so the vector is applied here
+        // where the profile is the authority 2014 not left for each caller to remember.
+        // A machine whose trap vector depends on who built it is a machine whose
+        // interrupts land somewhere chosen by a caller that may not have known there
+        // was a choice.
+        machine.set_trap_vector(profile.trap_vector())?;
         Ok(machine)
     }
 
@@ -1095,6 +1151,13 @@ impl LazalithMachine<Box<dyn Device>> {
         }
         if self.processor().architectural().sp() != profile.kernel_stack_pointer() {
             return mismatch("the kernel stack pointer differs");
+        }
+        let trap_vector = self
+            .processor()
+            .read_trap_control(ControlRegister::Tvec)
+            .map_err(|source| ProfileError::Machine(MachineError::Cpu(source)))?;
+        if trap_vector != profile.trap_vector().as_u64() {
+            return mismatch("the trap vector differs");
         }
         if self.devices().len() != profile.devices().len() {
             return mismatch("the machine has devices the profile did not name");

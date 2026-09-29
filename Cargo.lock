@@ -320,6 +320,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazalith-vm"
+version = "0.1.0"
+dependencies = [
+ "lazalith-boot",
+ "lazalith-cpu",
+ "lazalith-devices",
+ "lazalith-isa",
+ "lazalith-machine",
+ "lazalith-memory",
+ "lazalith-os",
+ "lazalith-types",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"

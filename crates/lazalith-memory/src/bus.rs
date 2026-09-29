@@ -108,6 +108,16 @@ impl<D: Device> Bus<D> {
         self.devices.tick(delta)
     }
 
+    /// Sets the device manager's virtual time outright.
+    ///
+    /// The restore path, and the reason it lives here rather than being reached
+    /// through `LazalithMachine`'s device accessor: a machine restoring a snapshot has
+    /// to move the processor's clock and the devices' clock together, and a bus that
+    /// offered only `tick` would make that two calls a caller could get wrong.
+    pub fn set_device_clock(&mut self, elapsed: lazalith_types::CycleCount) {
+        self.devices.set_clock(elapsed);
+    }
+
     fn overlap(&self, start: PhysicalAddress, end: PhysicalAddress) -> Result<(), MemoryFaultKind> {
         for mapping in &self.mappings {
             if start <= mapping.end && mapping.start <= end {

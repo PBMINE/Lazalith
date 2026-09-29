@@ -6581,3 +6581,211 @@ is what turns `lza64-virt-v1` from a nameable profile into a real one.
   wrong one. `rustc` cannot catch two constants with the same meaning in different
   modules; a person can, in about ten seconds, by looking at what else is called
   that.
+
+---
+
+# B6 — the common VM lifecycle, reset and boot contract
+
+`binstruction.md` §6, §9, §34. Preceded by `4c2cfd2` (B5). New crate:
+`crates/lazalith-vm`.
+
+## What was already there, confirmed
+
+- `LazalithMachine::reset`, which reset the machine and knew nothing about booting.
+- `BootImage::start`, which built a machine *and* ran a bootloader in one call, and
+  refused a non-empty device manager with `BootError::UnexpectedDevices`.
+- `ProfiledMachine::from_profile`, which built a machine *with* devices from a profile
+  and knew nothing about booting.
+- `DeviceManager::snapshot`, and `MachineState`, which recorded whether a machine would
+  execute.
+
+## What changed
+
+### One construction path: `Vm<D>`
+
+`lazalith-vm` owns a machine, the stage it is in, the profile it came from, and where
+the last boot stopped. It is the only place a lifecycle transition is decided.
+
+`Vm` is **additive**. `LazalithMachine` is unchanged in what it can do, Phase-I's
+`BootImage::start` still builds and boots, and `Vm::from_machine` adopts an existing
+machine — which is how a Phase-I `NoDevice` machine gets a lifecycle. That is tested,
+because "B6 did not break Phase-I" is a claim that deserves a test rather than an
+inspection.
+
+### The boot contract, and the check that did not exist
+
+Before B6 there were two ways to make a machine and nothing compared them. The rule now
+is **each is the authority for what it knows, and the overlap is checked**:
+
+| Fact | Authority |
+| --- | --- |
+| memory — a kernel image, a kernel stack, a user region, with the OS's permissions | the boot image |
+| devices, the timer, the geometry, the interrupt model | the profile |
+
+Four fields are described by both and must agree: `physical_ram_start`,
+`reset_vector`, `kernel_load_address`, `kernel_initial_sp`. A profile that moved the
+kernel load address and an image built for this build's layout are **refused**, with
+the field named. Before B6 they were accepted, and the failure appeared as a fault at
+the first instruction of a kernel loaded somewhere else.
+
+**Two of those four names are one fact.** `reset_vector` *is* `boot_rom_start`, and
+`BootAgreement` reports it under the name `BootAgreement`'s callers think in. The test
+asserts the refusal names `reset_vector` for a moved `boot_rom_start`, because giving
+a caller two fields to go and fix for one mistake is worse than one.
+
+### B4's recorded limitation, closed
+
+`MachineLayout` gained `trap_vector`, so the interrupt model is part of the machine's
+description rather than something each caller sets afterwards.
+`ProfiledMachine::from_profile` applies it, and `matches_profile` checks it — the
+round trip now verifies six things instead of five. A machine whose trap vector depends
+on who built it is a machine whose interrupts land somewhere a caller that may not
+have known there was a choice.
+
+## Two real bugs, and the second one is the interesting one
+
+### The read-only ROM, and a wrong `boot`
+
+B6's first `Vm::boot` wrote the firmware into the machine's boot ROM with
+`machine.load_bytes`. The memory model refused it:
+
+```text
+MemoryFault { access: Initialize, size: Bytes(524288),
+              kind: ReadOnly { region_start: 0, kind: Rom } }
+```
+
+**The memory model was right and the implementation was wrong.** A profile's ROM window
+is mapped read-only because a guest must not be able to write its own firmware — and
+that same fact means firmware cannot be installed after construction. So `boot` was
+rewritten to do what §34 says: build the machine from the *image's* memory and this
+profile's devices, rather than patching firmware into a described machine. That
+required `MachineProfile::build_devices`, which is a real API with a real reason to
+exist.
+
+The refused attempt is recorded in the method's documentation, because the next person
+to read `boot` will otherwise reasonably ask why it rebuilds the machine rather than
+loading a ROM into it.
+
+### Snapshots could not undo anything
+
+The first `Vm::restore` advanced the clock to the snapshot's time and **refused a
+snapshot taken earlier than the machine had reached**. That is backwards, and it made
+every snapshot useless: you could snapshot, run, and then not restore — and undoing
+the run is the only reason to take one.
+
+The fix was in the machine, not in the rule. `LazalithMachine::advance_clock` only
+moves forward, while **devices had been able to rewind all along**, because each
+device's `restore` writes its own elapsed count straight back. The device manager was
+rewindable and the machine was not, and nothing had noticed because nothing had tried.
+
+So B6 added:
+
+- `DeviceManager::set_clock` — sets the manager's time without ticking, documented as
+  the restore path and as a trap if used alone (a device's own count comes from its
+  snapshot bytes; ticking here as well would apply the interval twice).
+- `Bus::set_device_clock` — so the two clocks move together.
+- `LazalithMachine::restore_time` — sets the processor's and the devices' clocks in one
+  call, because a machine whose two clocks disagree is a machine where a device has
+  been told a time the processor does not believe, and nothing else would report it.
+
+`Vm::restore` now rewinds, and the two refusals that remain are about what a restore
+cannot conjure: a snapshot from another stage (a machine cannot become booted by being
+restored, because booting ran firmware) and a different device count (device snapshots
+are restored by position).
+
+### A rule that was wrong on arrival
+
+`Vm` originally refused to map a device or load a region "while the guest is running".
+Execution here is **synchronous**: `run` executes and returns, leaving
+`MachineState::Running` as bookkeeping. That rule would have refused `reset()`
+immediately after `run(1000)` — the most ordinary thing a caller does. It is now keyed
+on an **active execution context**, which is the only genuinely in-flight thing
+present, and the reasoning is in the module documentation so it is not re-invented.
+
+## Invariants now checked rather than asserted
+
+Three new rows in `crates/lazalith-cli/tests/architecture.rs`, on top of B5's four:
+
+| Invariant | Test |
+| --- | --- |
+| The VM core depends on no host subsystem (§9's list) | `the_vm_core_depends_on_no_host_subsystem` |
+| The machine does not know what a boot image is | `the_machine_does_not_know_what_a_boot_image_is` |
+| The trap vector has one definition | `the_trap_vector_has_one_definition` |
+
+The second is the one that matters. `Vm::boot` needs both a profile and an image, and
+the tempting place to put that is inside `lazalith-machine`. It would compile, and it
+would make the architectural machine depend on the ROM format — so a change to the
+image format would become a change to the machine's API, and the machine would no
+longer be usable without a boot image. The join is a separate crate for that reason.
+
+## Tests
+
+`crates/lazalith-vm/tests/lifecycle.rs`, 16 tests. The ones that matter most:
+
+- `the_boot_agreement_can_be_made_to_fail_on_every_field` — forces each of the four
+  disagreements in turn, so the check cannot pass by covering only some fields. A check
+  that has only ever seen agreeing inputs has not been shown to be able to fail, and
+  B4 recorded that lesson twice.
+- `a_boot_onto_a_profile_that_disagrees_leaves_the_machine_alone` — checks the PC is
+  unchanged after a refusal, which is the half of the contract that says the check
+  happens before the machine is built.
+- `a_machine_adopted_from_the_boot_path_can_hold_a_lifecycle` — Phase-I's
+  `BootImage::start` still works, and a machine with no profile is *refused* by
+  `matches_profile` rather than reported as agreeing.
+
+**No test-only constructors were added.** The "restore a snapshot taken earlier" case
+is produced by snapshotting, advancing the clock, and restoring; the disagreements are
+produced by editing a `MachineLayout`, which is a public type with public fields. A
+test that could only be written with a bespoke `#[doc(hidden)]` constructor is usually
+testing a shape no caller can reach.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1377 passed, 0 failed**
+- `nix flake check`, `nix build`, `actionlint` ✅
+
+Phase-I's boot, OS, stdlib and runtime suites are unchanged and green, which is the
+real evidence that splitting `start` into `machine_setup` + `boot_into` did not disturb
+them.
+
+## Limitations at the end of this stage
+
+1. **No firmware.** §34: "Do not implement them during this architecture pass." The
+   firmware is a ROM a caller loads; what B6 builds is the *contract* for loading one.
+2. **One ROM window.** `MachineLayout` has no nested firmware volumes, so §34's
+   minimal-Lazalith / BIOS-like / UEFI-like layers cannot be described yet. They need a
+   `FirmwareProfile`, which is B13.
+3. **`Vm::from_machine`'s `stage` is the caller's claim.** There is nothing to compute
+   it from — a `LazalithMachine` does not record whether a bootloader ran, and B6 did
+   not add that field to it, because the fact belongs to the lifecycle. A caller that
+   claims `Booted` when nothing booted gets a VM that believes it.
+4. **`boot` discards the previous machine.** Deliberate and documented: a boot is a
+   cold start, and preserving a previous machine's RAM and devices would be a way to
+   get a machine that is half one profile's disk and half another's. But it means a
+   booted VM cannot re-boot while keeping anything.
+5. **`Vm` is above `lazalith-boot`, so `lazalith-boot` cannot use it.** A caller that
+   wants a lifecycle around Phase-I's `BootImage::start` has to adopt the machine. That
+   is `Vm::from_machine`, and it works — but it is a second path, and the run prompt's
+   "unite the two paths" is only *mostly* satisfied: one path now *builds and boots*,
+   and the other still exists as the Phase-I entry point it has always been.
+6. **The clock is settable and therefore abusable.** `restore_time` will rewind a
+   machine's clock without restoring device state, leaving devices ahead of the
+   processor. The doc comment says to restore devices first and says why; nothing
+   enforces it. A `restore` on `Vm` that a caller cannot get wrong would be better,
+   and is noted rather than left for someone to trip over.
+7. **PIO still does not exist**, unchanged from B4. B6 did not answer it, and a boot
+   contract is the wrong place to.
+8. **`aarch64-linux` still unchecked**, and no cold `nix flake check` timing was taken.
+
+## Next stage
+
+**B7, native display architecture** (§28). B4's `lza64_native_v1` has no display, and
+`docs/device-model.md` §5.2 records that `Sdl3DisplayBackend` is a proposal. B7 is the
+stage that puts a real display behind the B5 backend boundary.
+
+**B8, storage architecture** (§31) is the other candidate and is a smaller piece of
+work now: a *file* backend over `BlockBackend` makes `lza64-virt-v1` real, and B5's
+invariant that a backend is never a guest interface is exactly the discipline a file
+backend needs.

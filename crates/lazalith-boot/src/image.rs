@@ -300,8 +300,37 @@ impl BootImage {
     ) -> Result<LazalithMachine<D>, BootError> {
         let mut machine = LazalithMachine::new(self.machine_setup(devices)?)
             .map_err(|source| BootError::Machine(Box::new(source)))?;
+        // The one bootloader implementation, shared with `Vm::boot` since B6. Reset
+        // here rather than in `boot_into` because `start` is the path that *is*
+        // "build and boot from scratch", and a machine it just built has nothing to
+        // preserve.
+        machine.reset();
         self.execute_bootloader(&mut machine)?;
         Ok(machine)
+    }
+
+    /// Runs this image's bootloader on a machine that is already built.
+    ///
+    /// **B6's reason this is public.** Before B6, booting a machine and building one
+    /// were the same call: `start` built the machine and then ran the bootloader, so a
+    /// caller who had already built a machine from a *profile* had no way to run a
+    /// bootloader on it — and a profile-built machine has devices, which `start`
+    /// refuses outright. Splitting the two makes "build it, then boot it" a sequence
+    /// rather than a single privileged call.
+    ///
+    /// `start` is now exactly `machine_setup` followed by this, so there is one
+    /// bootloader implementation and Phase-I is unaffected.
+    ///
+    /// The machine is expected to have the image's ROM loaded and to be at its reset
+    /// vector. It is *not* reset here: resetting a machine a caller has just
+    /// deliberately configured would discard that configuration, and which of the two
+    /// a caller means is not something this can guess.
+    pub fn boot_into<D: Device>(
+        &self,
+        machine: &mut LazalithMachine<D>,
+    ) -> Result<InstructionAddress, BootError> {
+        self.execute_bootloader(machine)?;
+        Ok(self.entry())
     }
 
     fn execute_bootloader<D: Device>(

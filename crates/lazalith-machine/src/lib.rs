@@ -1032,6 +1032,27 @@ impl<D: Device> LazalithMachine<D> {
         self.clock = next;
         Ok(())
     }
+
+    /// Sets virtual time outright, forwards or backwards.
+    ///
+    /// **The restore path.** `advance_clock` only moves forward, which is right for
+    /// running a machine and wrong for putting one back: a snapshot taken before the
+    /// machine ran on could not be restored after it did, and a snapshot that cannot
+    /// undo the running is not a snapshot. B6 added this so the VM lifecycle's
+    /// `restore` is real rather than a one-way capture.
+    ///
+    /// Devices are *not* ticked. A device's elapsed count is part of its own snapshot
+    /// and is written back by its `restore`; ticking it here too would apply the same
+    /// interval twice, which for a timer means its deadline moves. So the order is:
+    /// restore the devices, then set the clock.
+    ///
+    /// The machine's clock and the device manager's clock are set together, because a
+    /// machine whose two clocks disagree is a machine where a device has been told a
+    /// time the processor does not believe — and nothing else would report it.
+    pub fn restore_time(&mut self, elapsed: CycleCount) {
+        self.clock = VirtualClock::at(elapsed);
+        self.bus.set_device_clock(elapsed);
+    }
 }
 
 fn trap_cause(fault: &CpuFault<MemoryFault>) -> TrapCause {
