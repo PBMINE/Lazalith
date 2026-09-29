@@ -1,2 +1,30 @@
-/target
-result
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# Nix
+/result
+/result-*
+.direnv/
+.devenv/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Temporary / crash files
+core
+core.*
+*.tmp
+*.temp

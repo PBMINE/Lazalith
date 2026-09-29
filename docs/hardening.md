@@ -589,53 +589,135 @@ Three more test defects here, all of the same family as H2's and H4's:
   `0`. The frontend was right to reject it and the probe was wrong.
 
 ---
+## H2 a third time — the C feature sweep: three more defects, two of them a feature that was never implemented
 
-## Running totals
+**New test:** `crates/lazalith-c-compiler/tests/hardening_c_features.rs`.
+
+A sweep of the C features the suite did not reach, each against a hand-written answer.
+This is the same technique that found the first four, applied to a list nobody had
+written down.
+
+**Defect 10 — a multi-dimensional array's initialiser was checked against the wrong
+dimension.** `int grid[2][3] = {{1, 2, 3}, {4, 5, 6}}` was *refused* with "this list has
+3 values for an array of 2", and `{{1, 2}, {3, 4}}` was *accepted*. C's postfix
+derivations associate right to left, so the first subscript is the outer dimension; the
+declarator fold went the other way. The fix reverses the array derivations and leaves
+the `*` prefix derivations in source order, because a prefix binds looser than every
+suffix — `int *a[3]` is an array of 3 pointers, and reversing that too would have
+broken a case that was right.
+
+Two things hid this, and both are the kind of blind spot worth naming:
+
+- **`sizeof` cannot see it.** The size is the *product* of the dimensions, and a product
+  does not care what order it is multiplied in. `sizeof` was correct before the fix and
+  is correct after it. The measurement tried first was blind by arithmetic.
+- **A square array cannot see it.** `int g[2][2]` has two equal dimensions, so the wrong
+  one gives the right answer. The shape tried first was blind by symmetry.
+
+**Defect 11 — `switch` was not implemented.** `switch_statement` read the condition
+with `let _ = self.value(condition);` — discarding the value being switched on — and
+lowered the body as an ordinary block. Every program with a `switch` in it ran the first
+case body whatever the value, with no diagnostic and with a green suite, because a test
+whose expected value happened to be the first arm's could not tell the difference.
+
+It is now a comparison chain with C's fall-through: one block per arm, one block per
+dispatch test (two branches cannot share a block, and the builder rightly refuses an
+instruction after a terminator), and a jump from each arm's end to the *next* arm. Three
+details are load-bearing and are commented where they are met:
+
+- A fall-through jump is skipped when the arm already ended, or it is a second
+  terminator in one block.
+- A label chain like `case 1: case 2: stmt` is collected **recursively**, because the
+  parser nests it — and a nested label left alone is lowered as an ordinary statement
+  and runs unconditionally, which is a wrong answer rather than a refusal.
+- The IR builder grew `current_is_terminated()` so a lowering assembling blocks
+  back to back can ask whether the previous one ended.
+
+**Defect 12 — pointer arithmetic was not scaled by the pointee.** `at + 1` on an `int *`
+advanced one *byte*, so `*(at + 1)` read one byte into an element and faulted on the
+alignment check. `at[1]` was correct, because `element_address` has always multiplied by
+the element's size — so the two spellings of one address disagreed, and a suite that used
+only one of them could not tell. All four shapes C defines are now handled: `p + n`,
+`n + p`, `p - n`, and `p - q` as a count of elements.
+
+That fix is also what made `p->a = 7` work, because a member's offset from a pointer is
+the same kind of scaled addition.
+
+### Four test defects, and three of them were mine
+
+- The struct-size test asserted **16** where C says **24** — the members were added and
+  the padding was not. The platform was right.
+- The `do`/`while` test asserted `n == 1` after four passes, where the fourth subtraction
+  takes `n` to `-2`. That is the answer for a `while`; the platform was right.
+- The loop-with-`switch` test asserted **112** where the answer is **122**. Arithmetic.
+  The platform was right.
+- **The limitation records were checked against `compile` alone**, so they called two
+  features "unsupported" that only `generate` refuses, and called a *bare function-pointer
+  declaration* unsupported when it is only *calling through* one that fails. A record
+  that says "unsupported" for a program that fails at `generate` sends the next reader
+  looking for a bug that is not there. The records now check the whole pipeline and name
+  the stage.
+
+### What remains
+
+Four limitations, all loud, all asserted, all in
+`hardening_c_features.rs::four_c_features_are_still_refused`: a whole-struct assignment; a
+member access through a *dereference* (`(*p).a` types the place as the record, while
+`p->a` is fine — same address, wrong width); a call through a function pointer; and
+reading an element of a multi-dimensional array.
+
+---
+
+## Running totals (final)
 
 | | before | after |
 | --- | --- | --- |
-| tests | 1176 | 1263 |
-| confirmed defects | — | 9 (7 in the C frontend, 1 in the runtime, 1 in the debugger) |
-| test defects found and fixed | — | 22 |
-| clusters audited | — | 11 (H1, H2 twice, H3/H11, H4, H5, H6, H7/H8, H9, H10, H12) |
-| new tests | — | 87 |
+| tests | 1176 | 1279 |
+| confirmed defects | — | 12 (10 in the C frontend, 1 in the runtime, 1 in the debugger) |
+| test defects found and fixed | — | 26 |
+| clusters audited | — | 12 (H1, H2 three times, H3/H11, H4, H5, H6, H7/H8, H9, H10, H12) |
+| new tests | — | 103 |
 
-Seven of the eight confirmed defects are in the C frontend, and all seven were found by a
-*differential* or *property* test rather than by reading code. Nothing in the suite
-had ever asked the C frontend to agree with C, and nothing had asked a constant to
-be worth anything.
+Twelve confirmed defects in a platform whose 1,176-test suite was green at the start.
+Ten of the twelve are in the C frontend, and every one of the ten was found by asking
+the compiler to do something and checking the number — a differential against Lazen, a
+property over a model, or a hand-written answer. Not one was found by reading code.
 
-The eighth was the exception that proves the rule. It was not hidden by a missing
-test at all — it was a defect **recorded in this repository, with a reproduction and a
-theory**, for a whole cluster, and the theory was wrong. The reader was right about
-the address and wrong about which memory owned it. What finally found it was asking a
-question step 97.s investigation had not: not "which of these two addresses is right"
-but "read the bytes through each of them and see which one holds the picture".
+**Twenty-six test defects against twelve implementation defects.** Every one of the
+twenty-six was a test that would have passed, or failed, for the wrong reason: a stale
+hand-computed constant, a case whose values did not distinguish the behaviours it
+compared, a baseline taken before a legitimate write, a limitation record that checked
+the wrong pipeline stage, and one assertion that demanded a checksum the object format
+was never going to have.
 
-The ratio is the phase's main result so far, and it is worth stating plainly rather
-than leaving to be inferred: on this platform the **implementation has been more
-reliable than the tests that describe it**. Fifteen test defects against seven
-implementation defects, and the pattern in the test defects is consistent — a
-hand-computed constant that was stale, a case whose values did not distinguish the
-behaviours it claimed to compare, a baseline taken before a legitimate write, and one
-assertion that demanded a feature (a checksum) the format was never going to have.
+That ratio is this phase's result, and it is the part worth carrying forward. On this
+platform the implementation has been more reliable than the tests that describe it, and
+the three rules that came out of it are now conventions rather than habits:
 
-Every one of those is a test that would have passed, or failed, for the wrong reason,
-which is worse than a test that does not exist: a test that is confidently wrong
-teaches its reader something false. That is the thing to watch for in the remaining
-clusters, and it is the reason the rule from H4 — *derive the expected value in the
-test* — is now stated as a convention rather than as a habit.
+1. **Derive an expected value; do not write it down.** A closed-form constant computed in
+   the test cannot go stale when the program changes, and a hand-written one went stale
+   six times here — every time wrongly blaming the platform.
+2. **A test whose values do not distinguish the behaviours it compares asserts nothing.**
+   The `&&`/`||` case and the `0o777` probe were both confident and both vacuous.
+3. **Check the whole pipeline, not the front end.** Two "unsupported" records here were
+   wrong because they stopped before the stage that actually refused.
 
 ## Open items
 
-- **No checksum in the object format.** Corrupting a data field yields a valid
-  object rather than a rejected one. Not a current threat model (objects are local to
-  the toolchain) and not fixed, deliberately: adding a digest to a binary format is a
-  design change, not a hardening patch, and it is better made once than retrofitted.
-- **The C constant work touched `types.rs` and `ir.rs`, so the full C campaign should
-  be re-run against a clean tree** rather than trusted because its own tests pass.
-  Done: 1240 tests, clean fmt, clean strict Clippy, green `nix flake check` and
-  `nix build` at the time of writing.
-- **`lazalith-c-runtime` and `lazalith-runtime` are dev-dependencies** of
-  `lazalith-c-compiler`, having briefly been regular dependencies when the
-  cross-frontend test was written. Corrected, and the architecture checks re-run.
+Carried forward from the clusters above, and still open at the freeze:
+
+- **No checksum in the object format.** Corrupting a data field yields a *valid* object
+  rather than a rejected one. Not a current threat model — objects are built and consumed
+  locally by the toolchain — and not fixed, deliberately: adding a digest to a binary
+  format is a design change rather than a hardening patch, and it is better made once
+  than retrofitted.
+- **Four C features are refused, loudly**: whole-struct assignment, a member access
+  through a dereference, a call through a function pointer, and reading an element of a
+  multi-dimensional array. Each is asserted, so the day one lands this file says so.
+- **Lazen has no `&mut [u8]` to `&[u8]` coercion**, so every standard-library function
+  taking `&[u8]` is unreachable from a program holding a mutable array without building
+  a read-only view from an address. It is a loud failure rather than a wrong answer, and
+  two of this phase's own test files had to work around it.
+- **The hardening phase is not finished.** Eleven of the roadmap's eighteen clusters are
+  done. What remains is the same technique applied to the rest: differential, property
+  and adversarial tests, each asking a question the existing suite does not.

@@ -1,6 +1,6 @@
 # Lazalith — Project State
 
-Last updated: 2026-09-29 (hardening: 11 clusters audited, 9 confirmed defects, 1263 tests)
+Last updated: 2026-09-29 (Phase I frozen as lazalith-phase1-100; hardening: 12 clusters audited, 12 confirmed defects, 1279 tests)
 
 ## Where the roadmap stands
 
@@ -1944,8 +1944,11 @@ It was *documented*, with evidence and a theory, and the theory was what kept it
 alive. Asking "which of these two addresses is right" could not have found it; asking
 "read the bytes through each and see which holds the picture" did, immediately.
 
-1263 tests pass, and fmt, strict Clippy, check, `nix flake check` and `nix build` are
-green. `lazalith-c-runtime` and `lazalith-runtime` are dev-dependencies of
+1279 tests pass, and fmt, strict Clippy, check, `nix flake check` and `nix build` are
+green. The third sweep of the C front end found three more defects and is recorded in
+`docs/hardening.md`: a multi-dimensional array.s initialiser checked against the wrong
+dimension, `switch` discarding the value it was switching on, and pointer arithmetic not
+scaled by the pointee. `lazalith-c-runtime` and `lazalith-runtime` are dev-dependencies of
 `lazalith-c-compiler`, as they should be; they were briefly regular dependencies when
 the cross-frontend test was written.
 
@@ -5825,3 +5828,42 @@ so *only the length* can be refused, and the test now says so.
   spawned is not usable on the machine that process was spawned on.
 - **No source-level information**, so a snapshot records addresses and not lines.
   That is Step 76.
+
+---
+
+# PHASE I FREEZE
+
+Phase I — the hundred-step roadmap — is complete and is frozen. The frozen state is the
+commit this file was last changed on, carrying the tag:
+
+```text
+lazalith-phase1-100
+```
+
+What is frozen:
+
+```text
+Phase I        Steps 1–100. Complete, tested, documented. Not a work in progress.
+Hardening      In progress and NOT frozen as complete. Eleven of the roadmap's
+               eighteen clusters are audited; the remaining seven are not.
+               12 confirmed defects fixed, 26 defective tests fixed, 1279 tests.
+Beyond Lazalith  Not started. No work of any kind is in this repository.
+```
+
+The hardening phase is deliberately *not* part of the freeze claim. The tag records the
+Step-100 baseline and the hardening work that stood at the moment of freezing; it does
+not assert that the audit is finished, and `docs/hardening.md` says so in its own open
+items.
+
+Verified at the freeze:
+
+```text
+cargo fmt --all --check                                     clean
+cargo clippy --workspace --all-targets --all-features       clean (-D warnings)
+cargo check --workspace --all-targets --all-features        clean
+cargo test  --workspace --all-features                      1279 passed, 0 failed
+nix flake check path:.                                       all checks passed
+nix build path:.                                             result/bin/{lazen, lazalith-fuzz}
+lazen run examples/hello/main.lz                            Hello, Lazalith
+lazen run examples/window/main.lz                           exit 0
+```
