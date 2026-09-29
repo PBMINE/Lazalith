@@ -7545,3 +7545,138 @@ packets.
 **B12, expansion bus / device discovery** (§33). The stage several things above are now
 waiting on: PIO, USB (§30), and B27's compatibility machine all need a bus, and §33 says a
 native Lazalith expansion bus may come before PCI.
+
+---
+
+# B12 — expansion bus / device discovery
+
+`binstruction.md` §33, and §25's "Architectural Core → bus". Preceded by `54fcb32` (B11).
+New module: `crates/lazalith-memory/src/expansion.rs`.
+
+## What was already there, confirmed
+
+- `Bus`, which maps device windows into an address space and routes by `DeviceId`.
+- B4's `MachineProfile`, which *describes* a machine's devices.
+- B10's `Device::take_interrupt`, which a bus needs to route.
+
+## §33's six items, answered four ways and recorded two
+
+| §33 item | Here |
+| --- | --- |
+| device identifiers | `DeviceDescriptor`: id, class, name, window, interrupt, dma |
+| configuration | `ExpansionBus::with_capacity`, checked at attach time |
+| MMIO | already the only register mechanism; the bus is where a window is *assigned* |
+| interrupt routing | `attach` refuses two devices on one line |
+| bus topology | `BusTopology`, a bus → device tree in attachment order |
+| DMA | **not built** — recorded |
+
+## The PIO question, answered
+
+B4 recorded this as open and **four stages have now deferred it**: B9 (PS/2), B11, B12,
+and it blocks B27. LZA has no `in`/`out` instruction; eleven Linux driver files use them.
+
+§33 says "a native Lazalith expansion bus may come before PCI", which argues for giving
+the platform a bus of its own. But a bus with only MMIO cannot host a PS/2 controller, an
+IDE channel or a VGA sequencer, because every one of those is *defined by its port
+numbers*.
+
+**The answer: port decode is a compatibility-machine concern, emulated host-side, and LZA
+gets no port address space.** A PS/2 controller here is a device whose *host backend*
+answers for ports 0x60 and 0x64, and a guest reaches it through an ordinary MMIO register
+window the backend translates.
+
+That is a real architectural position, not another deferral, and it has a consequence
+worth naming: **a guest that speaks `in`/`out` cannot be ported by rewriting its driver
+to use MMIO**, because the port numbers *are* the interface. The Linux port therefore
+needs either an ISA with `in`/`out` or a compatibility layer that traps them. Both are
+B27's question, and until it is answered this is the documented default rather than the
+only possible answer.
+
+## Discovery is a description, not a scan
+
+A bus that *scans* for devices must know what a device looks like before it has one.
+That is PCI's configuration space and it is a large, load-bearing decision.
+
+`DeviceDescriptor` is the alternative: a device **says** what it is, and the bus places
+it. No scan, no vendor list, no enumeration order — because the machine is *described*,
+which B4 established, and a profile listing four devices has four devices.
+
+**The cost, stated plainly:** a guest cannot find a device the host did not describe. For
+a virtual machine that is a feature. For a machine meant to run code that probes for
+hardware, it is a limitation — and it is exactly what B27's compatibility machine will
+have to give up.
+
+## Every refusal happens before anything is written
+
+`attach` checks capacity, duplicate id, empty window, address overflow, window overlap
+and interrupt conflict **before** it pushes. A bus that attached a device and *then*
+found the overlap would leave a machine where one address has two possible destinations,
+and nothing would ever report it. Every test attaches a good device, then a bad one, and
+checks the bus length is unchanged.
+
+**Interrupt lines are exclusive.** A controller that delivers one line to two devices
+delivers it to neither, so a conflict is a refusal rather than a resolution order.
+
+**Attachment order is meaningful and is recorded.** Windows are checked when the *second*
+device is attached, so the order records which one "had" the address — which is what a
+caller diagnosing an overlap wants to know.
+
+## `dma: bool` that nothing acts on
+
+`DeviceDescriptor::dma` is recorded and **not acted on**. §33 lists DMA and it is not
+built, for B10's reason: a device has no way to reach guest memory, and building it means
+a DMA engine on the machine that services device *requests* rather than handing every
+device a memory handle.
+
+The flag exists so a profile can say "this device will do DMA" *before* the engine can,
+and a machine that has one finds out at run time rather than at boot. **A flag nothing
+reads would be worse than no flag** — it would be a claim the platform cannot keep — so
+`BusTopology::dma_capable()` exists to let a caller see what was claimed.
+
+## Tests
+
+`crates/lazalith-memory/tests/expansion.rs`, 17 tests. The ones that matter:
+
+- `two_devices_whose_windows_overlap_are_refused` and
+  `two_devices_on_one_interrupt_line_are_refused` — both attach a good device first and
+  then check the bus is unchanged, which is the "all checks before any write" property.
+- `a_window_that_would_overflow_the_address_space_has_no_end` — an overflow in a window
+  end must be a refusal, not an end address that wrapped to something small and legal.
+- `a_bus_with_no_capacity_is_a_legitimate_machine` — refusing every attach is a way to
+  say "this machine has no expansion hardware", not an error.
+- `an_erased_bus_converts_to_a_manager_and_keeps_its_descriptions` — the descriptors
+  survive the conversion, because a machine that has the devices and not what they are
+  cannot be shown to a person or snapshotted.
+
+**The monomorphic test uses `TimerDevice`, not `NoDevice`.** `NoDevice` is an
+*uninhabited* enum, so a bus of them cannot be built and the test could not exist. Phase-I
+uses `NoDevice` as a type, never as a value, and the test says so.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1498 passed, 0 failed**
+- `nix flake check`, `nix build`, `actionlint` ✅
+
+## Limitations at the end of this stage
+
+1. **The bus is not yet in the machine.** `ExpansionBus` is a tested, standalone
+   structure; `LazalithMachine` still uses its own `Bus` + `DeviceManager` directly. The
+   join — a profile building an `ExpansionBus` and a machine adopting it — is mechanical
+   and is not done. `into_manager` exists precisely so that join is one call.
+2. **No DMA**, and the flag is inert. See above.
+3. **No port address space**, by decision. See the PIO section.
+4. **Class numbers are a registry, not a table.** `ClassRegistry` hands out `u8`s so
+   adding a device is not a change to a table elsewhere, but nothing consults the numbers
+   yet — a guest cannot enumerate by class because there is no guest-visible
+   enumeration.
+5. **No hot-plug.** A bus is built and attached to; removing a device would change what
+   addresses mean under a running guest, and §33 does not ask for it.
+6. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B13, firmware / boot profiles** (§34). Small, and it uses what B6 built: a profile that
+records *where* firmware lives and what the boot chain is, without implementing any
+firmware — §34 says "Do not implement them during this architecture pass."

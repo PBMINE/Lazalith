@@ -4,6 +4,7 @@ extern crate alloc;
 
 mod bus;
 mod cache;
+pub mod expansion;
 mod fault;
 mod region;
 mod space;

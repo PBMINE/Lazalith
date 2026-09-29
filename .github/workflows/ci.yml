@@ -152,6 +152,8 @@ jobs:
         run: nix develop --command cargo test -p lazalith-machine --test engine -- --nocapture
       - name: the device/backend boundary
         run: nix develop --command cargo test -p lazalith-devices --test backend -- --nocapture
+      - name: the expansion bus and device discovery
+        run: nix develop --command cargo test -p lazalith-memory --test expansion -- --nocapture
       - name: networking, and the no-silent-transmit rule
         run: nix develop --command cargo test -p lazalith-devices --test net -- --nocapture
       - name: audio, and the device interrupt path
