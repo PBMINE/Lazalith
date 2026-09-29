@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 
 use lazalith_cpu::Processor;
 use lazalith_devices::DeviceId;
+use lazalith_machine::MachineState;
 use lazalith_types::{CycleCount, InstructionAddress};
 
 use crate::state::BootStage;
@@ -36,12 +37,33 @@ const SNAPSHOT_MAGIC: &[u8; 4] = b"LVM1";
 /// host resource and a machine snapshot that copied a 64 MiB disk would be holding a
 /// second copy of it. Restoring onto different storage is refused by the device, not
 /// silently accepted.
+///
+/// # A snapshot's parts, taken apart for a restore
+///
+/// A named type because clippy is right that a five-element tuple of this is not a
+/// thing a human should read at a call site, and `Vm::restore` destructures it.
+pub(crate) type VmSnapshotParts = (
+    BootStage,
+    Processor,
+    CycleCount,
+    Vec<(DeviceId, Vec<u8>)>,
+    MachineState,
+);
 #[derive(Clone, Debug)]
 pub struct VmSnapshot {
     stage: BootStage,
     processor: Processor,
     clock: CycleCount,
     devices: Vec<(DeviceId, Vec<u8>)>,
+    /// The machine's own lifecycle state, added in B19.
+    ///
+    /// **Without this a snapshot restored a halted machine that was not halted.** The
+    /// processor came back exactly as saved — pointing at the next instruction, not
+    /// halted — while `MachineState` still said `Halted`, so `is_halted()` and the
+    /// registers disagreed. Nothing caught it until a management layer tried to restore
+    /// a pre-halt snapshot onto a VM that had run to a halt and found the VM still
+    /// reporting halted.
+    state: MachineState,
 }
 
 impl VmSnapshot {
@@ -50,13 +72,20 @@ impl VmSnapshot {
         processor: Processor,
         clock: CycleCount,
         devices: Vec<(DeviceId, Vec<u8>)>,
+        state: MachineState,
     ) -> Self {
         Self {
             stage,
             processor,
             clock,
             devices,
+            state,
         }
+    }
+
+    /// The machine's lifecycle state when this was taken.
+    pub const fn machine_state(&self) -> MachineState {
+        self.state
     }
 
     /// Which stage the machine was in when this was taken.
@@ -93,8 +122,14 @@ impl VmSnapshot {
     /// Consuming rather than lending, because a restore that failed part-way has
     /// already moved the machine and must not be able to leave the caller holding a
     /// snapshot it might try again with.
-    pub(crate) fn into_parts(self) -> (BootStage, Processor, CycleCount, Vec<(DeviceId, Vec<u8>)>) {
-        (self.stage, self.processor, self.clock, self.devices)
+    pub(crate) fn into_parts(self) -> VmSnapshotParts {
+        (
+            self.stage,
+            self.processor,
+            self.clock,
+            self.devices,
+            self.state,
+        )
     }
 
     /// Whether `bytes` begin with this format's magic word.

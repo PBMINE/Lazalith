@@ -334,6 +334,7 @@ impl<D: Device> Vm<D> {
             self.machine.processor().clone(),
             self.machine.clock().elapsed(),
             self.machine.devices().snapshot(),
+            self.machine.state(),
         )
     }
 
@@ -365,7 +366,7 @@ impl<D: Device> Vm<D> {
     /// B18 is where replay and determinism verification arrive. Neither refusal above
     /// is an artefact of this implementation; both are true at any snapshot level.
     pub fn restore(&mut self, snapshot: &VmSnapshot) -> Result<(), VmError> {
-        let (stage, processor, clock, devices) = snapshot.clone().into_parts();
+        let (stage, processor, clock, devices, state) = snapshot.clone().into_parts();
         if stage != self.stage {
             return Err(VmError::SnapshotStage {
                 snapshot: stage,
@@ -394,6 +395,12 @@ impl<D: Device> Vm<D> {
             .map_err(|source| VmError::Machine(MachineError::Cpu(source)))?;
         self.machine.devices_mut().restore(&devices)?;
         self.machine.restore_time(clock);
+        // The lifecycle state last, like the clock: it is the summary of everything
+        // above it, and writing it before the processor and devices would leave a
+        // machine reporting a state its own contents do not match if a later write
+        // failed. B19 added this — without it a restore left a halted machine halted
+        // with a running processor's registers.
+        self.machine.restore_state(state)?;
         Ok(())
     }
 

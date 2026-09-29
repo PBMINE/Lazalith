@@ -53,6 +53,13 @@ pub enum MachineOperation {
     Step,
     Run,
     Pause,
+    /// Restoring a machine's lifecycle state from a snapshot.
+    ///
+    /// B19 added this. `VmSnapshot` had no lifecycle state to restore, so a machine
+    /// that had halted stayed halted after a restore of a snapshot taken before it
+    /// halted — the processor's registers and the machine's `Halted` disagreeing, and
+    /// the management layer is where that showed up.
+    RestoreState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -375,6 +382,43 @@ impl<D: Device> LazalithMachine<D> {
     }
     pub const fn is_halted(&self) -> bool {
         matches!(self.state, MachineState::Halted)
+    }
+
+    /// Puts the machine's lifecycle state back, as a snapshot restore does.
+    ///
+    /// **This exists because `VmSnapshot` did not record it, and a snapshot that does
+    /// not record a machine's halt state restores a halted machine.** The processor
+    /// comes back exactly as it was saved — not halted, pointing at the next
+    /// instruction — while `state` still said `Halted`, so `is_halted()` reported a
+    /// stopped machine whose registers were mid-flight. Two sources of truth, disagreeing,
+    /// and the manager layer is where it showed up: a restore of a pre-halt snapshot
+    /// onto a halted VM left the VM reporting halted.
+    ///
+    /// The write is guarded the same way every other machine mutation is: an active
+    /// execution context or a trap frame means the machine is mid-something, and putting
+    /// a lifecycle state back underneath that is the kind of change the lifecycle
+    /// exists to refuse. `Created` is refused too, because a created machine is one
+    /// that has not been described yet, and a snapshot of one describes a different
+    /// thing than a snapshot of a running machine.
+    pub fn restore_state(&mut self, state: MachineState) -> Result<(), MachineError> {
+        if self.active_execution_context().is_some() {
+            return Err(MachineError::InvalidUserContext {
+                reason: "the machine's state cannot be restored under an active execution context",
+            });
+        }
+        if self.processor.traps().has_active_frame() {
+            return Err(MachineError::InvalidUserContext {
+                reason: "the machine's state cannot be restored while a trap frame is active",
+            });
+        }
+        if state == MachineState::Created {
+            return Err(MachineError::InvalidTransition {
+                operation: MachineOperation::RestoreState,
+                state: self.state,
+            });
+        }
+        self.state = state;
+        Ok(())
     }
     pub fn architectural_state(&self) -> &ArchitecturalState {
         self.processor.architectural()

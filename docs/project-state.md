@@ -8472,3 +8472,206 @@ snapshots in the VM layer. The check is not weakened — verified by adding an
 
 **B19, VM manager / management API** (§41 and the roadmap) — a management layer above
 VM Core, with no direct access to CPU registers, devices or engine-private state.
+
+---
+
+# B19 — VM manager / management API (§35)
+
+## What this stage is
+
+§35 asks for "a dedicated VM management layer" that creates, configures and runs VMs for
+a person, that the GUI and the CLI both consume, and whose last line is the requirement
+everything else follows from:
+
+```text
+The GUI and CLI consume this management API.
+Neither directly manipulates CPU internals.
+```
+
+`lazalith-manager` is that layer, and it sits above `lazalith-vm` the way a
+hypervisor's management plane sits above its virtual hardware.
+
+## The rule is checked as a fact, not a convention
+
+`Manager` keeps its `Vm` private with no accessor that hands it out, and
+`no_management_crate_touches_cpu_internals` in `crates/lazalith-cli/tests/architecture.rs`
+fails if the crate so much as *names* `machine_mut`, `processor_mut`, `devices_mut`,
+`architectural_mut`, `traps_mut`, `load_region` or `map_device` outside a comment.
+
+It has to be a test because the failure is otherwise invisible: a manager that reached
+through `machine_mut().processor_mut().architectural_mut()` to "just poke a register for
+the UI" would compile, would pass every test that only starts and stops a VM, and would
+be the first place guest state could change without the lifecycle knowing.
+
+**The denylist is kept honest by a second test.** A denylist is a list that rots, so
+`the_mutating_surface_below_the_manager_is_the_list_it_is_denied` reads the actual
+mutating accessors out of `lazalith-vm/src/vm.rs` and `lazalith-machine/src/lib.rs` and
+asserts the list. Adding a mutating method to either crate fails it, and the question
+"should the management layer get this?" has to be answered. A third test asserts that
+the deeper methods the denylist names (`traps_mut`, `restore_architectural`,
+`replace_architectural`) still exist, so the denylist cannot quietly name a method that
+was never there.
+
+**The check was verified to bite**, by adding an `architectural:` field to
+`lazalith-codegen` and confirming the B3 engine test still fails.
+
+## What §35 lists and what this build has
+
+| §35 item | state |
+| --- | --- |
+| VM creation, VM configuration | `Manager::create`, `VmConfig` |
+| machine profile, RAM configuration | `Manager::profile`, `MemorySpec` |
+| storage, network, audio, display, console | device classes in `VmConfig` |
+| USB | **describable, refused by name** |
+| CPU configuration | **deliberately absent** |
+| boot, start, pause, resume, reset, shutdown | `Manager::start`/`pause`/`resume`/`reset`/`shutdown` |
+| snapshot, restore, clone | `Manager::snapshot`/`restore`/`clone_vm` |
+| debugger attachment | an attachment record, not a stepping session |
+| console | the console's identity and buffer, not the guest's output |
+
+**USB is describable and refused.** §35 lists it and this build has no USB device, so
+`DeviceClass::Usb` exists in the vocabulary and `Manager::create` refuses it with the
+class in the message. This is the distinction B4 drew for `DisplayProfile::VgaCompatible`
+and §28 drew for VGA: a profile may describe hardware this build cannot produce, and the
+refusal is a fact a caller can act on. It maps to the machine crate's existing
+`DeviceClass::Other` — the right word for "no constructor" — rather than to a near-miss
+class, so a caller who somehow got past validation would be refused there too instead of
+being handed a keyboard.
+
+**There is no CPU configuration, and that is not an omission.** The shipped profile is
+single-core with one fixed configuration. A `VmConfig` field for core count or feature
+flags would adjust nothing, and a GUI would show it and a user would believe it. So the
+type has no such field, and `there_is_no_cpu_configuration_to_set` says so in the suite
+rather than leaving a reader to notice the absence.
+
+## Three findings, all of which changed the design
+
+### A clone needs the image it boots, because the lifecycle's stage rule is a stage rule
+
+`Manager::clone_vm` was written to snapshot the VM and restore it onto a freshly
+described one. That does not work, and the error is B6's doing:
+
+```text
+SnapshotStage { snapshot: Booted, machine: Cold }
+```
+
+A `Booted` snapshot cannot be restored onto a `Cold` machine, because restoring a booted
+guest's registers into a machine that has not run firmware would put a running kernel's
+state behind no firmware. So a clone has to be booted first, and **`clone_vm` takes the
+boot image**.
+
+That is a real cost on the API, and it has a real fix: a management layer that stored
+the boot chain with the configuration would make `clone` one argument. Persisting the
+boot chain is the natural next step and is not done here.
+
+The alternative — re-implementing the stage comparison inside the manager so a clone
+could skip the boot — was rejected: that would be a second place for B6's rule to be
+wrong, which is the thing the layering exists to prevent.
+
+### `VmSnapshot` did not record the machine's lifecycle state
+
+`VmSnapshot` held `stage`, `processor`, `clock` and `devices`. It did not hold the
+machine's `MachineState`, so **restoring a pre-halt snapshot onto a machine that had
+halted left the machine reporting `Halted`** with a processor whose registers were
+mid-flight pointing at the next instruction. Two sources of truth about the machine,
+disagreeing, with nothing in the snapshot to say which was right.
+
+B6's stage was the *lifecycle* stage; `MachineState` is a different question and it had
+no home in the snapshot. Fixed in B19: `VmSnapshot` carries it, and
+`LazalithMachine::restore_state` puts it back — guarded like every other machine
+mutation, refusing under an active execution context or a trap frame, and refusing
+`Created`, because a created machine is one that has not been described yet.
+
+Pinned by mutation: removing the `restore_state` call fails
+`a_restore_puts_a_vm_back_where_the_snapshot_was_taken`.
+
+### The virtual clock does not advance as the guest executes
+
+`elapsed_cycles` is zero after a VM has run five thousand instructions.
+`LazalithMachine::advance_clock` moves the clock, but the interpreter's step loop does
+not call it, so **B18 captured a clock that nothing advances.**
+
+The management layer cannot fix this, and deliberately does not try: `advance_clock` is
+on the machine, so calling it is exactly the reach-through §35 forbids and the
+architecture test rejects. A GUI cannot show a running clock yet.
+
+The suite says so out loud — `the_clock_does_not_advance_because_nothing_advances_it`
+asserts the zero and explains why — rather than asserting a clock that does not move.
+Every other test in the suite uses `halted`, `stage` or `ManagerState` as its evidence
+for exactly this reason.
+
+## Debugger attachment is an attachment record, and the reason is a real constraint
+
+`Manager::attach_debugger` records a name and the image's debug block. It does **not**
+give a client live stepping, and the reason is structural: `lazalith_debug::DebugController`
+*owns* the machine it drives, because it is constructed by booting one. It cannot be
+pointed at a VM this layer already owns.
+
+Handing the controller a borrowed machine is a refactor of the same shape as B23's
+interpreter↔JIT state handoff — one owner, one state, a switch that does not clone or
+reset — and it is recorded as the work that would close the gap. What is here is enough
+for a UI to say "a debugger is attached" and enough for a future borrowed-machine
+controller to hang on.
+
+One attachment at a time, and a second is refused rather than replacing the first:
+silently replacing it would make the first debugger's breakpoints vanish.
+
+## The console is configured, not read
+
+`Manager::console` returns the console's `DeviceSpec` — its number, its class and its
+buffer size, which are the facts a UI shows and a configuration file records. It does
+*not* return what the guest printed, because a console's registers are write-only from
+the guest's side: there is nothing there to read. The guest's output reaches a person
+through the device *backend* that was given to the machine, which is a backend question
+and not a management one.
+
+An earlier draft of this method returned the guest's output and always failed. That was a
+function whose name promised something no implementation could deliver, which is worse
+than not having it — a caller would have written a UI around an error message. Removed
+rather than kept as a stub.
+
+## What the tests are shaped like
+
+31 tests, walked in §35's order, and **more of them are refusals than happy paths**
+because a management API is mostly a set of refusals and refusals are what a GUI gets
+wrong first. Every refusal is *forced* by putting the VM in the state that triggers it.
+
+The kernels are separated for a reason worth recording: the obvious kernel halts, and a
+halted machine refuses `pause` (`InvalidTransition { operation: Pause, state: Halted }`)
+— the lifecycle being correct. A suite written against a halting kernel would be testing
+the halt path over and over, so there is a spinning kernel (`BR AL, -2`, a self-loop,
+because a run of NOPs runs off its own end and faults on the image trailer) and a halting
+one, and the tests that care about halting ask for it.
+
+`a_booted_vm_that_has_not_run_cannot_be_paused` pins the other half: a booted machine is
+`MachineState::Reset`, and `pause` requires `Running`.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1603 passed, 0 failed** (38 new)
+- `nix flake check`, `nix build` ✅
+
+## Limitations at the end of this stage
+
+1. **No CLI and no GUI consume the manager yet.** §35 requires both, and the API is
+   complete enough for them; neither was wired in this stage. This is the same shape as
+   B17's "no `lazdbg`".
+2. **The virtual clock does not advance during execution**, so a UI cannot show a
+   running clock and `elapsed_cycles` is always zero. The fix is in the interpreter's
+   step loop, not in the manager.
+3. **Cloning needs the boot image** because the lifecycle's stage rule requires the
+   target to be booted. Storing the boot chain with the configuration would fix it.
+4. **Debugger attachment is not live stepping**; `DebugController` owns its machine.
+5. **The manager's `console` is configuration, not output**, because a console's
+   registers are write-only.
+6. **No configuration persistence.** A `VmConfig` is a value, but nothing writes one to
+   a file or reads one back, so "VM configuration" is not yet durable.
+7. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B20, VM GUI / Rust SDL3 migration boundary** (§36) — the GUI above the management
+API rather than above the machine, and the inventory of SDL3 usage that §36 asks for
+before any migration.

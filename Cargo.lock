@@ -237,6 +237,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazalith-manager"
+version = "0.1.0"
+dependencies = [
+ "lazalith-boot",
+ "lazalith-devices",
+ "lazalith-isa",
+ "lazalith-machine",
+ "lazalith-memory",
+ "lazalith-types",
+ "lazalith-vm",
+]
+
+[[package]]
 name = "lazalith-memory"
 version = "0.1.0"
 dependencies = [

@@ -538,6 +538,142 @@ fn no_execution_engine_owns_the_architectural_state() {
     );
 }
 
+/// B19: the management layer does not manipulate CPU internals.
+///
+/// `binstruction.md` §35 says the GUI and the CLI consume the management API and that
+/// "neither directly manipulates CPU internals". `lazalith-manager` is that API, so the
+/// rule is a constraint on its source.
+///
+/// **It is checked as a fact rather than by review because the failure is invisible.**
+/// A manager that reached through `machine_mut().processor_mut().architectural_mut()` to
+/// "just poke a register for the UI" would compile, would pass every test that only ever
+/// starts, runs and stops a VM, and would be the first place guest state could change
+/// without the lifecycle knowing — the one property `Vm` exists to guarantee.
+///
+/// Doc comments are skipped. This file's own rule is *named in prose* in the manager's
+/// module documentation, and a check that counted prose would have to be weakened to
+/// allow the very explanation that makes the rule clear. A call is never in a `///`.
+#[test]
+fn no_management_crate_touches_cpu_internals() {
+    let manager = workspace().join("crates/lazalith-manager");
+    let mut offending = Vec::new();
+    for entry in walk(&manager.join("src")) {
+        let Ok(text) = std::fs::read_to_string(&entry) else {
+            continue;
+        };
+        for (number, line) in text.lines().enumerate() {
+            let code = line.trim();
+            if code.starts_with("//") {
+                continue;
+            }
+            for needle in [
+                "machine_mut",
+                "processor_mut",
+                "devices_mut",
+                "architectural_mut",
+                "traps_mut",
+                "replace_architectural",
+                "restore_architectural",
+                "load_region",
+                "map_device",
+            ] {
+                if code.contains(needle) {
+                    offending.push(format!(
+                        "{}:{} mentions {needle}",
+                        entry.file_name().unwrap_or_default().to_string_lossy(),
+                        number + 1
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        offending.is_empty(),
+        "§35 says the management API's clients do not manipulate CPU internals, and \
+         the management layer is that API; {offending:?}"
+    );
+}
+
+/// The mutating surface a management client is denied, named.
+///
+/// **Paired with `no_management_crate_touches_cpu_internals` so the denylist cannot
+/// quietly go stale.** This is a closed list, read out of the two crates it spans — a
+/// `Vm` and the machine it owns, because `machine_mut()` is a single name that reaches
+/// every mutating method on the machine underneath. If either crate grows a mutating
+/// method that is not in this list, the test fails and the question "should the
+/// management layer get this?" has to be answered. That is the point: adding a
+/// capability to the lifecycle should be a decision about the management layer, not a
+/// thing that happens to it.
+///
+/// `load_region` and `map_device` are here for the same reason `devices_mut` is: they
+/// mutate and are not `_mut`-suffixed, which is why the denylist cannot be generated
+/// from a suffix and has to be written out.
+#[test]
+fn the_mutating_surface_below_the_manager_is_the_list_it_is_denied() {
+    let mut mutating: Vec<String> = Vec::new();
+    for file in [
+        "crates/lazalith-vm/src/vm.rs",
+        "crates/lazalith-machine/src/lib.rs",
+    ] {
+        let text = std::fs::read_to_string(workspace().join(file)).expect("the crate reads");
+        mutating.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("pub fn ") || line.starts_with("pub const fn "))
+                .filter_map(|line| {
+                    let rest = line
+                        .strip_prefix("pub fn ")
+                        .or_else(|| line.strip_prefix("pub const fn "))?;
+                    rest.split('(').next().map(str::to_string)
+                })
+                .filter(|name| {
+                    name.ends_with("_mut") || name == "load_region" || name == "map_device"
+                }),
+        );
+    }
+    mutating.sort();
+    mutating.dedup();
+    assert_eq!(
+        mutating,
+        vec![
+            String::from("devices_mut"),
+            String::from("interrupts_mut"),
+            String::from("load_region"),
+            String::from("machine_mut"),
+            String::from("map_device"),
+            String::from("processor_mut"),
+        ],
+        "these are the ways to change a machine that are *declared* on a Vm or on the \
+         machine it owns, and every one of them is denied to the management layer by \
+         the test above"
+    );
+}
+
+/// The deeper mutators, which are only reachable *through* the ones above.
+///
+/// `Processor::traps_mut` and `Processor::restore_architectural` are declared in
+/// `lazalith-cpu`, not on a `Vm` or a machine, so the test above cannot see them. They
+/// are in the denylist anyway, and this test says why: `processor_mut()` is the single
+/// name that reaches all of them, so a manager that had it would have them. This test
+/// fails if either stops existing, which is what stops the denylist naming a method
+/// that was never there.
+#[test]
+fn the_deeper_mutators_the_denylist_names_still_exist() {
+    let cpu = std::fs::read_to_string(workspace().join("crates/lazalith-cpu/src/processor.rs"))
+        .expect("the CPU crate reads");
+    for named in [
+        "traps_mut",
+        "restore_architectural",
+        "replace_architectural",
+    ] {
+        assert!(
+            cpu.contains(named),
+            "{named} is named in the management layer's denylist, so it has to exist; \
+             if it was renamed, update the denylist in the test above"
+        );
+    }
+}
+
 /// B3: the machine holds the processor and the engine as separate things.
 ///
 /// The switch exists because those are two fields rather than one. A machine that
