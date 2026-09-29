@@ -55,3 +55,20 @@ impl BootStage {
         Self::Cold
     }
 }
+
+impl core::fmt::Display for BootStage {
+    /// The name a status line shows.
+    ///
+    /// **Added in B20, for a reason that is not cosmetic.** A management client has to
+    /// print this — `lazctl status` has a line for it — and before this a client either
+    /// wrote its own `match` over the enum, which is a second place for the two stages
+    /// to be spelled, or printed `{:?}`, which is a debug rendering in a user-facing
+    /// line. The management layer's own types already render (`ManagerState` does), and
+    /// this is the stage doing the same.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Cold => "cold",
+            Self::Booted => "booted",
+        })
+    }
+}

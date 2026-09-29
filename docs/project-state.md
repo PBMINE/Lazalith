@@ -8850,3 +8850,214 @@ modelled".
 ## Next stage
 
 **B20, VM GUI / Rust SDL3 migration boundary** (§36).
+
+---
+
+# B20 — the management API gets its consumers, and the SDL3 migration plan (§36)
+
+## What this stage is
+
+Two things §36 and §35 require, and they are different kinds of work:
+
+1. **the GUI and the CLI consume the management API**, and neither manipulates CPU
+   internals;
+2. **the SDL3 migration is inventoried and decided** before anything is moved.
+
+## The manager is no longer an unused abstraction
+
+B19's first limitation was "no CLI and no GUI consume the manager yet. The API is
+complete enough for them; neither was wired in." An API nothing calls is a
+specification, not an abstraction, and B19 said so. This stage closes it from both
+directions.
+
+### `lazen vm` — the CLI
+
+Twelve commands, named in §35's order, in `crates/lazalith-cli/src/lazctl.rs`:
+
+```text
+create  start  pause  resume  reset  shutdown
+status  snapshot  restore  clone  attach  detach
+```
+
+Every one goes through `lazalith_manager::Manager` and nothing else. `lazctl status`
+prints state, stage, virtual time, halt and debugger attachment — every line a field of
+`VmStatus` — and **no register, no memory, no disassembly**, because a status line that
+printed those would be a debugger and §35's management layer is not one.
+
+**It is a `lazen` subcommand rather than a separate `lazctl` binary.** A separate binary
+would need `CliError` and `Outcome` moved into a library target, because they are the
+main binary's types today; that refactor is a risk with no architectural benefit, and
+"the CLI consumes the manager" is satisfied by a subcommand. Recorded here because it
+was a decision, not an oversight.
+
+### The GUI's management view
+
+`crates/lazalith-gui/src/vm.rs` builds a `VmView` from `lazalith_manager::VmStatus` and
+nothing else. It answers §35's question ("what is this VM doing") rather than §17's
+("what is the processor doing"), and it exists as a *second* view because
+`lazalith-gui` already depends on `lazalith-debug` for its debugger view: a frontend
+that could only reach a machine through the debugger would be a debugger wearing a GUI.
+
+## The layering is checked, not promised
+
+Two new tests in `crates/lazalith-cli/tests/architecture.rs`:
+
+- **`no_frontend_reaches_cpu_internals`** — `lazalith-cli` and `lazalith-gui` may not
+  name `machine_mut`, `processor_mut`, `devices_mut`, `architectural_mut`, `traps_mut`,
+  `interrupts_mut`, `load_region`, `map_device`, `restore_architectural`,
+  `replace_architectural`, `LazalithMachine::new` or `MachineSetup {`. Doc comments are
+  skipped, because this file's own rule is *named in prose* in the clients'
+  documentation and a check that counted prose would have to be weakened to allow the
+  explanation. Verified to bite: adding the string `processor_mut` to `lazctl.rs` fails it
+  with `lazalith-cli/lazctl.rs:122 mentions processor_mut`.
+
+- **`both_frontends_depend_on_the_management_api`** — **the companion, because a rule
+  that forbids the wrong thing is satisfied by not doing anything at all.** Two frontends
+  that both avoided CPU internals by never touching a VM would pass the rule perfectly.
+  So this asserts both manifests depend on `lazalith-manager`, *and* that the GUI's
+  management view mentions `VmStatus` and does **not** mention `DebugController` — a
+  view called "vm" that asked the debugger for its numbers would satisfy a dependency
+  check and defeat the architecture.
+
+## Five bugs the tests found, all in the new code
+
+The `lazctl` suite runs the real binary in a temporary directory and judges it by its
+stdout, stderr and exit code, because those *are* the contract of a command-line tool.
+Five things were wrong:
+
+1. **Unknown options were silently ignored.** `lazen vm create vm --usb` printed a VM as
+   created, having dropped the request. A management tool that ignores an option is a
+   tool whose output a user has to check against what they typed, and for hardware
+   requests that is exactly the wrong failure — the whole reason B19 made
+   `DeviceClass::Usb` a *refusal* is that silently building a machine without a device
+   somebody asked for is the failure to avoid. `OPTIONS` is now a closed list.
+
+2. **`start` ran the guest twice.** `live()` runs so the machine reaches `Running`
+   (which `pause` needs), and `start` went through it, so a `start` of a *halting*
+   program was refused with "Run is invalid while machine is Halted" — the manager being
+   right about a second run and the command being wrong about asking for one. `booted()`
+   and `live()` are now separate and `start` uses the first.
+
+3. **`pause` on a freshly booted VM was refused.** A machine that has booted but not
+   executed is `MachineState::Reset`, and `pause` requires `Running`. That is the
+   lifecycle being right and the *command* being wrong: a person typing `pause` means
+   "this VM is running, stop it", so `live()` now runs it first. Stated in the code
+   because it is a decision about how to read the command.
+
+4. **`attach vm kernel lazdbg` read "lazdbg" as the kernel.** The image path was "the
+   last positional argument", which is the debugger name. It is now a `Target` whose
+   fields are decided by the positional *count* — `[name] <image> [debugger]`, with one
+   positional meaning the image and the name defaulting.
+
+5. **`create myvm` named the VM "lazen".** The same last-positional rule read the name as
+   an image. `create` is the one command whose positional is a *name*, because there is
+   nothing to boot, and it now parses it as one.
+
+Two of the original tests were also **wrong about the design** and were rewritten rather
+than made to pass:
+
+- `pausing_twice_is_refused` asserted a refusal that `lazctl` cannot express, because
+  each invocation builds a fresh VM. It is now `a_vm_is_rebuilt_per_invocation_and_that_is_stated`,
+  which tests the design; the lifecycle's own "already paused" refusal is tested where it
+  is expressible, in the manager's suite, against one manager.
+- `starting_a_shut_down_vm_is_refused` had the same problem, and became
+  `shutdown_is_reported_as_off_and_the_command_line_still_has_no_such_vm_afterwards`.
+
+## The SDL3 migration: inventoried and decided, and not performed
+
+### What §36 asks, and what is delivered
+
+§36's eight steps: read the wrapper, find callers, enumerate the SDL functions used, map
+them to `sdl3`, identify what is not covered, decide whether a wrapper remains, verify the
+unsafe surface, document the strategy. Five of those are *facts about the code* and are
+now in `crates/lazalith-sdl3/tests/migration.rs` as tests rather than prose.
+
+### The blocker, stated plainly
+
+**The Rust `sdl3` crate is not reachable from this environment.** `crates.io` answers
+`403` and there is no vendored copy, so the dependency cannot be added and nothing built
+against it could be compiled or tested. That blocks the *mechanical* half of §36. It does
+not block the preparatory half, which is the half §36 itself insists on doing first.
+
+So: the inventory, the mapping, the decisions, the unsafe audit and the decision about
+whether a wrapper remains are all delivered and checked. **The crate swap is not
+delivered, and the next stage with network access does it against this table.**
+
+### The inventory
+
+Eighteen functions and five mirrored types, all mapped:
+
+| | count | decision |
+| --- | --- | --- |
+| `SDL_Init`, `SDL_Quit`, `SDL_GetError` | 3 | replaced |
+| window/renderer/texture create + destroy | 7 | replaced |
+| `SDL_UpdateTexture`, `SDL_SetTextureScaleMode`, `SDL_RenderTexture` | 3 | replaced |
+| `SDL_RenderFillRect`, `SDL_RenderLines`, `SDL_RenderPresent`, `SDL_SetRenderDrawColor` | 4 | replaced |
+| `SDL_PollEvent`, `SDL_Delay` | 2 | replaced |
+| `SDL_Event`, `SDL_KeyboardEvent`, `SDL_Keycode`, `SDL_Keymod`, `SDL_Window` | 5 (types) | replaced |
+
+**Nothing is uncovered, so nothing is wrapped, so `lazalith-sdl3` is deleted rather than
+kept as a thin shell.** That is the load-bearing claim of the whole plan and it is a
+test: `the_rust_sdl3_crate_covers_everything_this_one_declares`. If a future `sdl3` stops
+covering one of these, that row's decision flips to `Wrapped`, the crate stays, and the
+test has to be rewritten to say so — deliberately, rather than the plan quietly being
+wrong.
+
+`lazalith-gui`'s `window.rs` and `font.rs` **stay**. They answer "put these lines of text
+on a screen", which is a Lazalith-shaped question with a Lazalith font renderer, not an
+SDL question. The plan is `lazalith-sdl3` deleted, `lazalith-gui` kept and now calling
+`sdl3`.
+
+### Completeness is checked, and the check bites
+
+`the_inventory_is_complete` reads `lazalith-sdl3/src/lib.rs`, finds every `SDL_`
+identifier, and fails if the table does not account for all of them — so a wrapper that
+grows a call without growing the table fails the build rather than quietly invalidating
+the plan. Verified: adding a declaration `SDL_NewUnmappedThing` fails with
+`the wrapper declares SDL functions the migration inventory does not account for:
+["SDL_NewUnmappedThing"]`.
+
+The scan is byte-wise rather than char-wise because the file is full of em-dashes and
+prose, and indexing a `&str` by byte index panics the first time an index lands inside
+one. It found five names the hand-written inventory had missed — the mirrored *types* —
+which is why they are a second table: they are a different kind of work, and
+`build.rs`'s C probe existed only because a hand-mirrored `SDL_Event` layout is a claim
+nobody checked.
+
+### The unsafe surface
+
+`unsafe_audit_is_one_crate` asserts no crate other than `lazalith-sdl3` contains
+`unsafe`, which is the property the workspace's `forbid` exists to protect. **This is the
+test to re-read after the swap**, when the `unsafe` will be in `sdl3` instead and this
+crate will be gone.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1655 passed, 0 failed** (35 new)
+- `nix flake check`, `nix build` ✅
+- `actionlint` not run: no workflow file changed, and this flake's devShell does not
+  provide it.
+
+## Limitations at the end of this stage
+
+1. **The `sdl3` crate swap is not done**, because `crates.io` is unreachable from this
+   environment. The plan is complete and checked; the execution is not.
+2. **No configuration persistence**, so `lazen vm` builds its VM per invocation. B19's
+   first limitation, unchanged and now stated as a test.
+3. **No snapshot persistence.** `lazen vm snapshot` reports what a snapshot holds and says
+   it is not written to disk, because `VmSnapshot` has no serialized form. A file that
+   looked restorable and was not would be worse than none.
+4. **Debugger attachment is still not live stepping** — `DebugController` owns its
+   machine, unchanged from B19.
+5. **The GUI's management view is a value, not a window.** `VmView` builds and is tested;
+   nothing draws it yet, because `lazalith-sdl3` is still the drawing path and the swap
+   has not happened.
+6. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B21, optimized interpreter / execution-engine abstractions** (§38) — the Reference
+Interpreter stays the semantic authority, and the first optimisation is measured rather
+than assumed.

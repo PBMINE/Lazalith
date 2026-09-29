@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 lazalith-boot = { path = "../lazalith-boot" }
+lazalith-manager = { path = "../lazalith-manager" }
 lazalith-compiler = { path = "../lazalith-compiler" }
 lazalith-cpu = { path = "../lazalith-cpu" }
 lazalith-devices = { path = "../lazalith-devices" }

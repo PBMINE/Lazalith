@@ -46,6 +46,7 @@ mod build;
 mod check;
 mod deps;
 mod format_cmd;
+mod lazctl;
 mod new;
 mod pack;
 mod run;
@@ -200,6 +201,7 @@ fn dispatch(arguments: &[OsString]) -> Result<Outcome, CliError> {
         "test" => run::tests(rest),
         "pack" => pack::run(rest),
         "deps" => deps::run(rest),
+        "vm" => lazctl::run(rest),
         "sysroot" => sysroot_cmd::run(rest),
         "fmt" => format_cmd::run(rest),
         "help" | "--help" | "-h" => {
@@ -232,7 +234,9 @@ COMMANDS
     run [file]       build, then execute the program under LazOS
     test [file]      run a project's tests and report pass or fail
     pack [out]       write a .lza from a manifest and a built image
-    deps             resolve a manifest.s dependencies against local directories
+    deps             resolve a manifest's dependencies against local directories
+    vm <command>    manage a VM through the VM Manager API: create, start, status, pause,
+                     resume, reset, shutdown, snapshot, restore, clone, attach, detach
     sysroot <dir>    write a target sysroot: headers, libraries, runtime, startup objects
     fmt [--check] [file]
                      format a file in the canonical style, or report that it is not

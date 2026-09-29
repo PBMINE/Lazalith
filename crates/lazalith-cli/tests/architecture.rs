@@ -674,6 +674,113 @@ fn the_deeper_mutators_the_denylist_names_still_exist() {
     }
 }
 
+/// B20: neither frontend reaches CPU internals.
+///
+/// `binstruction.md` §35 says "The GUI and CLI consume this management API. Neither
+/// directly manipulates CPU internals", and §36 draws the same diagram. §35's rule was
+/// enforced on `lazalith-manager` by `no_management_crate_touches_cpu_internals`; this
+/// is the other half — the *clients* of that API.
+///
+/// **It has to be a test, and it has to cover both frontends.** B20 made `lazctl` a real
+/// consumer of the manager and gave the GUI a manager-backed view, which is the first
+/// time either crate has wanted a machine. A CLI that could do its job by reaching into
+/// the machine would be *more* code, not less, and it would compile, and every test
+/// that only ever started and stopped a VM would still pass.
+///
+/// The GUI is the interesting case: `lazalith-gui` depends on `lazalith-debug` for its
+/// debugger view, and `DebugController` is above the machine, so a GUI can already reach
+/// a machine *the permitted way*. The rule here is not "the GUI cannot touch a machine"
+/// — it is that the permitted path is the one it takes, and that the management view
+/// does not quietly go through the debugger to get there.
+#[test]
+fn no_frontend_reaches_cpu_internals() {
+    let mut offending = Vec::new();
+    for crate_name in ["lazalith-cli", "lazalith-gui"] {
+        for entry in walk(&workspace().join("crates").join(crate_name).join("src")) {
+            let Ok(text) = std::fs::read_to_string(&entry) else {
+                continue;
+            };
+            for (number, line) in text.lines().enumerate() {
+                let code = line.trim();
+                if code.starts_with("//") {
+                    continue;
+                }
+                for needle in [
+                    "machine_mut",
+                    "processor_mut",
+                    "devices_mut",
+                    "architectural_mut",
+                    "traps_mut",
+                    "interrupts_mut",
+                    "load_region",
+                    "map_device",
+                    "restore_architectural",
+                    "replace_architectural",
+                    "LazalithMachine::new",
+                    "MachineSetup {",
+                ] {
+                    if code.contains(needle) {
+                        offending.push(format!(
+                            "{crate_name}/{}:{} mentions {needle}",
+                            entry.file_name().unwrap_or_default().to_string_lossy(),
+                            number + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        offending.is_empty(),
+        "§35 says the GUI and the CLI consume the management API and do not manipulate \
+         CPU internals; {offending:?}"
+    );
+}
+
+/// B20: both frontends actually depend on the manager.
+///
+/// **The companion to the rule above, because a rule that forbids the wrong thing is
+/// satisfied by not doing anything at all.** A GUI and a CLI that both avoid CPU
+/// internals by never touching a VM would pass `no_frontend_reaches_cpu_internals`
+/// perfectly. This is the test that says they use the management API instead.
+///
+/// B19's first limitation was "no CLI and no GUI consume the manager yet" — an API
+/// nothing calls is a specification, not an abstraction — so this is the assertion that
+/// closed it.
+#[test]
+fn both_frontends_depend_on_the_management_api() {
+    for crate_name in ["lazalith-cli", "lazalith-gui"] {
+        let manifest = std::fs::read_to_string(
+            workspace()
+                .join("crates")
+                .join(crate_name)
+                .join("Cargo.toml"),
+        )
+        .expect("a frontend manifest reads");
+        assert!(
+            manifest.contains("lazalith-manager"),
+            "{crate_name} must depend on lazalith-manager: §35 says the GUI and the CLI \
+             consume the management API, and a frontend that does not depend on it \
+             cannot be consuming it"
+        );
+    }
+    // And the GUI's management view must be built from the manager's *status*, not from
+    // the debugger. A view called "vm" that asked a `DebugController` for its numbers
+    // would satisfy the dependency test and defeat the architecture.
+    let gui = workspace().join("crates/lazalith-gui/src/vm.rs");
+    let text = std::fs::read_to_string(&gui).expect("the GUI's vm module reads");
+    assert!(
+        text.contains("lazalith_manager") && text.contains("VmStatus"),
+        "the GUI's management view is built from lazalith_manager::VmStatus, so it \
+         cannot be reaching a machine through the debugger"
+    );
+    assert!(
+        !text.contains("DebugController"),
+        "and it does not go through DebugController, which is the debugger's API and not \
+         the management layer's"
+    );
+}
+
 /// B3: the machine holds the processor and the engine as separate things.
 ///
 /// The switch exists because those are two fields rather than one. A machine that

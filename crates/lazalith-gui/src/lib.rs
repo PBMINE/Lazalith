@@ -43,6 +43,7 @@ pub mod display;
 pub mod font;
 pub mod input_backend;
 pub mod view;
+pub mod vm;
 pub mod window;
 
 pub use display::{CLEAR, Sdl3DisplayBackend, framebuffer_bytes};
@@ -51,6 +52,7 @@ pub use view::{
     Diagnostic, DiagnosticKind, Diagnostics, Emphasis, Line, Panel, Screen, Section, SourcePlace,
     View, ViewOptions,
 };
+pub use vm::{VmPanel, VmView};
 pub use window::Windowed;
 
 pub mod control;

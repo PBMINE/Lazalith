@@ -17,6 +17,7 @@ license = "MIT OR Apache-2.0"
 # dependency graph rather than a promise in a document.
 [dependencies]
 lazalith-debug = { path = "../lazalith-debug" }
+lazalith-manager = { path = "../lazalith-manager" }
 lazalith-devices = { path = "../lazalith-devices" }
 lazalith-os = { path = "../lazalith-os" }
 lazalith-sdl3 = { path = "../lazalith-sdl3" }
