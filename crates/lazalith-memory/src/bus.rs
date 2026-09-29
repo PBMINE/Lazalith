@@ -118,6 +118,15 @@ impl<D: Device> Bus<D> {
         self.devices.set_clock(elapsed);
     }
 
+    /// Takes every interrupt the devices have raised.
+    ///
+    /// A passthrough for the same reason `set_device_clock` is: the machine has to move
+    /// the devices. clock and deliver their interrupts in one place, and a bus that offered
+    /// only one of the two would make that two calls a caller could get wrong.
+    pub fn take_device_interrupts(&mut self) -> Vec<lazalith_types::InterruptId> {
+        self.devices.take_interrupts()
+    }
+
     fn overlap(&self, start: PhysicalAddress, end: PhysicalAddress) -> Result<(), MemoryFaultKind> {
         for mapping in &self.mappings {
             if start <= mapping.end && mapping.start <= end {

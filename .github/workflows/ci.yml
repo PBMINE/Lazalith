@@ -152,6 +152,8 @@ jobs:
         run: nix develop --command cargo test -p lazalith-machine --test engine -- --nocapture
       - name: the device/backend boundary
         run: nix develop --command cargo test -p lazalith-devices --test backend -- --nocapture
+      - name: audio, and the device interrupt path
+        run: nix develop --command cargo test -p lazalith-devices --test audio -- --nocapture
       - name: the input backend boundary
         run: nix develop --command cargo test -p lazalith-devices --test input_backend -- --nocapture
       - name: the host storage backends

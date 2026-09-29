@@ -1030,6 +1030,27 @@ impl<D: Device> LazalithMachine<D> {
         let next = self.clock.advanced(delta).map_err(MachineError::Clock)?;
         self.bus.tick_devices(delta).map_err(MachineError::Device)?;
         self.clock = next;
+        self.deliver_device_interrupts()?;
+        Ok(())
+    }
+
+    /// Hands any interrupts the devices raised to the processor.
+    ///
+    /// **Called after every clock advance, not from inside `tick`.** A device learns
+    /// things *in* `tick` — a timer expiring, an audio ring reaching half — and the
+    /// machine asks afterwards, so a device never has to know whether an interrupt
+    /// controller exists and never has to deliver anything itself. That is what keeps
+    /// `Device` free of guest-controller vocabulary.
+    ///
+    /// The clock is committed first, so a device that raises an interrupt in response to
+    /// the tick sees the time that caused it. And a refusal to queue one is propagated
+    /// rather than dropped: a device that raised an interrupt the machine could not
+    /// deliver has told the guest something, and swallowing that would be worse than the
+    /// error.
+    fn deliver_device_interrupts(&mut self) -> Result<(), MachineError> {
+        for id in self.bus.take_device_interrupts() {
+            self.request_interrupt(id)?;
+        }
         Ok(())
     }
 

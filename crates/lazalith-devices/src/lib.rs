@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+mod audio;
 mod backend;
 mod console;
 mod display;
@@ -11,6 +12,15 @@ pub mod input;
 mod input_backend;
 mod storage;
 pub mod timer;
+pub use audio::{
+    AUDIO_ABI_VERSION, AUDIO_CONTROL_CAPTURE, AUDIO_CONTROL_PLAY, AUDIO_REGISTER_BYTES,
+    AUDIO_REGISTER_CHANNELS, AUDIO_REGISTER_CONTROL, AUDIO_REGISTER_DATA, AUDIO_REGISTER_FORMAT,
+    AUDIO_REGISTER_LEVEL, AUDIO_REGISTER_RATE, AUDIO_REGISTER_STATUS, AUDIO_REGISTER_THRESHOLD,
+    AUDIO_SNAPSHOT_BYTES, AUDIO_STATUS_BAD_FORMAT, AUDIO_STATUS_OVERRUN, AUDIO_STATUS_READY,
+    AUDIO_STATUS_UNDERRUN, AudioBackend, AudioDevice, AudioDrain, AudioError, AudioFormat,
+    AudioFrame, DEFAULT_RING_SAMPLES, MAX_CHANNELS, MAX_RATE, NullAudioBackend,
+    RecordingAudioBackend, SampleFormat,
+};
 pub use backend::{
     AbsentBlockBackend, Backend, BackendError, BackendIdentity, BackendKind, BlockBackend,
     CopyOnWriteBlockBackend, MemoryBlockBackend, SECTOR_BYTES,
@@ -59,7 +69,7 @@ use alloc::{boxed::Box, collections::TryReserveError, vec::Vec};
 use core::{error::Error, fmt};
 use lazalith_isa::DataSize;
 use lazalith_types::{ClockOverflow, VirtualClock};
-pub use lazalith_types::{CycleCount, DeviceId, DeviceOffset};
+pub use lazalith_types::{CycleCount, DeviceId, DeviceOffset, InterruptId};
 
 #[derive(Debug)]
 pub enum DeviceError {
@@ -154,6 +164,25 @@ pub trait Device: fmt::Debug {
     /// own, so a mismatch is a refusal rather than a misreading.
     fn snapshot(&self) -> Vec<u8>;
 
+    /// An interrupt this device has raised, if any, taken rather than read.
+    ///
+    /// **Added by B10**, for §29.s "interrupts". A device that consumes a *rate* 2014 audio
+    /// filling a ring, a disk finishing a transfer 2014 learns something in `tick`, and a
+    /// guest that has to be told has no other way to learn it. Polling a status register
+    /// makes the guest busy-wait at its own rate, which is the wrong rate: the device
+    /// knows when its ring is half empty and the guest does not.
+    ///
+    /// Taken rather than read so that a raised interrupt is delivered exactly once. A
+    /// `&self` peek would be re-delivered every cycle, and a guest that cleared its own
+    /// interrupt would race with the machine reading it.
+    ///
+    /// The machine calls this after every `tick`. `None` is the default, so a device that
+    /// has no interrupts implements nothing extra 2014 which is why this is additive and
+    /// why no existing device needed changing.
+    fn take_interrupt(&mut self) -> Option<InterruptId> {
+        None
+    }
+
     /// Puts back a state this device produced.
     ///
     /// `bytes` must be exactly what this device's `snapshot` would produce. A
@@ -190,6 +219,9 @@ impl Device for NoDevice {
     }
     fn tick(&mut self, _: CycleCount) {
         match *self {}
+    }
+    fn take_interrupt(&mut self) -> Option<InterruptId> {
+        None
     }
     fn snapshot(&self) -> Vec<u8> {
         match *self {}
@@ -365,7 +397,23 @@ impl<D: Device> DeviceManager<D> {
             .collect()
     }
 
-    /// Puts every device's state back, in the order `snapshot` produced them.
+    /// Takes every interrupt the devices have raised, in device order.
+    ///
+    /// **Returns them rather than delivering them**: this crate does not know what an
+    /// interrupt controller is, and the machine does. A device that raised twice before
+    /// anyone asked loses the first 2014 which is the same "interrupts are edges" rule a
+    /// real controller has, and the reason a device keeps at most one pending.
+    pub fn take_interrupts(&mut self) -> Vec<InterruptId> {
+        let mut raised = Vec::new();
+        for entry in &mut self.entries {
+            if let Some(id) = entry.device.take_interrupt() {
+                raised.push(id);
+            }
+        }
+        raised
+    }
+
+    /// Puts every device.s state back, in the order `snapshot` produced them.
     pub fn restore(&mut self, states: &[(DeviceId, Vec<u8>)]) -> Result<(), DeviceError> {
         if states.len() != self.entries.len() {
             return Err(DeviceError::SnapshotShape {

@@ -7264,3 +7264,149 @@ device has a buffer. That is worth getting right rather than copying B9's shape.
 **B12, expansion bus / device discovery**, is the other candidate and is now the
 bottleneck for several stages above: USB (§30), PIO, and B27's compatibility machine
 all need a bus.
+
+---
+
+# B10 — audio architecture
+
+`binstruction.md` §29, and §25's "Standard Computer Hardware → audio". Preceded by
+`6d95fa6` (B9).
+
+## What was already there, confirmed
+
+- No audio device of any kind. §29 was entirely unimplemented.
+- `Device` with ten methods, none of which could raise an interrupt or reach memory.
+
+## Two gaps §29 exposed, and what was done about each
+
+§29's list is: PCM playback, PCM capture, sample rate, sample format, channel count,
+buffers/rings, **DMA**, **interrupts**.
+
+### Interrupts — built
+
+A device that consumes a *rate* learns something in `tick`, and a guest that must be
+told has no other way. Polling a status register makes the guest busy-wait at its own
+rate, and the device knows when its ring is half empty and the guest does not.
+
+`Device` gained one method:
+
+```rust
+fn take_interrupt(&mut self) -> Option<InterruptId> { None }
+```
+
+**Taken, not read**, which is what makes it an edge: a `&self` peek would re-deliver
+every cycle, and a guest clearing its own interrupt would race with the machine reading
+it. `DeviceManager::take_interrupts`, `Bus::take_device_interrupts` and
+`LazalithMachine::deliver_device_interrupts` carry it, and the machine asks *after*
+every clock advance rather than from inside `tick` — so a device never needs to know an
+interrupt controller exists and never delivers anything itself. That is what keeps
+guest-controller vocabulary out of `Device`.
+
+The default is `None`, so **no existing device changed**. That is the test of whether an
+addition to a trait is additive or invasive.
+
+### DMA — not built, with the reason
+
+A device has **no way to reach guest memory**: `Device` gives a device its registers
+and nothing else. Handing every device a memory handle would put an address space in
+front of every device in the platform, including the ones that must not have one — the
+display, the input device and the block device are all better off without it.
+
+So audio samples move through the data port, one access at a time, **exactly as B5's
+block device does**. That is not a workaround; it is the same decision reached
+independently, and it is recorded here so the next person does not read the absence as
+an oversight.
+
+§29's verb for DMA is *investigate*, not implement, so this is within scope. It is
+listed in limitations below with what it would actually cost.
+
+## The device
+
+`AudioDevice`: playback and capture rings, a format register triple, control, threshold,
+a data port, status and level. `SampleFormat` is `S8`/`S16Le`/`S24Le`/`F32`;
+`AudioFormat` binds the three so a rate cannot be set without a format — a rate in Hz
+means nothing without knowing how many bytes a sample is.
+
+**`AudioFrame` is §29's "host backends must be independent of the guest ABI" as a
+type**: a format and a `&[f32]`. No registers, no offsets, no Lazalith structs. A
+backend written against it could be driven by a different machine's audio device, and the
+alternative — a backend taking a guest-visible struct — would make every host backend a
+second guest driver.
+
+`NullAudioBackend` is not a null object for convenience. A machine with no sound card
+must still consume what a guest produces, or the guest gets `RingFull` and reports a
+broken device.
+
+## Three real bugs, and a pattern worth naming
+
+1. **`AUDIO_STATUS_READY` read the wrong ring.** It tested the *playback* ring, so a
+   guest in capture mode was told its buffer was empty while the host had four samples
+   waiting for it. The bit answers "can the guest read a sample now", and a guest reads
+   from capture.
+2. **The snapshot encoder and decoder disagreed.** `snapshot` wrote `low_water_raised`
+   as `u64::to_le_bytes()` — **eight** bytes — while `restore` read one. Every field
+   after it was shifted by seven, and a restore read the low-water flag out of the
+   middle of the playback level. The device worked perfectly; the snapshot was silently
+   corrupt. Only a test asserting `snapshot().len() == AUDIO_SNAPSHOT_BYTES` noticed.
+3. **A full-scale sample did not survive the register port.** Scaling by `i16::MAX`
+   maps −32 768 to −1.00003, so a guest reading back its own full-scale negative got a
+   number outside the range it wrote. Scaling by 32 768 makes −1.0 exact.
+
+**The second of those is the fourth time this project has had a constant and the encoder
+that must agree with it written in different places** — B5's `BLOCK_SNAPSHOT_BYTES`, and
+now this. The fix that generalises is not a comment: it is a test that compares a
+produced length against the declared constant, which now exists in both places.
+
+## Tests
+
+`crates/lazalith-devices/tests/audio.rs`, 24 tests. The ones that matter most:
+
+- `a_low_water_interrupt_is_raised_once_and_latches` — checks the *latch*, not just
+  that an interrupt arrived. A device that raises every cycle passes any test that only
+  checks the first.
+- `a_rate_mismatch_is_reported_rather_than_resampled` — and `Mismatch` is its own
+  outcome rather than `Idle`, because "the host is at 44.1 and the guest asked for 48"
+  and "the guest produced nothing" are the two things a person debugging silence needs
+  told apart.
+- `a_backend_needs_no_guest_types_at_all` builds an `AudioFrame` with no device, no
+  machine and no register in scope, which is only possible if the type carries no guest
+  vocabulary.
+- `a_snapshot_carries_the_format_and_the_levels_but_not_the_audio`.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1463 passed, 0 failed**
+- `nix flake check`, `nix build`, `actionlint` ✅
+
+## Limitations at the end of this stage
+
+1. **No DMA.** A device cannot reach guest memory; see the reasoning above. Building it
+   means a DMA engine on the machine that services device *requests* (address, length,
+   direction) rather than handing every device a memory handle. That is a bus change
+   and belongs with §33.
+2. **No host audio backend.** `NullAudioBackend` and `RecordingAudioBackend` stand in.
+   SDL's audio API exists but nothing wraps it — the same gap B7 recorded for
+   `Sdl3DisplayBackend`.
+3. **Playback and capture share one ring.** A real duplex codec has two. §29's job here
+   was the ring and the rate, not duplex, and it is named as a simplification.
+4. **A sample crosses the port as 16-bit signed, always.** A guest using `F32` or `S24Le`
+   has its samples quantised on the way in and out, so a 32-bit float format is a lie
+   about precision. Clamping is explicit, so nothing wraps, but a guest that wanted
+   float precision is not getting it.
+5. **`AUDIO_REGISTER_LEVEL` reports the playback level only** — it reads as 0 for a
+   capture-only guest. It is the register a playback driver polls, and the capture side
+   has `AUDIO_STATUS_READY`; making one register mean two things would be worse, so the
+   second is missing instead.
+6. **No SoundBlaster, AC'97 or HDA.** §29 puts them in compatibility-machine work, which
+   is B27.
+7. **No PIO**, unchanged since B4. Blocks B9's PS/2, B12's bus and B27's AT machine, and
+   is still the highest-leverage unbuilt thing in the roadmap.
+8. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B11, networking architecture** (§32). The fourth of §26's device directions, and the
+first one with a *two-way* stream: a host socket in, a guest NIC out, with a host that
+may be slow, may refuse, and may be a different machine than the guest believes.
