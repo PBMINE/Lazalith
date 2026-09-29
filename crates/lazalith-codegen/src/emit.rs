@@ -47,8 +47,8 @@ use alloc::vec::Vec;
 
 use lazalith_ir::{
     BinaryOp, BlockId, CallArg, CallTarget, ComparisonOp, ConstValue, DataSegment, Function,
-    Instruction, Intrinsic, Linkage, MemorySpace, Name, ReturnValue, Terminator, Type as IrType,
-    UnaryOp, ValueId,
+    Instruction, Intrinsic, MemorySpace, Name, ReturnValue, Terminator, Type as IrType, UnaryOp,
+    ValueId,
 };
 use lazalith_isa::{Condition, DataSize, Opcode, Operand};
 use lazalith_toolchain::RelocationKind;
@@ -225,10 +225,13 @@ impl<'a> FunctionEmitter<'a> {
     /// linkage; only the offset is this stage's to report.
     pub fn run(&mut self) -> Result<u64, CodegenError> {
         let entry = self.code.len() as u64;
-        // A declared extern has no body of its own: the symbol is defined
-        // elsewhere. Its one block traps, so anything that reached it would fail
-        // loudly instead of running whatever the linker placed next.
-        if self.function.linkage == Linkage::External {
+        // A declaration has no body of its own: the name is resolved by the ABI or
+        // by whatever defines it, not by this function. Its one block traps, so
+        // anything that reached it would fail loudly instead of running whatever
+        // the linker placed next. Asked of the body rather than of the linkage: a
+        // C ABI declaration is `Local` and a Lazen one is `External`, and both are
+        // this.
+        if self.function.is_declaration() {
             self.trap(0)?;
             self.terminated = true;
             self.mark(&self.block_label(self.function.blocks[0].id));

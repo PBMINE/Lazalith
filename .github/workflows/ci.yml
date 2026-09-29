@@ -170,6 +170,8 @@ jobs:
         run: nix develop --command cargo test -p lazalith-vm --test lifecycle -- --nocapture
       - name: boot, linker and object-format suites
         run: nix develop --command cargo test -p lazalith-boot -p lazalith-toolchain --all-features
+      - name: "B14: the toolchain stages are independent and agree"
+        run: nix develop --command cargo test -p lazalith-driver --test stages -- --nocapture
 
   # Tier 3. Reproducibility: the same five checks the flake publishes, in the
   # same sandbox, on the same pinned nixpkgs that a developer's `nix flake check`
@@ -236,12 +238,62 @@ jobs:
           export PATH="$PWD/result/bin:$PATH"
           test -x result/bin/lazalith-fuzz
           result/bin/lazalith-fuzz --list
+      - name: "B14: the stage tools run separately and agree byte-for-byte"
+        run: |
+          export PATH="$PWD/result/bin:$PATH"
+          for stage_tool in lazcc lazas lazld; do
+            test -x "result/bin/$stage_tool" \
+              || { echo "$stage_tool was not installed" >&2; exit 1; }
+            "$stage_tool" --version
+          done
+
+          work="$(mktemp -d)"
+          cp examples/hello/main.lz "$work/hello.lz"
+
+          # Each stage on its own, with a file left on disk between them.
+          lazcc "$work/hello.lz" -o "$work/hello.lzo"
+          test -s "$work/hello.lzo"
+
+          printf '.arch lz64\n.entry _start\n.global _start\n.section .text\n_start:\n    LI r0, 0\n    HALT\n' > "$work/tiny.la"
+          lazas "$work/tiny.la" -o "$work/tiny.lzo"
+          test -s "$work/tiny.lzo"
+
+          lazld "$work/hello.lzo" -o "$work/from-tools.lzx"
+          test -s "$work/from-tools.lzx"
+
+          lazen build "$work/hello.lz"
+          # The point of the step: the three tools and the driver are the same
+          # code path, so a drift between them fails here rather than on a user's
+          # machine.
+          cmp "$work/from-tools.lzx" "$work/hello.lzx"
+
+          # C is a first-class target: compiles, links, and the object is real.
+          cat > "$work/hello.c" <<'C'
+          int main(void) {
+              print("Hello from C\n");
+              return 7;
+          }
+          C
+          lazcc "$work/hello.c" -o "$work/hello-c.lzo"
+          test -s "$work/hello-c.lzo"
+          lazld "$work/hello-c.lzo" -o "$work/hello-c.lzx" --entry fn.c.main
+          test -s "$work/hello-c.lzx"
+
+          # A C error is reported as a C error, and writes no object.
+          printf 'int main(void) { return not_a_thing; }\n' > "$work/bad.c"
+          if lazcc "$work/bad.c" -o "$work/bad.lzo" 2>/dev/null; then
+            echo "lazcc accepted a C file with a type error" >&2; exit 1
+          fi
+          test ! -e "$work/bad.lzo"
       - name: Keep the built artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lazalith-binaries
           path: |
             result/bin/lazen
+            result/bin/lazcc
+            result/bin/lazas
+            result/bin/lazld
             result/bin/lazalith-fuzz
           retention-days: 14
           if-no-files-found: error

@@ -259,6 +259,17 @@ impl<'a> Lowerer<'a> {
     /// declaration with no parameters would refuse every syscall call with
     /// arguments — which is the verifier being right about a declaration that
     /// says nothing.
+    ///
+    /// **`Local`, not `External`, and that is a fix rather than a default.** A syscall
+    /// declaration is a typing artifact for the verifier: every call to it is resolved
+    /// by the backend into a `SYSCALL` instruction and a number out of the ABI's own
+    /// table, so there is no address anywhere for a linker to bind. Declaring it
+    /// `External` made it a *guaranteed-unique global* — so a C object and a Lazen
+    /// object, each declaring the same ABI, collided at link time on
+    /// `fn.syscall.write` and refused. Neither was wrong about the ABI; both were
+    /// claiming to own a symbol neither one owns. `Local` says what is true: the name
+    /// is meaningful only inside the module that declared it, and the machine reaches
+    /// the call through the ABI rather than through a symbol.
     fn syscall_declaration(&mut self, name: &str) -> Result<(), LowerError> {
         let ir_name = Name::from(format!("{SYSCALL_PREFIX}{name}"));
         let signature = crate::types::abi_signature(name);
@@ -285,7 +296,7 @@ impl<'a> Lowerer<'a> {
         });
         let mut builder = self
             .module
-            .function(&ir_name, Linkage::External, params, result)?;
+            .function(&ir_name, Linkage::Local, params, result)?;
         builder
             .switch_to_block("declaration")
             .map_err(LowerError::from)?;

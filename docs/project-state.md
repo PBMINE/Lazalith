@@ -7818,3 +7818,117 @@ firmware, because "BIOS is missing" and "firmware is missing" are different work
 **B14, GCC-like toolchain separation** (§18) — the first stage that is about the
 *toolchain* rather than the machine, and the first that §14 and §15's "C is a
 first-class target" depends on.
+
+---
+
+# B14 — GCC/binutils-like toolchain separation (§18)
+
+## What this stage is
+
+The first stage about the **toolchain** rather than the machine. Before B14 the whole
+chain in §18's diagram — source → frontend → IR → optimizer → LZA backend → `.lzo` →
+`lazld` → `.lzx` — existed inside `RuntimeProgram::build`, which compiled, lowered,
+generated *and* held the result. A caller who wanted a `.lzo` had no way to stop
+there: the only way to reach the objects was a method that also knew how to link.
+
+The stages are now functions in a new crate, and **the boundary is a file format, not
+a function call**:
+
+| Stage | Function | Produces |
+| --- | --- | --- |
+| compile Lazen | `lazalith_driver::lazen_object` | `.lzo` |
+| compile C | `lazalith_driver::compile_c` | `.lzo` |
+| assemble | `lazalith_driver::assemble` | `.lzo` |
+| link | `lazalith_driver::link` | `.lzx` |
+| serialise | `lazalith_driver::image_bytes` | bytes |
+
+## What is real
+
+- **Three separate programs.** `lazcc` (frontend + backend), `lazas` (assembler),
+  `lazld` (link), beside the existing `lazen` driver. Each is argument handling and a
+  call into `lazalith-driver`; none implements a stage, because §18 says the driver
+  "coordinates these stages instead of implementing a parallel linker or object
+  system" and a tool that grew its own linker would be exactly the parallel system
+  §18 forbids.
+- **`lazcc` does not link, and `lazas` needs nothing.** A compiler that also links
+  cannot hand an object to a *different* linker. The assembler needs no compiler, no
+  prelude, no entry sequence and no linker.
+- **`lazld` owns the entry.** The startup sequence is added at link time, not compile
+  time, so a caller who only wanted an object did not pay to assemble code that would
+  never be linked, and `--entry` can relink the same object at a different entry.
+- **`lazen build` calls the same functions.** `crates/lazalith-cli/src/build.rs` now
+  calls `lazalith_driver::build_lazen`, so the driver and the tools cannot drift.
+
+## The tests, and what one of them cost
+
+- `the_two_ways_to_build_agree_byte_for_byte` — `lazcc a.lz` then `lazld a.lzo` writes
+  **the same bytes** as `lazen build a.lz`, and **the same bytes as the pre-B14
+  `RuntimeProgram` path** that every existing example uses. The second comparison is
+  the one that matters; the first alone only says the code is deterministic.
+- `an_image_built_through_the_stages_runs`, `a_c_program_compiles_links_and_runs`,
+  `c_and_lazen_agree_through_the_toolchain` — the stages produce **artifacts that are
+  executed**, not only compared.
+- `every_tool_explains_itself_without_doing_the_work`, `a_tool_with_no_input_says_what_it_needs`.
+- `an_object_for_another_machine_is_refused`, `the_linker_owns_the_entry_point`.
+
+The byte-equivalence test originally compared `lazalith-driver` against itself — both
+sides ended in the same `link` — and it passed while every image the driver produced
+trapped. See the next section.
+
+## C is a first-class target, and getting there found two real defects
+
+This stage's first draft **refused C**, reporting a missing "C-to-object backend". That
+refusal was wrong, and it was wrong in an instructive way: it was a claim about the
+codebase that nobody had checked, stated in the same confident register as six refusals
+that *were* accurate. `lazalith_c_compiler::ir::lower` already produced a
+`lazalith_ir::Module` and a `Vec<lazalith_ir::FrameLayout>` — the same types the Lazen
+lowering produced — and `lazalith_codegen::generate` already took exactly those. The
+backend was never missing. **A refusal is not self-justifying: the discipline that
+makes one trustworthy is the same one that finds it unnecessary.**
+
+Building the C path for real then found two defects that only running the output could
+find:
+
+1. **A C object and a Lazen object could not be linked together.** Both declare the
+   same OS ABI, and an ABI declaration was lowered as an `External` global — a
+   *guaranteed-unique* symbol — so a mixed link was refused as a duplicate
+   `fn.syscall.write`. Neither front end was wrong about the ABI; both were claiming to
+   own a symbol neither one owns. Fixed by making a syscall declaration `Local`, and
+   by adding `lazalith_ir::Function::is_declaration`, which answers the backend's
+   actual question — *does this have a body?* — structurally instead of by reading
+   linkage. A C ABI declaration is `Local` and a Lazen one is `External`; both are
+   declarations, so the old test was reading a proxy.
+2. **Every image built through the new `link` trapped** (`Permission` at the program's
+   first instruction). `link` passed the *program's* entry as the *image's* entry
+   symbol, so the machine started at a function with no OS-established stack and no
+   exit path. Fixed by naming the two symbols apart: `lazalith_runtime::STARTUP_LABEL`
+   is where an image starts; the program's entry is what the startup *calls*.
+
+Both were invisible to the byte-for-byte test, because every image the bug produced
+was internally consistent. **A stage that produces executable artifacts has to be
+checked by executing them.**
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1522 passed, 0 failed** (13 new)
+- `nix flake check`, `nix build`, `actionlint` ✅
+
+## Limitations at the end of this stage
+
+1. **No `lazdbg`.** `lazalith-debug` is a complete API and no program drives it.
+2. **No `lazpkg` or `lazimg`.** `lazen pack` / `lazen deps` stay subcommands; §18
+   asks to move *toward* distinct tools, and the split was drawn at the two file
+   formats rather than at command-line organization.
+3. **No C preprocessor.** Real missing work, unrelated to this stage.
+4. **`--target` parses but only lz64 is buildable** — the one backend is 64-bit only.
+5. **No sysroot and no startup objects on disk**, though `CBuildOptions::freestanding`
+   exists and takes an empty runtime. That is §19, and it is the next stage.
+6. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B15, target sysroot** (§19) — the directory layout a hosted build, a freestanding
+build and a `lazpkg` install all agree on, and the first thing that makes
+`CBuildOptions::freestanding` mean something beyond a field.

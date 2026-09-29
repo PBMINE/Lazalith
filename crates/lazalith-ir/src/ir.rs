@@ -668,6 +668,35 @@ impl Function {
         self.blocks.first()
     }
 
+    /// Whether this function is a **declaration**: a name with no body behind it.
+    ///
+    /// **This is the question a backend has to ask, and linkage is not it.** A
+    /// backend needs to know "does this have code, or is it a name the machine
+    /// resolves elsewhere?" so it can skip a prologue, skip a frame layout, and
+    /// emit a trap rather than running into whatever the linker placed next. Asking
+    /// "is the linkage `External`?" gets the same answer for the one shape both
+    /// front ends happen to use today, and the wrong answer the moment a second
+    /// shape appears.
+    ///
+    /// It already had the wrong answer. A C ABI declaration was `External` because
+    /// that is what an extern declaration is in C, and that made *two* objects — a C
+    /// one and a Lazen one, each declaring the same ABI — collide as duplicate
+    /// globals on `syscall.write`. Marking it `Local` fixed the collision and broke
+    /// the prologue, because the backend was still reading linkage where it should
+    /// have been reading the body. The body is what was being asked about all along:
+    /// a declaration has one block, no instructions, and a terminator that cannot
+    /// fall through.
+    ///
+    /// So the answer is structural: a function with no block that carries an
+    /// instruction has no body. An *empty* function is treated as a declaration
+    /// rather than an error, because a frontend that has emitted nothing yet is not
+    /// a frontend that has written a body.
+    pub fn is_declaration(&self) -> bool {
+        self.blocks
+            .iter()
+            .all(|block| block.instructions.is_empty())
+    }
+
     /// Looks up a block by label.
     pub fn block(&self, id: BlockId) -> Option<&Block> {
         self.blocks.iter().find(|block| block.id == id)

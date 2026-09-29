@@ -108,6 +108,13 @@
             done
             test -x "$out/bin/lazen" \
               || { echo "the lazen command was not installed" >&2; exit 1; }
+            # B14's separate stage tools. They install through the same loop above,
+            # and the same silence that let a missing `lazen` pass unnoticed would let
+            # a missing `lazld` pass unnoticed.
+            for stage_tool in lazcc lazas lazld; do
+              test -x "$out/bin/$stage_tool" \
+                || { echo "the $stage_tool stage tool was not installed" >&2; exit 1; }
+            done
             runHook postInstall
           '';
 
@@ -201,6 +208,55 @@
             # The binary must be the one from this build, not one found on PATH.
             test "$lazen" = "${package}/bin/lazen" \
               || { echo "the wrong lazen would be tested" >&2; exit 1; }
+
+            # B14: the three stages run *separately* on a real program, and the
+            # image they produce is compared byte-for-byte with the one `lazen
+            # build` writes. The comparison is the point — a check that only ran
+            # both would pass if the tools disagreed.
+            work="$TMPDIR/stages"
+            mkdir -p "$work"
+            cp examples/hello/main.lz "$work/hello.lz"
+            cd "$work"
+
+            lazcc hello.lz -o hello.lzo
+            test -s hello.lzo || { echo "lazcc wrote no object" >&2; exit 1; }
+
+            printf '.arch lz64\n.entry _start\n.global _start\n.section .text\n_start:\n    LI r0, 0\n    HALT\n' > tiny.la
+            lazas tiny.la -o tiny.lzo
+            test -s tiny.lzo || { echo "lazas wrote no object" >&2; exit 1; }
+
+            lazld hello.lzo -o from-tools.lzx
+            test -s from-tools.lzx || { echo "lazld wrote no image" >&2; exit 1; }
+
+            lazen build hello.lz
+            cmp from-tools.lzx hello.lzx \
+              || { echo "lazcc+lazld and lazen build disagree" >&2; exit 1; }
+
+            # The linked image is the program's whole executable, and it still runs.
+            lazen run hello.lz
+
+            # C is a first-class target: a C program compiles, links, and runs.
+            # This asserts the whole path, not a link, because a C object that
+            # merely links proves nothing about the C frontend and the shared
+            # backend agreeing.
+            cat > hello.c <<'C'
+            int main(void) {
+                print("Hello from C\n");
+                return 7;
+            }
+            C
+            lazcc hello.c -o hello-c.lzo
+            test -s hello-c.lzo || { echo "lazcc wrote no C object" >&2; exit 1; }
+            lazld hello-c.lzo -o hello-c.lzx --entry fn.c.main
+            test -s hello-c.lzx || { echo "lazld wrote no C image" >&2; exit 1; }
+
+            # A C error is reported as a C error, not as a later stage's failure.
+            printf 'int main(void) { return not_a_thing; }\n' > bad.c
+            if lazcc bad.c -o bad.lzo 2>/dev/null; then
+              echo "lazcc accepted a C file with a type error" >&2; exit 1
+            fi
+            test ! -e bad.lzo || { echo "lazcc wrote an object for a file it refused" >&2; exit 1; }
+
             touch "$out"
           '';
 

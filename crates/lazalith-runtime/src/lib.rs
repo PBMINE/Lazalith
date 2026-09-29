@@ -50,7 +50,7 @@ pub use run::{
 };
 pub use source::PRELUDE;
 pub use startup::{
-    ENTRY_SYMBOL, StartupError, startup_object, startup_object_for, startup_source,
+    ENTRY_SYMBOL, STARTUP_LABEL, StartupError, startup_object, startup_object_for, startup_source,
     startup_source_for,
 };
 

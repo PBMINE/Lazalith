@@ -265,6 +265,8 @@ struct Assembler<'a> {
     source_name: String,
     source_length: u32,
     architecture: Option<LzxArchitecture>,
+    /// What an object is for when the source did not say, from `assemble_for`.
+    default_architecture: LzxArchitecture,
     current: SectionKey,
     entry: Option<String>,
     sections: BTreeMap<SectionKey, SectionAccumulator>,
@@ -280,6 +282,21 @@ pub fn assemble(source: &str) -> Result<ObjectFile, ToolchainError> {
 }
 
 pub fn assemble_named(name: &str, source: &str) -> Result<ObjectFile, ToolchainError> {
+    assemble_for(lazalith_types::ArchitectureConfig::lz64(), name, source)
+}
+
+/// Assembles for a named machine.
+///
+/// **B14.** The assembler used to have one target -- the current architecture --
+/// because there was one machine. `assemble_named` now delegates here with lz64, so
+/// nothing that used it changed, and a caller that has a 32-bit object to hand a
+// linker can make one. A linker that accepted both would produce images whose
+/// instructions were the wrong width.
+pub fn assemble_for(
+    architecture: lazalith_types::ArchitectureConfig,
+    name: &str,
+    source: &str,
+) -> Result<ObjectFile, ToolchainError> {
     let mut manager = SourceManager::new();
     let source_id = manager
         .add_file(name, source)
@@ -298,7 +315,14 @@ pub fn assemble_named(name: &str, source: &str) -> Result<ObjectFile, ToolchainE
         source_id,
         source_name: String::from(name),
         source_length,
+        // `None` when the source has not said, so a `.arch` directive still works and
+        // `.arch` twice is still E232. The default is carried separately for exactly
+        // that reason: seeding `architecture` here would make every `.arch` a duplicate.
         architecture: None,
+        default_architecture: match architecture.word_width() {
+            lazalith_types::WordWidth::W32 => LzxArchitecture::Lz32,
+            lazalith_types::WordWidth::W64 => LzxArchitecture::Lz64,
+        },
         current: SectionKey::Text,
         entry: None,
         sections: SectionKey::ORDER
@@ -952,13 +976,13 @@ impl<'a> Assembler<'a> {
             _ => return Err(self.fail(start, end, "E265", "unknown data directive")),
         };
         if directive.eq_ignore_ascii_case(".dword") {
-            if let Some(architecture) = self.architecture {
-                if architecture == LzxArchitecture::Lz32 {
-                    return Err(self.fail(start, end, "E266", ".dword requires LZ64"));
-                }
-            } else {
-                self.dword_span = Some(tokens[0].span.clone());
+            // The source's `.arch` if it said one, otherwise the default this
+            // assembler was created with.
+            let architecture = self.architecture.unwrap_or(self.default_architecture);
+            if architecture == LzxArchitecture::Lz32 {
+                return Err(self.fail(start, end, "E266", ".dword requires LZ64"));
             }
+            self.dword_span = Some(tokens[0].span.clone());
         }
         if tokens.len() == 1 {
             return Err(self.fail(

@@ -9,7 +9,7 @@ mod lzo;
 mod manifest;
 mod object;
 
-pub use assembler::{AssemblyError, assemble, assemble_named};
+pub use assembler::{AssemblyError, assemble, assemble_for, assemble_named};
 pub use disassembler::{
     DisassembledInstruction, DisassemblyError, ObjectDisassembly, disassemble, disassemble_object,
     disassemble_one,

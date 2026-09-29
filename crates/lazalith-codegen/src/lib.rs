@@ -549,12 +549,15 @@ fn frame_table<'a>(
 ) -> Result<Vec<Option<&'a FrameLayout>>, CodegenError> {
     let mut table = Vec::new();
     for function in &module.functions {
-        // A declared extern has no body and therefore no frame: its one block is
-        // a trap. A defined function without one is an error, because a prologue
-        // sized from a missing frame would be a guess.
+        // A declaration has no body and therefore no frame: its one block is a
+        // trap. A *defined* function without one is an error, because a prologue
+        // sized from a missing frame would be a guess. Which of the two this is
+        // comes from the body rather than from the linkage, because a C ABI
+        // declaration is `Local` and a Lazen one is `External`, and both are
+        // declarations.
         let frame = match frames.iter().find(|frame| frame.function == function.name) {
             Some(frame) => Some(frame),
-            None if function.linkage == lazalith_ir::Linkage::External => None,
+            None if function.is_declaration() => None,
             None => {
                 return Err(CodegenError::MissingFrame {
                     function: function.name.clone(),

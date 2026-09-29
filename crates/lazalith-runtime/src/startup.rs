@@ -55,6 +55,23 @@ pub fn startup_source(architecture: ArchitectureConfig) -> String {
 /// itself.
 pub const ENTRY_SYMBOL: &str = "fn.main";
 
+/// The label the **image** starts at, which is the entry sequence itself.
+///
+/// **This is not [`ENTRY_SYMBOL`], and the two being different is the whole point.**
+/// An image starts at the startup code, which then *calls* the program's entry. A
+/// linker told that the image's entry is the program's function starts the machine
+/// at that function with no OS-established stack and no exit path: the program runs,
+/// and then the machine has nothing left to do and traps.
+///
+/// It happened here. The driver's `link` took the program's entry and passed it as
+/// the image's entry symbol, which is the right argument to the wrong question. The
+/// symptom was a `Permission` trap at the program's own first instruction, and the
+/// byte-for-byte test could not see it — both sides of that test went through the
+/// same `link`, so it was comparing the code against itself. Naming the label is the
+/// cheapest defence: one name for "where the image starts", and it is deliberately
+/// not the name of "what the image calls".
+pub const STARTUP_LABEL: &str = "entry";
+
 /// The entry sequence for a program whose entry has a stated symbol.
 ///
 /// The sequence itself is language-neutral: call the program's entry, then exit with
@@ -65,11 +82,14 @@ pub const ENTRY_SYMBOL: &str = "fn.main";
 pub fn startup_source_for(architecture: ArchitectureConfig, entry: &str) -> String {
     let mut source = String::from(".arch ");
     source.push_str(isa_name(architecture));
-    source.push_str("\n.entry entry\n");
+    source.push_str("\n.entry ");
+    source.push_str(STARTUP_LABEL);
+    source.push('\n');
     // The program's entry point. Code generation makes this symbol global even
     // when the source declared it private, because the loader is not a module.
     source.push_str(&alloc::format!(".extern {entry}\n"));
-    source.push_str("entry:\n");
+    source.push_str(STARTUP_LABEL);
+    source.push_str(":\n");
     source.push_str(&alloc::format!("         CALL {entry}\n"));
     source.push_str("         MOV r1, r0\n");
     source.push_str("         LI r0, 1\n");
@@ -89,8 +109,19 @@ fn isa_name(architecture: ArchitectureConfig) -> &'static str {
 /// Assembles the entry sequence into an object.
 pub fn startup_object(architecture: ArchitectureConfig) -> Result<ObjectFile, StartupError> {
     let source = startup_source(architecture);
-    assemble_named("lazen.startup", &source).map_err(StartupError::Assembly)
+    assemble_named(STARTUP_OBJECT_NAME, &source).map_err(StartupError::Assembly)
 }
+
+/// The name the startup object carries in the object file.
+///
+/// **The same for every entry, deliberately.** The object format records the name a
+/// module was assembled under, so an object called `c.startup` and one called
+/// `lazen.startup` are four bytes apart — and since the name lands in the image, an
+/// image linked with the C entry sequence differed from the same image linked with
+/// the Lazen one by exactly those four bytes. Nothing about the entry changes what
+/// the entry sequence *is*: it is the startup sequence, and one name is the honest
+/// description of it.
+pub const STARTUP_OBJECT_NAME: &str = "lazen.startup";
 
 /// The entry sequence for a program whose entry has a stated symbol.
 pub fn startup_object_for(
@@ -98,7 +129,7 @@ pub fn startup_object_for(
     entry: &str,
 ) -> Result<ObjectFile, StartupError> {
     let source = startup_source_for(architecture, entry);
-    assemble_named("c.startup", &source).map_err(StartupError::Assembly)
+    assemble_named(STARTUP_OBJECT_NAME, &source).map_err(StartupError::Assembly)
 }
 
 /// Why the entry sequence could not be built.

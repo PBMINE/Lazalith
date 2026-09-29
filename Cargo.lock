@@ -65,6 +65,7 @@ dependencies = [
  "lazalith-cpu",
  "lazalith-debug",
  "lazalith-devices",
+ "lazalith-driver",
  "lazalith-isa",
  "lazalith-os",
  "lazalith-os-abi",
@@ -143,6 +144,26 @@ dependencies = [
 name = "lazalith-diagnostics"
 version = "0.1.0"
 dependencies = [
+ "lazalith-types",
+]
+
+[[package]]
+name = "lazalith-driver"
+version = "0.1.0"
+dependencies = [
+ "lazalith-boot",
+ "lazalith-c-compiler",
+ "lazalith-c-runtime",
+ "lazalith-codegen",
+ "lazalith-compiler",
+ "lazalith-devices",
+ "lazalith-diagnostics",
+ "lazalith-ir",
+ "lazalith-isa",
+ "lazalith-machine",
+ "lazalith-os",
+ "lazalith-runtime",
+ "lazalith-toolchain",
  "lazalith-types",
 ]
 
