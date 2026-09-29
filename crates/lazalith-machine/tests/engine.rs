@@ -31,8 +31,7 @@
 
 use lazalith_cpu::{
     ArchitecturalState, CpuFault, CpuMemory, EngineError, EngineKind, ExecutionContextId,
-    ExecutionEngine, OutcomeApplication, Privilege, Processor, ReferenceInterpreter,
-    StatusRegister,
+    ExecutionEngine, Privilege, Processor, ReferenceInterpreter, StatusRegister, StepResult,
 };
 use lazalith_devices::{ConsoleDevice, DeviceId, DeviceManager};
 use lazalith_isa::{DataSize, Instruction, Opcode, Operand, encode};
@@ -75,10 +74,14 @@ impl<M: CpuMemory> ExecutionEngine<M> for Counting {
         &mut self,
         processor: &mut Processor,
         memory: &mut M,
-    ) -> Result<OutcomeApplication, CpuFault<M::Error>> {
-        let application = ReferenceInterpreter::new().step(processor, memory)?;
+    ) -> Result<StepResult, CpuFault<M::Error>> {
+        let result = ReferenceInterpreter::new().step(processor, memory)?;
         self.steps += 1;
-        Ok(application)
+        // The cost is forwarded, not recomputed. A wrapper around the reference engine
+        // must report the same cost the reference reports, or a machine running it
+        // would keep a different virtual clock from a machine running the reference
+        // directly — and the two are supposed to be the same machine.
+        Ok(result)
     }
 
     fn execute(
@@ -86,7 +89,7 @@ impl<M: CpuMemory> ExecutionEngine<M> for Counting {
         processor: &mut Processor,
         instruction: &Instruction,
         memory: &mut M,
-    ) -> Result<OutcomeApplication, CpuFault<M::Error>> {
+    ) -> Result<StepResult, CpuFault<M::Error>> {
         self.steps += 1;
         ReferenceInterpreter::new().execute(processor, instruction, memory)
     }

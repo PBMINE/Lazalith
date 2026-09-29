@@ -455,7 +455,27 @@ fn one_guest_reads_three_device_windows() {
             .registers()
             .read(RegisterIndex::try_from(index).unwrap())
     };
-    assert_eq!(register(2), 1_234, "the timer window");
+    // The timer window is the machine's virtual time, read live.
+    //
+    // **1_235 and not 1_234, and the difference is the whole point.** The guest issues
+    // `LI` then `LDZ`; the `LI` retires and costs one cycle, so the machine's clock is
+    // 1_235 by the time the `LDZ` reads the window. Before the clock was charged during
+    // execution this read 1_234 — the value the *driver* had set — so a guest polling
+    // the timer would have seen a clock frozen at the moment the driver last touched it.
+    //
+    // Asserted as "the driver's value plus the cost of the instructions before the
+    // read" rather than as the total run cost, because a read happens at one instant:
+    // charging the whole run would be asserting that the guest can see the future.
+    assert_eq!(
+        register(2),
+        1_234 + 1,
+        "the timer window reads the machine's virtual time, mid-run"
+    );
+    assert_eq!(
+        machine.clock().elapsed().as_u64(),
+        1_234 + run.cycles,
+        "and the run went on to cost the rest of it after the read"
+    );
     assert_eq!(register(4), 0, "the input window, with nothing queued");
     assert_eq!(register(6), 0, "the display window, with no window open");
     assert_ne!(

@@ -192,3 +192,21 @@ impl CpuMemory for Ram {
         Ok(self.word(range.start, range.len()))
     }
 }
+
+/// Asserts what an instruction *did*, without its cost.
+///
+/// **Named so a reader knows which of the two is being checked.** A `step` answers two
+/// questions — what happened, and what it cost — and almost every instruction test is
+/// only asking the first. Spelling the cost into each of those expectations would couple
+/// them all to the timing model, so a change to the model would rewrite thirteen
+/// assertions that were never about it. The cost has its own tests
+/// (`instruction_costs_follow_the_isa_model`) which check it exactly.
+#[macro_export]
+macro_rules! assert_outcome {
+    ($actual:expr, $expected:expr $(,)?) => {
+        assert_eq!(
+            $actual.map(lazalith_cpu::StepResult::outcome),
+            ::core::result::Result::Ok($expected)
+        )
+    };
+}

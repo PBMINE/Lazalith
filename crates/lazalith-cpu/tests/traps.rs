@@ -1,3 +1,4 @@
+#[macro_use]
 mod support;
 
 use lazalith_cpu::{
@@ -107,13 +108,13 @@ fn editable_controls_and_rfe_restore_only_control_state() {
         ));
         assert_eq!(cpu.traps().frame(), Some(&frame));
 
-        assert_eq!(
+        assert_outcome!(
             ReferenceInterpreter::new().execute(
                 &mut cpu,
                 &instruction(config, Opcode::Rfe, &[]),
                 &mut ram
             ),
-            Ok(OutcomeApplication::Continue)
+            OutcomeApplication::Continue
         );
         assert_eq!(cpu.architectural().pc().as_u64(), 0x90);
         assert_eq!(cpu.architectural().sp().as_u64(), 0x120);
@@ -297,7 +298,7 @@ fn frame_controls_require_a_frame_before_value_validation() {
 fn csrr_and_csrw_use_real_controller_state() {
     for config in MODES {
         let mut cpu = cpu(config, 0, 0x100, 0, &[(1, 0x80)]);
-        assert_eq!(
+        assert_outcome!(
             ReferenceInterpreter::new().execute(
                 &mut cpu,
                 &instruction(
@@ -307,11 +308,11 @@ fn csrr_and_csrw_use_real_controller_state() {
                 ),
                 &mut Ram::default(),
             ),
-            Ok(OutcomeApplication::Continue)
+            OutcomeApplication::Continue
         );
         assert_eq!(cpu.traps().tvec().unwrap().as_u64(), 0x80);
         assert_eq!(cpu.architectural().pc().as_u64(), 8);
-        assert_eq!(
+        assert_outcome!(
             ReferenceInterpreter::new().execute(
                 &mut cpu,
                 &instruction(
@@ -321,7 +322,7 @@ fn csrr_and_csrw_use_real_controller_state() {
                 ),
                 &mut Ram::default(),
             ),
-            Ok(OutcomeApplication::Continue)
+            OutcomeApplication::Continue
         );
         assert_eq!(cpu.architectural().registers().read_raw(2).unwrap(), 0x80);
         assert_eq!(cpu.architectural().pc().as_u64(), 16);

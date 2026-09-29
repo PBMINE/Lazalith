@@ -251,6 +251,14 @@ pub struct LazalithMachine<D: Device> {
     /// value cannot outlive, and the report is what a person reads anyway.
     last_emulator_bug: Option<Box<EmulatorBug>>,
     executed: u64,
+    /// What the last retired instruction cost, in virtual cycles.
+    ///
+    /// **A report, not state a snapshot needs.** The clock itself is architectural and
+    /// is restored (B18); this is a per-instruction accounting kept so a machine can
+    /// answer "what did that instruction cost", which is what a differential test
+    /// between two engines (B24) compares and what a `disassembly` view shows. It
+    /// derives from the clock, so it is not part of what a snapshot must carry.
+    last_cycles: u8,
 }
 
 impl<D: Device> LazalithMachine<D> {
@@ -295,6 +303,7 @@ impl<D: Device> LazalithMachine<D> {
             last_trap_resume_pc: None,
             last_emulator_bug: None,
             executed: 0,
+            last_cycles: 0,
         })
     }
 
@@ -993,8 +1002,8 @@ impl<D: Device> LazalithMachine<D> {
             .checked_add(1)
             .ok_or(MachineError::InstructionCountOverflow)?;
         let had_frame = self.processor.traps().has_active_frame();
-        let application = match self.engine.step(&mut self.processor, &mut self.bus) {
-            Ok(application) => application,
+        let result = match self.engine.step(&mut self.processor, &mut self.bus) {
+            Ok(result) => result,
             Err(fault) => {
                 let cause = trap_cause(&fault);
                 let resume_pc = fault.pc;
@@ -1006,11 +1015,28 @@ impl<D: Device> LazalithMachine<D> {
                 return Ok(MachineEvent::Trapped { event });
             }
         };
+        // **Time is charged here: after the instruction retired, before the outcome is
+        // applied.** Three things make this the only place that works.
+        //
+        // - It is after the engine's step, so the cost is the cost of the instruction
+        //   that actually ran, reported by whichever engine ran it. A faulted fetch
+        //   retires nothing and is charged nothing, which is what a guest measuring its
+        //   own work expects. Charging beforehand would mean fetching and decoding the
+        //   instruction twice and would bill a guest for an instruction that never ran.
+        // - It is before the outcome is applied, so a `Halt` and a `Trap` are both
+        //   charged. Both executed an instruction, and a machine where trapping was free
+        //   would let a guest spend unbounded time for nothing.
+        // - It goes through `advance_clock`, so devices are ticked and any interrupt a
+        //   device raises in response to the tick is delivered. The interrupt is then
+        //   taken at the *next* step's boundary by `try_external_interrupt`, which is
+        //   why a timer works without the step loop knowing that timers exist.
+        self.last_cycles = result.cycles;
+        self.advance_clock(CycleCount::new(u64::from(result.cycles)))?;
         self.executed = executed;
         if had_frame && !self.processor.traps().has_active_frame() {
             self.last_trap_fault = None;
         }
-        match application {
+        match result.application {
             OutcomeApplication::Halted => {
                 self.state = MachineState::Halted;
                 Ok(MachineEvent::Halted)
@@ -1023,7 +1049,9 @@ impl<D: Device> LazalithMachine<D> {
                 let event = self.enter_trap(pending)?;
                 Ok(MachineEvent::Trapped { event })
             }
-            OutcomeApplication::Continue => Ok(MachineEvent::Stepped { application }),
+            OutcomeApplication::Continue => Ok(MachineEvent::Stepped {
+                application: result.application,
+            }),
         }
     }
 
@@ -1044,6 +1072,7 @@ impl<D: Device> LazalithMachine<D> {
                 .ok_or(MachineError::InstructionCountOverflow)?;
         }
         self.state = MachineState::Running;
+        let before = self.clock.elapsed();
         let mut executed = 0u64;
         let mut trap = None;
         let halted_at = loop {
@@ -1071,7 +1100,16 @@ impl<D: Device> LazalithMachine<D> {
             executed,
             halted_at,
             trap,
+            cycles: self.clock.elapsed().as_u64() - before.as_u64(),
         })
+    }
+
+    /// What the last retired instruction cost, in virtual cycles.
+    ///
+    /// A report rather than state a snapshot carries: the clock is architectural and is
+    /// restored, and this is a per-instruction accounting derived from it.
+    pub const fn last_instruction_cycles(&self) -> u8 {
+        self.last_cycles
     }
 
     pub fn pause(&mut self) -> Result<(), MachineError> {
@@ -1254,7 +1292,18 @@ fn engine_for(kind: EngineKind) -> ReferenceInterpreter {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MachineRun {
+    /// How many instructions retired.
     pub executed: u64,
+    /// The instruction count at which the guest halted, if it did.
     pub halted_at: Option<u64>,
+    /// The trap that ended the run, if one did.
     pub trap: Option<TrapEvent>,
+    /// The virtual cycles this run cost.
+    ///
+    /// **Reported as well as derivable, because it is the cheaper half to ask for and
+    /// the harder half to reconstruct.** The clock says where virtual time *is*; this
+    /// says what the run *spent*, which is a different question a caller asking "was
+    /// that worth it" (B21) and a differential test asking "did the two engines agree
+    /// on what this cost" (B24) both want answered without a snapshot in between.
+    pub cycles: u64,
 }

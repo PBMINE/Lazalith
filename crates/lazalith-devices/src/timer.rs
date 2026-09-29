@@ -117,10 +117,19 @@ impl Device for TimerDevice {
     }
 
     fn tick(&mut self, elapsed: CycleCount) {
-        self.elapsed = self
-            .elapsed
-            .checked_add(elapsed)
-            .unwrap_or(CycleCount::new(u64::MAX));
+        // **Assigned, not accumulated.** This was the one device out of five that
+        // added, and the machine's own `DeviceManager::tick` passes the *new absolute*
+        // elapsed time — so a timer that added was computing a sum of absolute
+        // timestamps. On a machine whose clock only ever moved once, that read as
+        // correct: the first tick delivered 1_234 and the counter became 1_234. The
+        // moment the clock started moving during execution, the second tick delivered
+        // 1_235 and the counter became 2_469, which is a time the machine was never at.
+        //
+        // The guest reads this register as "what time is it", so absolute is the only
+        // answer that means anything. `elapsed` here is a clock reading, not a delta;
+        // a device that wants a delta is a device that wants a different method, and
+        // the trait documents which one it is getting.
+        self.elapsed = elapsed;
     }
 
     /// The counter, as eight bytes, for a machine snapshot.

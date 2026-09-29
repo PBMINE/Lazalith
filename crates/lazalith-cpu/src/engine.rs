@@ -34,7 +34,7 @@
 //! reference. Differential testing against it is how that is enforced, not
 //! agreement by construction.
 
-use crate::{CpuFault, CpuMemory, OutcomeApplication, Processor};
+use crate::{CpuFault, CpuMemory, Processor, StepResult};
 use core::error::Error;
 use core::fmt;
 use lazalith_isa::Instruction;
@@ -126,7 +126,7 @@ pub trait ExecutionEngine<M: CpuMemory>: fmt::Debug {
         &mut self,
         processor: &mut Processor,
         memory: &mut M,
-    ) -> Result<OutcomeApplication, CpuFault<M::Error>>;
+    ) -> Result<StepResult, CpuFault<M::Error>>;
 
     /// Executes one instruction whose bytes the caller already has.
     ///
@@ -138,7 +138,7 @@ pub trait ExecutionEngine<M: CpuMemory>: fmt::Debug {
         processor: &mut Processor,
         bytes: &[u8],
         memory: &mut M,
-    ) -> Result<OutcomeApplication, CpuFault<M::Error>> {
+    ) -> Result<StepResult, CpuFault<M::Error>> {
         let instruction = lazalith_isa::decode(processor.config(), bytes).map_err(|source| {
             CpuFault::at(
                 processor.architectural().pc(),
@@ -155,7 +155,7 @@ pub trait ExecutionEngine<M: CpuMemory>: fmt::Debug {
         processor: &mut Processor,
         instruction: &Instruction,
         memory: &mut M,
-    ) -> Result<OutcomeApplication, CpuFault<M::Error>>;
+    ) -> Result<StepResult, CpuFault<M::Error>>;
 
     /// Drops everything this engine holds that is not architectural.
     ///

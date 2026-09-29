@@ -62,7 +62,7 @@ fn encoded_guest_hello_runs_through_interpreter_rom_and_mmio_both_modes() {
                 .step(&mut cpu, &mut bus)
                 .unwrap();
             assert_eq!(
-                event,
+                event.outcome(),
                 if step == 2 * text.len() + 1 {
                     OutcomeApplication::Halted
                 } else {

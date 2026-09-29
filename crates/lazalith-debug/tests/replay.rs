@@ -233,21 +233,44 @@ fn a_program_outlives_its_own_log_and_still_sees_what_arrived() {
     assert_eq!(run.steps, 3, "the program did not run three instructions");
     assert_eq!(
         run.time.as_u64(),
-        3,
-        "three instructions did not advance three cycles"
+        4,
+        "three instructions cost four cycles: LI is one, LDZ is a data access and so \
+         two, and HALT is one. The cost model is the ISA's, not one-per-step, and not \
+         this replay engine's."
     );
 }
 
 // -- what makes the promise hard to keep ----------------------------------
 
 #[test]
-fn virtual_time_advances_by_the_step_and_not_by_the_clock() {
+fn virtual_time_advances_by_the_instruction_cost_and_not_by_the_step_count() {
+    // **This is the test the clock fix needed.** It used to assert that time moved by
+    // exactly one cycle per instruction, which was true only because `ReplaySession::run`
+    // advanced the clock itself and the machine's did not. The replay engine no longer
+    // touches the clock, and the machine charges each instruction what it costs, so the
+    // two must now agree — for a reason that has nothing to do with counting steps.
+    //
+    // `SOURCE` happens to be four one-cycle instructions, so `time == steps` still holds
+    // for it; that is a property of *that program*, not of the model, and
+    // `a_program_outlives_its_own_log_and_still_sees_what_arrived` is the test that
+    // shows the difference, because its `LDZ` costs two. Between them, one cycle per
+    // instruction and "the ISA's cost model" are distinguishable.
     let log = InputLog::new();
     let run = session(SOURCE, &log).run(100).expect("the run finishes");
     assert_eq!(
         run.time.as_u64(),
         run.steps,
-        "virtual time moved by something other than one cycle per instruction"
+        "for an all-`LI` program the two agree"
+    );
+
+    let counter = session(COUNTER, &log).run(100).expect("the run finishes");
+    assert_eq!(counter.steps, 3, "three instructions");
+    assert!(
+        counter.time.as_u64() > counter.steps,
+        "and a program with a data access costs more cycles than it has instructions, \
+         so the model is not one-per-step: {} cycles for {} instructions",
+        counter.time.as_u64(),
+        counter.steps
     );
 }
 

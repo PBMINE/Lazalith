@@ -556,11 +556,28 @@ impl ReplaySession {
 
     /// Runs up to `limit` instructions, delivering the log as it goes.
     ///
-    /// The clock moves by one cycle per instruction. A scheduler that advanced time
-    /// by a host tick or a wall clock would make the trace depend on the machine it
-    /// ran on, which is the one thing a reproduction must not do. A log's events are
-    /// delivered on the cycle they were recorded on, so the program sees the same
-    /// input at the same point in its own execution.
+    /// **This loop does not touch the clock.** It used to, advancing it by exactly one
+    /// cycle per instruction, and that was a second time source living in the replay
+    /// engine: the machine's own clock was not moving during execution, so the replay
+    /// engine had to move it or the log's events would never come due. The machine now
+    /// charges each retired instruction its own cost, so a step here advances virtual
+    /// time by what the instruction cost — and the replay engine adding a cycle on top
+    /// would count every instruction twice.
+    ///
+    /// That is the whole point of the fix, and it is worth being explicit about why it
+    /// was possible: the manual advance was *load-bearing* while the machine's clock was
+    /// inert, and removing it is only correct because the machine took the job over. A
+    /// replay engine that kept its own clock would be a second account of virtual time,
+    /// and two accounts of the same quantity is the defect the whole canonical-state
+    /// rule exists to prevent — in a place nobody would have looked for it, because
+    /// "the replay engine keeps the log's events on schedule" sounds like a feature.
+    ///
+    /// What is preserved is the property the manual advance was there for: a trace
+    /// depends on the program and the log, never on a host tick or a wall clock. The
+    /// machine's cost model is part of the ISA, so it is the same on every host.
+    ///
+    /// A log's events are delivered on the cycle they were recorded on, so the program
+    /// sees the same input at the same point in its own execution.
     pub fn run(&mut self, limit: u64) -> Result<Trace, ReplayError> {
         let mut steps = 0;
         let stop = loop {
@@ -571,9 +588,6 @@ impl ReplaySession {
             if self.machine.step().is_err() {
                 break Stop::Faulted;
             }
-            self.machine
-                .advance_clock(CycleCount::new(1))
-                .map_err(|error| ReplayError::Machine(format!("the clock: {error:?}")))?;
             steps += 1;
             if self.machine.is_halted() {
                 break Stop::Halted;

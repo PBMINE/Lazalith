@@ -1,3 +1,4 @@
+#[macro_use]
 mod support;
 use lazalith_cpu::{
     CpuFaultCause as Cause, ExecutionEngine, ExecutionState, OutcomeApplication,
@@ -22,9 +23,9 @@ fn tiny_fetched_call_sequence_runs_both_modes() {
         ram.code(32, config, Opcode::Ret, &[]);
         let mut cpu = cpu(config, 0, 256, 0, &[]);
         for pc in [8, 24, 32, 16] {
-            assert_eq!(
+            assert_outcome!(
                 ReferenceInterpreter::new().step(&mut cpu, &mut ram),
-                Ok(OutcomeApplication::Continue)
+                OutcomeApplication::Continue
             );
             assert_eq!(cpu.architectural().pc().as_u64(), pc);
         }
@@ -37,9 +38,9 @@ fn tiny_fetched_call_sequence_runs_both_modes() {
             ),
             16
         );
-        assert_eq!(
+        assert_outcome!(
             ReferenceInterpreter::new().step(&mut cpu, &mut ram),
-            Ok(OutcomeApplication::Halted)
+            OutcomeApplication::Halted
         );
         let before = cpu.architectural().clone();
         let memory = ram.clone();
@@ -207,16 +208,16 @@ fn traps_are_events_and_controller_instructions_are_not_emulated() {
                 let mut cpu = cpu(config, 0, 256, status, &[]);
                 let before = cpu.architectural().clone();
                 let mut ram = Ram::default();
-                assert_eq!(
+                assert_outcome!(
                     ReferenceInterpreter::new().execute(
                         &mut cpu,
                         &instruction(config, opcode, &operands),
                         &mut ram
                     ),
-                    Ok(OutcomeApplication::Trap {
+                    OutcomeApplication::Trap {
                         request,
                         resume_pc: lazalith_types::InstructionAddress::new(8)
-                    })
+                    }
                 );
                 assert_eq!(cpu.architectural(), &before);
             }
@@ -258,13 +259,13 @@ fn traps_are_events_and_controller_instructions_are_not_emulated() {
                     Cause::PrivilegeViolation
                 ));
             } else {
-                assert_eq!(
+                assert_outcome!(
                     ReferenceInterpreter::new().execute(
                         &mut cpu,
                         &instruction(config, Opcode::Csrw, &operands),
                         &mut Ram::default()
                     ),
-                    Ok(OutcomeApplication::Continue)
+                    OutcomeApplication::Continue
                 );
                 assert_eq!(cpu.traps().tvec().unwrap().as_u64(), 0);
             }

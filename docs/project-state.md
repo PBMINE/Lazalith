@@ -8675,3 +8675,178 @@ one, and the tests that care about halting ask for it.
 **B20, VM GUI / Rust SDL3 migration boundary** (§36) — the GUI above the management
 API rather than above the machine, and the inventory of SDL3 usage that §36 asks for
 before any migration.
+
+---
+
+# B19 follow-up — the virtual clock advances during execution
+
+## The defect
+
+B18 established that the virtual clock is real guest-visible state and B19 found that
+**nothing advanced it**. A machine that had executed a million instructions still
+reported zero elapsed cycles, so:
+
+- a guest's `time` syscall returned a constant;
+- a guest's `sleep` would never wake, because nothing was scheduled to wake it;
+- a guest polling the timer device saw a clock frozen at the value the driver last set.
+
+B19 deliberately did not fix it. `advance_clock` is a machine method, and calling it
+from a management client is exactly the reach-through §35 forbids —
+`no_management_crate_touches_cpu_internals` rejects the name. The fix belongs at the
+owning layer, which is the machine.
+
+## Where the fix went, and why there
+
+**`LazalithMachine::step_inner`, immediately after the engine's step returns and before
+the outcome is applied.** Three things make that the only place that works:
+
+- **After the step**, so the cost is the cost of the instruction that actually ran. A
+  faulted fetch retires nothing and is charged nothing; charging beforehand would mean
+  fetching and decoding twice and billing a guest for an instruction that never ran.
+- **Before the outcome is applied**, so a `Halt` and a `Trap` are both charged. Both
+  executed an instruction, and a machine where trapping was free would let a guest spend
+  unbounded time for nothing.
+- **Through `advance_clock`**, so devices are ticked and any interrupt a device raises
+  in response to the tick is delivered. It is then taken at the *next* step's boundary by
+  `try_external_interrupt`, which is why a timer now works without the step loop knowing
+  that timers exist.
+
+## The cost model is the ISA's, and it is not one cycle per instruction
+
+A flat one-cycle-per-instruction charge would have been the smallest change that made
+the clock move, and it would have been wrong in a way a guest could measure: a division
+and an addition would take the same time.
+
+So the cost lives in `lazalith-isa`, next to the instruction definitions:
+
+- `InstructionFormat::base_cycles()` — one cycle for register work, **two** for a `Mem`
+  instruction (it reaches outside the register file and consults the bus) and **two** for
+  a `Br` (it changes where the next instruction comes from, which ends the straight-line
+  run one cycle assumes).
+- `Opcode::cycles()` — the format's base cost, except `Mul`, `Divu`, `Divs`, `Remu` and
+  `Rems`, which are the operations whose work is not a fixed-width add and cost 8.
+
+**The model is derived from the definitions rather than tabulated.** There is no list of
+forty-six numbers to fall out of step with the mnemonics: a new opcode inherits a
+defensible cost by being written down rather than by being remembered. The five slow
+operations are named explicitly, and `lazalith-isa/tests/cost.rs` fails if an opcode's
+cost is neither its format's base cost nor one of those five.
+
+**This is a timing model for virtual time, not a pipeline description.** Lazalith has no
+documented pipeline, and inventing one here would be inventing hardware nobody
+specified. What the model has to get right is the property a guest can observe: time
+advances when the guest executes, by an amount that depends on what it executed,
+deterministically, and identically on every execution engine — which is what B22–B24
+need in order for two engines to agree on time.
+
+## The engine reports the cost, because only it knows
+
+`ExecutionEngine::step` now returns a `StepResult` — the outcome *and* the cycles — rather
+than a bare `OutcomeApplication`.
+
+**The machine cannot ask afterwards.** The processor's PC has already moved, so the
+instruction that just ran is no longer there to be measured. Reading the cost before the
+step would mean fetching and decoding it twice, and would bill a guest for an
+instruction that then faulted. So the engine reports it, which is also what lets B22's
+JIT work with no second mechanism: a JIT knows what it retired, and reports the same
+number the interpreter would.
+
+The interpreter's fifty-odd `return Ok(OutcomeApplication::...)` sites are untouched:
+`execute_application` keeps the outcome-only body and `execute_checked` attaches the cost
+once, from the instruction that produced it.
+
+## Two things the fix exposed, both pre-existing
+
+### The replay engine had its own clock
+
+`ReplaySession::run` advanced the clock by exactly one cycle per instruction itself. It
+was **load-bearing** while the machine's clock was inert: without it the log's events
+would never come due, and `deliver_due` had nothing to deliver. So the replay engine was
+a second account of virtual time — and it was the one place nobody would have looked for
+the defect, because "the replay engine keeps the log's events on schedule" sounds like a
+feature. It is removed, and the reproducibility it was protecting is *stronger* now: the
+old clock was a function of the driver's schedule, which could vary; the new one is a
+function of the program, which cannot.
+
+### `TimerDevice::tick` was adding instead of assigning
+
+The machine's `DeviceManager::tick` passes each device the machine's **new absolute**
+elapsed time. `TimerDevice::tick` *added* it to its own counter, so it was computing a
+sum of absolute timestamps.
+
+**It read as correct for the whole of B5–B19** because the clock moved at most once
+before execution charged anything: one tick delivering 1_234 gives a counter of 1_234,
+which is exactly right. The moment the clock started moving during execution, the second
+tick delivered 1_235 and the counter became 2_469 — a time the machine was never at,
+readable by a guest through a register documented as "the cycle count as the guest sees
+it".
+
+`TimerDevice` was the only device out of five that did this; the console, display and
+input devices all assign, and audio, network and storage ignore the argument. The trait's
+`tick` documentation now states the contract explicitly, because the cost of this bug was
+hidden by the defect it was waiting for.
+
+## Tests
+
+- `crates/lazalith-isa/tests/cost.rs` — 6 tests holding the cost model: every opcode
+  costs at least one cycle, data accesses and branches cost more than register work,
+  multiply/divide/remainder cost more than add, and **an opcode's cost is its format's
+  base cost unless it is one of the five named slow operations** (the anti-drift check).
+- `crates/lazalith-machine/tests/clock.rs` — 10 tests at the machine level: time moves,
+  a run advances by the *sum of its instructions' costs* rather than by its step count, a
+  data access costs more than register work, a fault is charged nothing, a halt *is*
+  charged, a trap *is* charged, `MachineRun::cycles` and the clock are one account rather
+  than two, two runs of a program cost the same, and the device manager and the machine
+  report the same time.
+
+**Every test was checked by removing the thing it claims to cover:**
+
+| mutation | tests that failed |
+| --- | --- |
+| the clock advance in `step_inner` removed | 7 of 10 |
+| the charge skipped on a trapping instruction | `a_trap_costs_what_the_trap_cost` |
+| `last_cycles` hard-coded to 1 | `the_machine_reports_what_the_last_instruction_cost` |
+
+Three tests that asserted the *old* behaviour were rewritten rather than deleted, and
+each rewrite says what the old assertion was protecting and why the new one protects it:
+
+- `the_clock_moves_only_when_the_driver_moves_it` →
+  `virtual_time_is_a_function_of_what_executed_and_of_nothing_else` plus
+  `the_same_program_costs_the_same_virtual_time_every_time`. The old test's reasoning was
+  good — a clock driven by a host tick would make traces host-dependent — but its
+  conclusion was wrong: refusing to let the step move the clock did not make it a
+  function of the program, it made it a function of *nothing*.
+- `virtual_time_advances_by_the_step_and_not_by_the_clock` →
+  `virtual_time_advances_by_the_instruction_cost_and_not_by_the_step_count`. The old name
+  claimed a model that is now explicitly false, so it was renamed and paired with a
+  program containing a data access that makes the two models distinguishable.
+- `a_program_outlives_its_own_log_and_still_sees_what_arrived` now expects 4 cycles for
+  `LI`+`LDZ`+`HALT` rather than 3.
+
+The bare-interpreter half of `lazalith-machine/tests/differential.rs` now accumulates
+each retired instruction's own reported cost, so "the two paths agree on time" means
+something: before, the machine reported 0 for everything and agreement meant "time is not
+modelled".
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1620 passed, 0 failed** (17 new)
+- `nix flake check`, `nix build` ✅
+- `actionlint` not run: no workflow file changed, and this flake's devShell does not
+  provide it.
+
+## What this does not do
+
+1. **The clock is not a wall clock and the model is not a microarchitecture.** There is
+   no pipeline, no cache, and no frequency. Virtual time is instruction costs, which is
+   what `time` and `sleep` are defined against.
+2. **`MachineRun::cycles` counts what a run spent; it is not a stopwatch with
+   sub-instruction resolution.** A JIT that runs a basic block will still be charged per
+   instruction, because the cost is per instruction.
+3. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B20, VM GUI / Rust SDL3 migration boundary** (§36).

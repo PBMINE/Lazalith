@@ -1,3 +1,4 @@
+#[macro_use]
 mod support;
 
 use lazalith_cpu::{
@@ -60,16 +61,16 @@ fn syscall_and_software_trap_are_legal_in_both_modes_without_early_transition() 
             ] {
                 let mut cpu = cpu(config, 0, 0x100, status, &[]);
                 let before = cpu.architectural().clone();
-                assert_eq!(
+                assert_outcome!(
                     ReferenceInterpreter::new().execute(
                         &mut cpu,
                         &instruction(config, opcode, &operands),
                         &mut Ram::default()
                     ),
-                    Ok(OutcomeApplication::Trap {
+                    OutcomeApplication::Trap {
                         request,
                         resume_pc: lazalith_types::InstructionAddress::new(resume)
-                    })
+                    }
                 );
                 assert_eq!(cpu.architectural().privilege(), privilege);
                 assert_eq!(cpu.architectural(), &before);
@@ -118,13 +119,13 @@ fn trap_entry_and_rfe_restore_user_and_interrupt_state_without_restoring_registe
         let admission = cpu.traps_mut().take_syscall_admission().unwrap();
         let completion = admission.complete_checked(0, 0).unwrap();
         assert!(cpu.traps_mut().authorize_syscall_return(&completion));
-        assert_eq!(
+        assert_outcome!(
             ReferenceInterpreter::new().execute(
                 &mut cpu,
                 &instruction(config, Opcode::Rfe, &[]),
                 &mut ram
             ),
-            Ok(OutcomeApplication::Continue)
+            OutcomeApplication::Continue
         );
         assert_eq!(cpu.architectural().privilege(), Privilege::User);
         assert!(cpu.architectural().status().interrupts_enabled());

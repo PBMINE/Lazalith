@@ -401,27 +401,37 @@ fn a_clone_is_independent_and_starts_paused() {
     );
 }
 
-/// A finding, not a design: the virtual clock does not advance as the guest executes.
+/// A management client can see virtual time move, without reaching into the machine.
 ///
-/// **This is why no test above uses `elapsed_cycles` as evidence.** The clock is a
-/// machine feature (B18 captured it) and `LazalithMachine::advance_clock` moves it,
-/// but the interpreter's step loop does not, so a VM that has run a million
-/// instructions still reports zero elapsed cycles.
+/// **This test asserted the opposite for the whole of B19.** It read
+/// `elapsed_cycles == 0` after a five-thousand-instruction run and recorded *why*: the
+/// step loop did not advance the clock, and the management layer could not fix it
+/// without calling `advance_clock` on the machine, which is the reach-through §35
+/// forbids. The suite deliberately used `halted`, `stage` and `ManagerState` as its
+/// evidence everywhere else for that reason.
 ///
-/// The management layer cannot fix it, and deliberately does not try: `advance_clock`
-/// is on the machine, so calling it would be exactly the CPU-internals reach-through
-/// §35 forbids and `no_management_crate_touches_cpu_internals` rejects. A GUI cannot
-/// show a running clock yet, and the honest thing is for the suite to record that
-/// rather than to assert a clock that does not move.
+/// The defect is now fixed at the layer that owns it — the machine charges each retired
+/// instruction what it costs — so a status bar can show a running clock. The important
+/// half is that the manager still reaches nothing: `status()` reports a clock that moved
+/// on its own, and the manager holds no reference to the machine's.
 #[test]
-fn the_clock_does_not_advance_because_nothing_advances_it() {
+fn a_management_client_can_see_virtual_time_move() {
     let mut manager = started();
-    manager.run(5000).expect("it runs");
+    // Booting already costs something: the bootloader ran, so the machine's clock is
+    // not at zero. That is itself the evidence the fix works — before it, booting was
+    // free.
+    let booted_at = manager.status().elapsed_cycles;
+    assert!(
+        booted_at > 0,
+        "a booted VM has a clock that moved, because the bootloader ran"
+    );
+
+    let run = manager.run(64).expect("it runs");
     assert_eq!(
         manager.status().elapsed_cycles,
-        0,
-        "the guest executed but the virtual clock did not move, because the step loop \
-         does not advance it; recorded here rather than asserted as if it worked"
+        booted_at + run.cycles,
+        "and running it moves the clock by exactly what the run reports it spent, so \
+         the status is not a second account of the same quantity"
     );
 }
 

@@ -426,14 +426,22 @@ fn a_timer_reports_the_cycle_count_and_refuses_a_write() {
             .expect("a read"),
         0
     );
+    // `tick` is told what time it is, not how much time passed, so the second call
+    // replaces the first. **This asserted 20 for the whole of B5–B19** — the counter
+    // accumulated, so 17 + 3 — which was right only because the machine's clock moved
+    // at most once before execution charged anything, and a single tick looks the same
+    // either way. The machine's `DeviceManager::tick` passes the new absolute elapsed
+    // time, so a timer that adds was computing a sum of absolute timestamps, and a
+    // guest reading it would be told a time the machine was never at.
     timer.tick(CycleCount::new(17));
     timer.tick(CycleCount::new(3));
     assert_eq!(
         timer
             .read(DeviceOffset::new(0), DataSize::Double)
             .expect("a read"),
-        20,
-        "the counter did not accumulate"
+        3,
+        "the counter reports the time the machine last said it was, and does not \
+         accumulate the timestamps it was handed"
     );
     // A write is refused rather than ignored, and `DeviceError` has no `PartialEq`
     // because two errors can be the same *kind* and different *events*; the

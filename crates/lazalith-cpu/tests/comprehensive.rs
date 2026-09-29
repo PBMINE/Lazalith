@@ -1,3 +1,4 @@
+#[macro_use]
 mod support;
 
 use lazalith_cpu::{
@@ -18,9 +19,9 @@ fn mem(base: u8, displacement: i32) -> Operand {
 
 fn run(cpu: &mut Processor, ram: &mut Ram, opcode: Opcode, operands: &[Operand]) {
     let config = cpu.architectural().config();
-    assert_eq!(
+    assert_outcome!(
         ReferenceInterpreter::new().execute(cpu, &instruction(config, opcode, operands), ram),
-        Ok(OutcomeApplication::Continue)
+        OutcomeApplication::Continue
     );
 }
 
@@ -351,7 +352,7 @@ fn every_branch_condition_exhausts_all_flag_patterns() {
                         assert!(matches!(result.unwrap_err().cause, Cause::Outcome(_)));
                         assert_eq!(machine.architectural().pc().as_u64(), 0x100);
                     } else {
-                        assert_eq!(result, Ok(OutcomeApplication::Continue));
+                        assert_outcome!(result, OutcomeApplication::Continue);
                         assert_eq!(
                             machine.architectural().pc().as_u64(),
                             if taken { target as u64 } else { 0x108 }
@@ -691,13 +692,13 @@ fn privilege_halt_and_all_control_selectors_are_explicit() {
         assert_eq!(machine.architectural().status().bits(), 31);
         run(&mut machine, &mut ram, Opcode::Di, &[]);
         assert_eq!(machine.architectural().status().bits(), 15);
-        assert_eq!(
+        assert_outcome!(
             ReferenceInterpreter::new().execute(
                 &mut machine,
                 &instruction(config, Opcode::Halt, &[]),
                 &mut ram
             ),
-            Ok(OutcomeApplication::Halted)
+            OutcomeApplication::Halted
         );
         assert_eq!(machine.architectural().pc().as_u64(), 24);
         assert_eq!(machine.execution(), ExecutionState::Halted);
@@ -780,9 +781,9 @@ fn decode_mode_fetch_errors_retain_context_and_typed_sources() {
         ram.readable = false;
         ram.code(4, config, Opcode::Nop, &[]);
         let mut machine = cpu(config, 4, 256, 63, &[]);
-        assert_eq!(
+        assert_outcome!(
             ReferenceInterpreter::new().step(&mut machine, &mut ram),
-            Ok(OutcomeApplication::Continue)
+            OutcomeApplication::Continue
         );
     }
     let wide = instruction(

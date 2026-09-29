@@ -1,3 +1,4 @@
+use crate::outcome::StepResult;
 use crate::{
     ControlStateError, ControlTarget, CpuFault, CpuFaultCause as Cause, CpuMemory, DataAccess,
     DataAccessKind, EngineKind, ExecutionEngine, ExecutionOutcome as Outcome, ExecutionState,
@@ -51,8 +52,9 @@ impl ReferenceInterpreter {
         processor: &mut Processor,
         instruction: &Instruction,
         memory: &mut M,
-    ) -> Result<OutcomeApplication, CpuFault<M::Error>> {
-        self.execute(processor, instruction, memory)
+    ) -> Result<StepResult, CpuFault<M::Error>> {
+        let application = self.execute_application_body(processor, instruction, memory)?;
+        Ok(StepResult::new(application, instruction.opcode().cycles()))
     }
 }
 
@@ -65,7 +67,7 @@ impl<M: CpuMemory> ExecutionEngine<M> for ReferenceInterpreter {
         &mut self,
         processor: &mut Processor,
         memory: &mut M,
-    ) -> Result<OutcomeApplication, CpuFault<M::Error>> {
+    ) -> Result<StepResult, CpuFault<M::Error>> {
         Self::validate_fetch(processor)?;
         let config = processor.config();
         let pc = processor.architectural().pc();
@@ -95,7 +97,7 @@ impl<M: CpuMemory> ExecutionEngine<M> for ReferenceInterpreter {
         processor: &mut Processor,
         bytes: &[u8],
         memory: &mut M,
-    ) -> Result<OutcomeApplication, CpuFault<M::Error>> {
+    ) -> Result<StepResult, CpuFault<M::Error>> {
         Self::validate_fetch(processor)?;
         let instruction = decode(processor.config(), bytes).map_err(|source| {
             CpuFault::at(
@@ -108,6 +110,23 @@ impl<M: CpuMemory> ExecutionEngine<M> for ReferenceInterpreter {
     }
 
     fn execute(
+        &mut self,
+        processor: &mut Processor,
+        instruction: &Instruction,
+        memory: &mut M,
+    ) -> Result<StepResult, CpuFault<M::Error>> {
+        self.execute_checked(processor, instruction, memory)
+    }
+}
+
+impl ReferenceInterpreter {
+    /// The application of one instruction, with no timing.
+    ///
+    /// **Kept separate from the trait.s `execute` so the fifty-odd `return
+    /// Ok(OutcomeApplication::...)` sites in the body below do not each have to know
+    /// what the instruction cost.** Every one of them returns the outcome; the cost is
+    /// attached once, by `execute_checked`, from the instruction that produced them.
+    fn execute_application_body<M: CpuMemory>(
         &mut self,
         processor: &mut Processor,
         instruction: &Instruction,

@@ -148,7 +148,7 @@ fn machine_clock_is_deterministic_and_fault_preserves_state_and_time() {
             CycleCount::new(7)
         );
         machine.set_trap_vector(I::new(0)).unwrap();
-        machine.run(4).unwrap();
+        let run = machine.run(4).unwrap();
         let before = machine.architectural_state().clone();
         let event = match machine.step().unwrap() {
             lazalith_machine::MachineEvent::Trapped { event } => event,
@@ -179,14 +179,22 @@ fn machine_clock_is_deterministic_and_fault_preserves_state_and_time() {
                 before.registers().read_raw(register).unwrap()
             );
         }
-        assert_eq!(machine.clock().elapsed(), CycleCount::new(7));
+        // The clock is where the driver left it plus what the run cost, and the faulting
+        // step that followed cost nothing because it retired nothing.
+        //
+        // **Asserted against `run.cycles` rather than a literal**, because the run is the
+        // thing that knows what it spent and this test is about the arithmetic being
+        // consistent, not about what four particular instructions cost. The cost model
+        // itself is pinned by `instruction_costs_follow_the_isa_model`.
+        let expected = CycleCount::new(7 + run.cycles);
+        assert_eq!(machine.clock().elapsed(), expected);
         assert_eq!(
             machine
                 .devices()
                 .device(DeviceId::new(1))
                 .unwrap()
                 .elapsed(),
-            CycleCount::new(7)
+            expected
         );
         assert_eq!(
             machine.devices().device(DeviceId::new(1)).unwrap().output(),
@@ -207,8 +215,20 @@ fn machine_clock_is_deterministic_and_fault_preserves_state_and_time() {
                 .map(|_| { machine.last_trap_fault().unwrap() as *const CpuFault<MemoryFault> }),
             retained_fault
         );
-        assert!(machine.advance_clock(CycleCount::new(u64::MAX)).is_err());
-        assert_eq!(machine.clock().elapsed(), CycleCount::new(7));
+        // A refused overflow leaves the clock exactly where it was. Captured rather
+        // than asserted against a literal, because the successful step above moved the
+        // clock and the point of this is that the *refusal* changed nothing — not that
+        // the clock happens to be at a particular number.
+        let before_overflow = machine.clock().elapsed();
+        assert!(
+            machine.advance_clock(CycleCount::new(u64::MAX)).is_err(),
+            "advancing past the end of the clock is refused"
+        );
+        assert_eq!(
+            machine.clock().elapsed(),
+            before_overflow,
+            "and a refused advance does not move it"
+        );
     }
 }
 
@@ -682,15 +702,12 @@ fn reset_restores_cpu_devices_and_epoch_but_preserves_memory_and_count() {
     machine.reset();
     assert_eq!(machine.state(), MachineState::Reset);
     assert_eq!(machine.architectural_state(), &initial);
+    // A reset restores the machine but does not rewind virtual time: the clock is
+    // machine-wide state, and a machine that forgot what time it was after a reset
+    // would let a guest read a time that went backwards across one.
     assert_eq!(machine.clock().elapsed(), CycleCount::new(7));
-    assert_eq!(
-        machine
-            .devices()
-            .device(DeviceId::new(1))
-            .unwrap()
-            .elapsed(),
-        CycleCount::new(7)
-    );
+    assert_eq!(machine.devices().clock().elapsed(), CycleCount::new(7));
+
     assert_eq!(machine.architectural_state().pc(), I::new(0));
     assert_eq!(machine.architectural_state().sp(), V::new(0x900));
     assert_eq!(machine.architectural_state().status().bits(), 4);

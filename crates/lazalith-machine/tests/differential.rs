@@ -48,7 +48,8 @@
 
 use lazalith_cpu::{
     ArchitecturalState, CpuFault, CpuFaultCause, CpuMemory, DataAccess, DataAccessKind,
-    ExecutionEngine, OutcomeApplication, Privilege, Processor, ReferenceInterpreter, TrapCause,
+    ExecutionEngine, OutcomeApplication, Privilege, Processor, ReferenceInterpreter, StepResult,
+    TrapCause,
 };
 use lazalith_devices::{ConsoleDevice, DeviceId, DeviceManager};
 use lazalith_isa::{DataSize, Instruction, Opcode, Operand, encode};
@@ -294,6 +295,13 @@ fn fault(address: u64, access: AccessType, size: u64) -> MemoryFault {
 }
 
 /// Runs a program on the bare interpreter and records what it did, step by step.
+///
+/// **Virtual time is accumulated here from each retired instruction's own reported
+/// cost.** The bare path has no machine and therefore no `VirtualClock`, but the cost
+/// is not the machine's — it is the ISA's, and the engine reports it. So the bare path
+/// sums the same numbers the machine charges, which is what lets the two be compared on
+/// time at all. Before the clock fix this comparison was meaningless in one direction:
+/// the machine reported 0 for everything, so "they agree" meant "time is not modelled".
 fn run_bare(program: &Program, steps: u64) -> (Vec<Observation>, Vec<Vec<u8>>) {
     let state = ArchitecturalState::new(
         program.config,
@@ -307,16 +315,21 @@ fn run_bare(program: &Program, steps: u64) -> (Vec<Observation>, Vec<Vec<u8>>) {
 
     let mut observations = Vec::new();
     let mut memory_watch = Vec::new();
+    let mut cycles = 0u64;
     for _ in 0..steps {
         let outcome = ReferenceInterpreter::new().step(&mut cpu, &mut memory);
-        observations.push(observe_bare(&cpu, &outcome));
+        cycles += outcome
+            .as_ref()
+            .map(|step| u64::from(step.cycles))
+            .unwrap_or(0);
+        observations.push(observe_bare(&cpu, &outcome, cycles));
         memory_watch.push(memory.bytes.clone());
         // A stopped processor is not stepped again. The bare path keeps going and
         // reports a halt as a fault on the next step, while the machine refuses the
         // step outright — two different ways of saying "this program has finished" —
         // so the comparison stops where the program stops, and
         // `both_paths_stop_together` says that they stopped together.
-        if !matches!(outcome, Ok(OutcomeApplication::Continue)) {
+        if !matches!(outcome, Ok(ref step) if step.outcome() == OutcomeApplication::Continue) {
             break;
         }
     }
@@ -440,7 +453,8 @@ fn program_bytes(program: &Program) -> Vec<u8> {
 
 fn observe_bare(
     cpu: &Processor,
-    outcome: &Result<OutcomeApplication, CpuFault<MemoryFault>>,
+    outcome: &Result<StepResult, CpuFault<MemoryFault>>,
+    cycles: u64,
 ) -> Observation {
     let state = cpu.architectural();
     // The same three-way question the machine's observer asks, in the same words.
@@ -448,7 +462,8 @@ fn observe_bare(
     // something, and the machine's answer to the same request is a trap with a cause.
     // The two are compared on the guest's pc — which for a trap is the resume point
     // the outcome carries, not the instruction that trapped.
-    let (halted, trapped, fault, guest_pc) = match outcome {
+    let application = outcome.as_ref().map(|step| step.outcome());
+    let (halted, trapped, fault, guest_pc) = match &application {
         Ok(OutcomeApplication::Continue) => (false, false, None, state.pc()),
         Ok(OutcomeApplication::Halted) => (true, false, None, state.pc()),
         Ok(OutcomeApplication::Trap { request, resume_pc }) => {
@@ -470,7 +485,7 @@ fn observe_bare(
         halted,
         trapped,
         fault,
-        time: 0,
+        time: cycles,
         console: Vec::new(),
     }
 }
@@ -937,20 +952,94 @@ fn both_paths_stop_together() {
 /// scheduler advances it by a quantum per process it runs. So the property is that
 /// the clock is a function of the driver and of nothing else — which is what makes a
 /// replay reproducible, and which a step-count property would have got wrong.
+/// Virtual time is a function of what the guest executed, and of nothing else.
+///
+/// **This test asserted the opposite for the whole of B6–B19**, and it was right to
+/// assert it at the time. It said: the clock belongs to the machine and not to the
+/// processor, a step does not move it, and the *driver* advances it by a quantum per
+/// process. The reasoning was good — a clock that moved by a host tick or a wall clock
+/// would make a trace depend on the machine it ran on, which is the one thing a
+/// reproduction must not do.
+///
+/// What it got wrong was the conclusion. Refusing to let the step move the clock did
+/// not make the clock a function of the program; it made the clock a function of
+/// *nothing*. A guest that called `time` read zero forever, and `sleep` never woke,
+/// because nothing on the machine ever moved it.
+///
+/// So the property is restated rather than deleted, and the "reproducible" part of the
+/// old reasoning is kept exactly: time now advances by **the ISA's cost for the
+/// instruction that retired**, which is part of the instruction's definition and
+/// therefore identical on every host, for every engine, at every speed. That is a
+/// stronger form of reproducibility than the old one — the old clock was a function of
+/// the driver's schedule, which *could* vary; this one is a function of the program.
 #[test]
-fn the_clock_moves_only_when_the_driver_moves_it() {
+fn virtual_time_is_a_function_of_what_executed_and_of_nothing_else() {
+    let mut any_execution_moved_the_clock = false;
     for config in MODES {
         for program in curated(config) {
             let (observations, _) = run_machine(&program, 8);
-            for observation in &observations {
-                assert_eq!(
-                    observation.time,
-                    0,
-                    "stepping {} moved the clock to {}, and only a driver may do that",
+            for pair in observations.windows(2) {
+                // Monotonic, and it moves unless the step faulted.
+                //
+                // **A faulted instruction is charged nothing, and that is the model
+                // rather than a loophole.** A fault is a failed fetch or a rejected
+                // operation: the instruction did not retire, so there is nothing to
+                // charge for, and charging it anyway would mean a program could make
+                // virtual time pass by faulting in a loop. So the property is
+                // "non-decreasing, and strictly increasing unless the step faulted",
+                // which is two assertions rather than one because one would be false.
+                assert!(
+                    pair[1].time >= pair[0].time,
+                    "stepping {} moved virtual time backwards, from {} to {}",
                     describe(&program),
-                    observation.time
+                    pair[0].time,
+                    pair[1].time
                 );
+                if pair[1].fault.is_none() {
+                    assert!(
+                        pair[1].time > pair[0].time,
+                        "stepping {} executed an instruction for no cycles at all: \
+                         time stayed at {}",
+                        describe(&program),
+                        pair[1].time
+                    );
+                }
             }
+            // Checked across the corpus rather than per program, because a program
+            // that faults on its first instruction legitimately never moves the clock
+            // — there is nothing to charge. Requiring every program to move would be
+            // requiring every program to execute.
+            any_execution_moved_the_clock |= observations
+                .last()
+                .is_some_and(|observation| observation.time > 0);
+        }
+    }
+    assert!(
+        any_execution_moved_the_clock,
+        "a corpus of programs ran and not one of them moved virtual time"
+    );
+}
+
+/// The same program costs the same virtual time every time it is run.
+///
+/// **The half of reproducibility that the old test was really after.** If a clock
+/// moved by a host tick this would fail on a busy machine and pass on an idle one,
+/// which is the worst way for a test to fail. Running the same program twice on the
+/// same machine is a weaker check than running it on two machines, and it is the one
+/// available here; the bare-versus-machine comparison in `run_bare` is the other half,
+/// since the bare path has no clock at all and still agrees.
+#[test]
+fn the_same_program_costs_the_same_virtual_time_every_time() {
+    for config in MODES {
+        for program in curated(config) {
+            let (first, _) = run_machine(&program, 8);
+            let (second, _) = run_machine(&program, 8);
+            assert_eq!(
+                first.iter().map(|o| o.time).collect::<Vec<_>>(),
+                second.iter().map(|o| o.time).collect::<Vec<_>>(),
+                "two runs of {} disagreed about what it cost",
+                describe(&program)
+            );
         }
     }
 }

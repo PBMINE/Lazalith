@@ -154,6 +154,24 @@ pub trait Device: fmt::Debug {
         value: u64,
     ) -> Result<(), DeviceError>;
     fn peek(&self, offset: DeviceOffset, output: &mut [u8]) -> Result<(), DeviceError>;
+
+    /// Tells the device what time it is now.
+    ///
+    /// **`elapsed` is the machine's new *absolute* virtual time, not a delta, and a
+    /// device that stores it must store it rather than add it.**
+    ///
+    /// That sentence is here because one device got it wrong for the whole of B5–B19
+    /// and nothing noticed. `TimerDevice::tick` added the argument to its own counter,
+    /// so it computed a sum of absolute timestamps. That reads as correct on a machine
+    /// whose clock moves exactly once: the first tick delivers 1_234 and the counter
+    /// becomes 1_234. The moment the machine charged cycles per retired instruction, the
+    /// second tick delivered 1_235 and the counter became 2_469 — a time the machine was
+    /// never at, readable by a guest through a register that is documented as
+    /// "the cycle count as the guest sees it".
+    ///
+    /// The cost of the bug was hidden by the clock defect it was waiting for. A delta
+    /// would be a defensible thing for a device to want, and the trait would then need
+    /// two methods; it has one, and what it passes is a clock reading.
     fn tick(&mut self, elapsed: CycleCount);
 
     /// This device's guest-visible state, as bytes.

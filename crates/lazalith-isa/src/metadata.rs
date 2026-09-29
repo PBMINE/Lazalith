@@ -116,6 +116,47 @@ impl InstructionFormat {
         Self::Ax,
     ];
 
+    /// The cycles an instruction of this format costs before any per-opcode answer.
+    ///
+    /// **The cost is a function of the format, not a per-opcode table, because a
+    /// hand-maintained table of forty-six numbers is a table that will be wrong.** The
+    /// format already says what the instruction *does*: a `Mem` instruction performs
+    /// a data access, a `Br` redirects the fetch stream, and everything else is
+    /// register work. That is exactly the distinction the cost model is drawing, and
+    /// deriving it from the format means a new opcode inherits a defensible cost by
+    /// being written down rather than by being remembered.
+    ///
+    /// The two costs above one are not microarchitecture claims. They are the two
+    /// operations that are *not* register work:
+    ///
+    /// - a `Mem` instruction reaches outside the register file, and the machine has to
+    ///   consult the bus, which is where memory and devices live;
+    /// - a `Br` instruction changes where the next instruction comes from, which ends
+    ///   the straight-line run the cost of one cycle assumes.
+    ///
+    /// This is a *timing model for virtual time*, not a pipeline description. Lazalith
+    /// has no documented pipeline, so inventing one here would be inventing hardware
+    /// nobody specified. What the model has to get right is the property a guest can
+    /// observe: time advances when the guest executes, by an amount that depends on
+    /// what it executed, deterministically, and identically on every execution engine.
+    pub const fn base_cycles(self) -> u8 {
+        match self {
+            Self::Mem => 2,
+            Self::Br => 2,
+            Self::Z
+            | Self::D
+            | Self::A
+            | Self::Da
+            | Self::Dab
+            | Self::Ab
+            | Self::Di
+            | Self::Dai
+            | Self::Imm
+            | Self::Dx
+            | Self::Ax => 1,
+        }
+    }
+
     pub const fn operands(self) -> &'static [OperandDefinition] {
         match self {
             Self::Z => &[],
@@ -190,6 +231,26 @@ macro_rules! opcodes {
             pub const ALL: &'static [Self] = &[$(Self::$name,)*];
 
             pub const fn as_u8(self) -> u8 { self as u8 }
+
+            /// How many virtual cycles this instruction costs when it retires.
+            ///
+            /// **This is what a guest's clock measures.** `time` returns virtual
+            /// cycles and `sleep` takes them, so the cost of an instruction *is* the
+            /// machine's clock rate: a program can measure its own work by reading the
+            /// clock before and after.
+            ///
+            /// The cost comes from the instruction's format (see
+            /// [`InstructionFormat::base_cycles`]) with one exception, spelled out
+            /// rather than folded in: multiply, divide and remainder are the
+            /// operations whose work is not a fixed-width register add, and giving them
+            /// the same cost as `ADD` would make a division program and an addition
+            /// program take the same time, which is a lie a guest could measure.
+            pub const fn cycles(self) -> u8 {
+                match self {
+                    Opcode::Mul | Opcode::Divu | Opcode::Divs | Opcode::Remu | Opcode::Rems => 8,
+                    _ => self.definition().format.base_cycles(),
+                }
+            }
 
             pub const fn definition(self) -> &'static InstructionDefinition {
                 match self {

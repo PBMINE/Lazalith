@@ -18,7 +18,8 @@ mod registers;
 
 pub use outcome::{
     ControlTarget, ExecutionOutcome, OutcomeApplication, OutcomeError, OutcomeErrorKind,
-    PreparedOutcome, StackEffect, TrapRequest, checked_next_pc, checked_return_sp, prepare_outcome,
+    PreparedOutcome, StackEffect, StepResult, TrapRequest, checked_next_pc, checked_return_sp,
+    prepare_outcome,
 };
 
 pub use processor::Processor;

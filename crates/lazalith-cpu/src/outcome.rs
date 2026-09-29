@@ -51,6 +51,67 @@ pub enum OutcomeApplication {
     Halted,
 }
 
+/// What one `step` produced, and what it cost.
+///
+/// **The cycles travel with the outcome because the engine is the only thing that
+/// knows which instruction it retired.** The machine cannot ask afterwards: the
+/// processor's PC has already moved, so the instruction that just ran is no longer
+/// there to be measured. Reading the cost *before* the step would mean fetching and
+/// decoding the instruction twice, and — worse — it would let a cost be charged for an
+/// instruction that then faulted, which is exactly the accounting a guest measuring its
+/// own work would be misled by.
+///
+/// So the engine reports it. That is also what makes B22's JIT work without a second
+/// mechanism: a JIT knows what it translated and retired, and it reports the same
+/// number the interpreter would, which is what lets the two engines agree on virtual
+/// time (B24 checks exactly that).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StepResult {
+    /// What the instruction did.
+    pub application: OutcomeApplication,
+    /// What it cost, from [`lazalith_isa::Opcode::cycles`].
+    pub cycles: u8,
+}
+
+impl StepResult {
+    /// An instruction that retired with this outcome at this cost.
+    pub const fn new(application: OutcomeApplication, cycles: u8) -> Self {
+        Self {
+            application,
+            cycles,
+        }
+    }
+
+    /// The outcome, without the cost.
+    ///
+    /// **A named accessor so a test that is about what an instruction did can say so
+    /// in one place.** Almost every instruction test asserts on the outcome, and putting
+    /// a cost in every one of those expectations would mean re-deriving them whenever
+    /// the timing model changes — for no gain, because none of them was ever checking
+    /// the cost. `Result::map(StepResult::outcome)` drops it, and the tests that *are*
+    /// about cost use [`StepResult::cycles`] directly.
+    pub const fn outcome(self) -> OutcomeApplication {
+        self.application
+    }
+}
+
+impl From<OutcomeApplication> for StepResult {
+    /// An outcome with no cost, for an engine that did not retire a real instruction.
+    ///
+    /// **This exists for test engines, and it is deliberately not the default way to
+    /// build a `StepResult`.** A test engine that returns `Ok(OutcomeApplication::Halted)`
+    /// without saying what it cost is saying "nothing ran", and this conversion says
+    /// exactly that. A real engine must name its cost with
+    /// [`StepResult::new`], because a real engine's cost is what the guest's clock
+    /// measures and there is no sensible default for it.
+    fn from(application: OutcomeApplication) -> Self {
+        Self {
+            application,
+            cycles: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutcomeError {
     pub pc: InstructionAddress,
