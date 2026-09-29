@@ -359,12 +359,17 @@ impl<D: Device> LazalithMachine<D> {
     /// back to the interpreter with the frame intact, or the program could never
     /// return from it.
     ///
-    /// # Today
+    /// # What exists to switch between
     ///
-    /// One engine exists — [`EngineKind::Reference`] — so this currently replaces an
-    /// engine with the same semantics and discards its private state. It is the
-    /// operation, not the second engine, that this stage establishes; there is no
-    /// JIT in this repository and this does not pretend otherwise.
+    /// **Two engines since B21**: the [`ReferenceInterpreter`], which is the semantic
+    /// authority, and [`lazalith_cpu::FastInterpreter`], which executes the same
+    /// semantics with some redundant validation removed. B21 measured that optimisation
+    /// as worth nothing — which is the argument for a JIT rather than a better
+    /// interpreter. What the second engine is *for* is that B23's handoff can be tested
+    /// against two engines that both actually run, rather than one engine switching to
+    /// itself and proving that assignment works.
+    ///
+    /// There is no JIT in this repository and this does not pretend otherwise.
     pub fn switch_execution_engine(&mut self, kind: EngineKind) -> Result<(), MachineError> {
         if !EngineKind::ALL.contains(&kind) {
             return Err(MachineError::Engine(EngineError::UnknownEngine(kind)));
@@ -379,8 +384,7 @@ impl<D: Device> LazalithMachine<D> {
                 reason: "the machine is faulted, and an engine switch is not a reset",
             }));
         }
-        self.engine.discard_private_state();
-        self.engine = Box::new(engine_for(kind));
+        self.engine = engine_for::<Bus<D>>(kind);
         Ok(())
     }
     pub const fn clock(&self) -> &VirtualClock {
@@ -1284,9 +1288,19 @@ fn sign_extended_payload(config: ArchitectureConfig, payload: i32) -> u64 {
 /// nothing else has to change, and until then there is exactly one thing a name can
 /// mean — which is why a machine can be asked to switch to an engine that does not
 /// exist and be told so rather than silently continuing.
-fn engine_for(kind: EngineKind) -> ReferenceInterpreter {
+/// The engine a machine starts on, and the one a switch installs.
+///
+/// **A `Box<dyn ExecutionEngine>`, so a switch is an assignment and not a rebuild.** B3
+/// made the field a trait object precisely so a second engine could be adopted; B21 adds
+/// the second engine, and the only thing that had to change is this function.
+///
+/// The return type is the trait object rather than an enum of engines because an enum
+/// would make every future engine a variant here *and* in the machine's field, and the
+/// day a JIT arrives that is three places to edit for one engine.
+fn engine_for<M: lazalith_memory::CpuMemory>(kind: EngineKind) -> Box<dyn ExecutionEngine<M>> {
     match kind {
-        EngineKind::Reference => ReferenceInterpreter::new(),
+        EngineKind::Reference => Box::new(ReferenceInterpreter::new()),
+        EngineKind::Optimized => Box::new(lazalith_cpu::FastInterpreter::new()),
     }
 }
 

@@ -9061,3 +9061,182 @@ crate will be gone.
 **B21, optimized interpreter / execution-engine abstractions** (§38) — the Reference
 Interpreter stays the semantic authority, and the first optimisation is measured rather
 than assumed.
+
+---
+
+# B21 — an optimised engine, and a null result (§10)
+
+## The result, first
+
+**B21 measured that optimising the interpreter is worth nothing.** `FastInterpreter`
+skips the reference's duplicate `validate_fetch` and its per-instruction PC
+revalidation, and three runs of the on-demand measurement gave:
+
+```text
+reference 7.63ms / optimised 8.03ms  (0.95x)
+reference 7.57ms / optimised 6.95ms  (1.09x)
+reference 7.23ms / optimised 7.16ms  (1.01x)
+```
+
+The run-to-run spread is wider than any effect the change has. The reason is knowable
+rather than mysterious: `validate_fetch` is a handful of comparisons, and the
+reference's per-step cost is dominated by the `match (opcode, operands)` over an operand
+slice plus the register-file updates around it. Removing two comparisons from that is a
+fraction of a percent.
+
+**§38 says measure rather than hide, so the number is here and the test is named for
+what it found** — `the_measured_difference_between_the_engines_is_within_noise`. That
+test asserts only that neither engine has become *catastrophically* slower. It cannot
+catch the optimisation being removed, because removing it changes nothing observable, and
+a wall-clock assertion in CI that pretends otherwise would be the alternative.
+
+**This null result is the argument for B22.** The only remaining way to make LZA
+execution materially faster is to stop interpreting it.
+
+## What the stage delivered instead
+
+**A second working engine with identical semantics, differentially checked.** That is
+what B23 needs *before* a JIT exists: two engines that both actually run, so a handoff
+can be tested against something other than one engine switching to itself and proving
+that assignment compiles.
+
+`FastInterpreter` is a `Copy` struct with one `bool` of private scheduling state, and
+that `bool` is about *the engine's own work* — "did I already check this address" — not
+anything about the guest. It holds no architectural state, which is what B3's
+`no_execution_engine_owns_the_architectural_state` test looks for.
+
+**The two removals it makes, and the one check it does not make:**
+
+- one `validate_fetch` per instruction instead of two — the reference calls it in `step`
+  and again at the top of `execute_application`, with nothing in between that could have
+  changed the answer;
+- no PC revalidation within a straight-line run — the address checks are a function of
+  the PC alone, and `pc + instruction_width` from a valid `pc` is valid;
+- **the trap-state and halted checks are never skipped**, because they depend on the
+  processor rather than the address, and a guest that takes a trap changes them between
+  one instruction and the next.
+
+**It does not re-implement the instruction semantics.** Every instruction is executed by
+the reference's own `execute_application`, now reachable from both engines. An optimised
+engine carrying its own copy of the arms would be a second implementation of the ISA,
+and §10 makes the Reference Interpreter the authority — a second implementation does not
+become the authority by being faster, it becomes a second thing that can be wrong.
+
+## The machine can now be switched onto it, and B3's field is what made it free
+
+`switch_execution_engine` already existed and `engine` was already
+`Box<dyn ExecutionEngine<Bus<D>>>` — B3 extracted the field for exactly this. The only
+change was `engine_for`, which returns a boxed trait object instead of a
+`ReferenceInterpreter`, so a switch is an assignment and not a rebuild. An enum of engines
+would have made every future engine a variant in two places.
+
+`EngineKind` gained `Optimized`, so `EngineKind::ALL` and the machine's refusal path both
+know about it.
+
+## Two things the tests found, and one of them is a B23 prerequisite
+
+### The engines differ in a way that is not guest-visible
+
+The first version of the machine-level comparison asserted whole `Observation` values
+equal, and failed: a `CpuFault` carries a `Location` naming the `.rs` file and line it
+was raised at, and the reference raises it in `interpreter.rs` while the optimised engine
+raises it in `fast.rs`.
+
+That is a fact about this repository's source and not about the machine — no guest can
+observe it, and §10 asks for *guest-visible* behaviour to be preserved. The comparison
+now cuts the location and compares everything else exactly: cause, address, access, size,
+resume PC, the double-trap that follows, the registers, PC, SP, status, halt, trap,
+**virtual time**, and console output. The cut is written out in `without_site` rather
+than hidden in a helper called `normalize`.
+
+### A faulted machine cannot be switched, and B23 needs it to be
+
+`switch_execution_engine` refuses a `MachineState::Faulted` machine with "an engine switch
+is not a reset" — a deliberate B3 decision. But **B23 requires handing a faulted program
+back to an interpreter**, and a JIT that cannot do that could never return control from a
+guest fault.
+
+This is recorded as a **B23 prerequisite** rather than fixed here, because the rule is
+B3's and relaxing it is B23's question. The machine-level test does not switch while the
+machine is faulted, and says so in a comment pointing at the prerequisite.
+
+### A benchmark against a memory the system never uses
+
+The first measurement ran against `support::Ram`, whose `fetch_instruction_cached` was
+the trait default and so decoded every instruction on every step. That measures the
+decoder, not the engines — and it made the optimised engine look 5% *slower* than the
+reference, before the cache was added and the number came back to noise.
+
+`lazalith_memory::Bus` caches decoded instructions, so the test's memory now does too.
+A benchmark run against a memory the system never uses produces a number that is true and
+useless.
+
+## Reaching a PC the fast path must refuse took three attempts
+
+The safety property — a step after a control transfer still validates the address it
+fetches from — took three tries, and the two failures are worth recording because each
+was a test that **passed against a build with the check removed entirely**, which is
+worse than no test.
+
+**A branch cannot reach a bad address.** Its target is `next_pc + displacement * 4`,
+always a multiple of four, and four *is* LZA's `instruction_alignment`. A test asserting
+that a branch to address 12 faulted did not fault.
+
+**A branch far outside the address space cannot either.** Such a fetch faults as unmapped
+on both engines whether the PC was validated or not, so it cannot distinguish a correct
+fast path from a broken one.
+
+**`JMP r` can**, because its target is a register. Two is off the four-byte grid, the bus
+will happily fetch eight bytes from there, and the only thing that refuses it is the PC
+check the fast path skips. The refusal happens at the *transfer*, not at the next fetch —
+which is why the test takes two steps rather than one.
+
+The general argument, which the test now backs: **every program counter that reaches a
+fetch is already valid.** Either a transfer produced it, and every transfer validates its
+target through the outcome path, or an increment produced it, and `pc + width` from a
+valid `pc` is valid.
+
+## The control-transfer list is checked against behaviour
+
+`FastInterpreter::control_transfers` is the safety condition for the second optimisation,
+and `the_control_transfer_list_is_not_missing_anything_that_moves_the_pc` runs each
+opcode through the reference and checks whether the PC simply advanced. One inaccuracy
+was found and removed while writing it: a branch with a displacement of zero *lands on
+the next instruction*, so a reverse check ("everything in the list really does transfer")
+is not decidable this way. The forward direction is the one whose absence is a
+correctness bug, and that is the one checked.
+
+## Tests
+
+- `crates/lazalith-cpu/tests/speed.rs` — 5 tests: per-instruction agreement over a
+  20,000-instruction program; per-opcode cost and fault parity across every encodable
+  opcode; the control-transfer list against the reference; the transfer-to-a-misaligned-
+  address case; the timing bound. Plus an `#[ignore]`d measurement that prints the
+  numbers on demand.
+- `crates/lazalith-machine/tests/differential.rs` — the corpus runner now takes an engine
+  kind and **switches on every other step**, so `the_machine_runs_identically_on_either_
+  engine` hands the architectural state from one engine to the other and back repeatedly
+  and still matches a reference-only run, memory included.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1661 passed, 0 failed** (6 new)
+- `nix flake check`, `nix build` ✅
+
+## Limitations at the end of this stage
+
+1. **The optimisation is worth nothing measurable**, which is this stage's finding rather
+   than a failure of it. B22 is what the finding argues for.
+2. **A `Faulted` machine cannot switch engines**, and B23 will have to answer whether that
+   rule survives.
+3. **No JIT**, unchanged. The two engines are both interpreters.
+4. **The timing assertion is a regression guard, not a measurement** — it cannot detect
+   the optimisation being removed, and says so.
+5. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B22, a real JIT** (§11) — host-native code that actually executes LZA instructions,
+with the canonical VM state staying where B3 put it.

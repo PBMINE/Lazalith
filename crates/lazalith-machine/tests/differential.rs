@@ -47,13 +47,13 @@
 //! about whether an access faulted disagree about the program's behaviour.
 
 use lazalith_cpu::{
-    ArchitecturalState, CpuFault, CpuFaultCause, CpuMemory, DataAccess, DataAccessKind,
+    ArchitecturalState, CpuFault, CpuFaultCause, CpuMemory, DataAccess, DataAccessKind, EngineKind,
     ExecutionEngine, OutcomeApplication, Privilege, Processor, ReferenceInterpreter, StepResult,
     TrapCause,
 };
 use lazalith_devices::{ConsoleDevice, DeviceId, DeviceManager};
 use lazalith_isa::{DataSize, Instruction, Opcode, Operand, encode};
-use lazalith_machine::{LazalithMachine, MachineEvent, MachineSetup};
+use lazalith_machine::{LazalithMachine, MachineEvent, MachineSetup, MachineState};
 use lazalith_memory::{AccessType, MemoryFault, MemoryRegion, RegionPermissions};
 use lazalith_properties::{Case, Gen, SEEDS};
 use lazalith_types::{
@@ -338,6 +338,15 @@ fn run_bare(program: &Program, steps: u64) -> (Vec<Observation>, Vec<Vec<u8>>) {
 
 /// Runs a program on the machine and records what it did, step by step.
 fn run_machine(program: &Program, steps: u64) -> (Vec<Observation>, Vec<Vec<u8>>) {
+    run_machine_on_engine(program, steps, EngineKind::Reference)
+}
+
+/// Runs `program` on a machine whose engine is `kind`, switched on every step.
+fn run_machine_on_engine(
+    program: &Program,
+    steps: u64,
+    kind: EngineKind,
+) -> (Vec<Observation>, Vec<Vec<u8>>) {
     let mut devices = DeviceManager::new();
     devices
         .insert(
@@ -404,7 +413,22 @@ fn run_machine(program: &Program, steps: u64) -> (Vec<Observation>, Vec<Vec<u8>>
         .expect("a trap vector inside the code region");
     let mut observations = Vec::new();
     let mut memory_watch = Vec::new();
-    for _ in 0..steps {
+    for step in 0..steps {
+        // Switched on every other step, so the architectural state crosses the engine
+        // boundary repeatedly rather than once.
+        //
+        // **Not while the machine is faulted, and that is a B3 decision this stage
+        // leaves alone.** `switch_execution_engine` refuses a `Faulted` machine with
+        // "an engine switch is not a reset", and a program that faults into a machine
+        // with no way to enter a trap frame is genuinely dead. Relaxing that rule is
+        // B23's question, not B21's, and it is recorded as a B23 prerequisite in
+        // `docs/project-state.md` — a JIT cannot hand a faulted program back to an
+        // interpreter while this rule stands, so B23 will have to answer it.
+        if step % 2 == 0 && machine.state() != MachineState::Faulted {
+            machine
+                .switch_execution_engine(kind)
+                .expect("the engine switches between steps");
+        }
         let event = machine.step();
         observations.push(observe_machine(&machine, &event));
         let mut seen = Vec::new();
@@ -1097,5 +1121,117 @@ fn trap_cause_name(cause: &TrapCause) -> String {
         TrapCause::SoftwareTrap => String::from("software"),
         TrapCause::Syscall => String::from("syscall"),
         other => format!("{other:?}"),
+    }
+}
+
+// -- B21: the two engines are interchangeable, and the machine says so -------
+
+/// A fault description with the Rust source location removed.
+///
+/// **Two engines genuinely differ here, and it is not a guest-visible difference.** A
+/// `CpuFault` carries a `Location` naming the `.rs` file and line it was raised at, and
+/// the reference raises it in `interpreter.rs` while the optimised engine raises it in
+/// `fast.rs`. That is a fact about this repository's source, not about the machine: no
+/// guest can observe it, and §10 asks for *guest-visible* behaviour to be preserved.
+///
+/// So the location is cut before the two are compared, and the cut is written out here
+/// rather than hidden inside a helper called `normalize`. Everything else about the fault
+/// — its cause, the address, the access, the size, the resume PC, and the double-trap
+/// that follows — is still compared exactly.
+fn without_site(fault: &Option<String>) -> Option<String> {
+    fault
+        .as_ref()
+        .map(|text| match text.find(", site: Location") {
+            Some(at) => text[..at].to_string(),
+            None => text.clone(),
+        })
+}
+
+/// The machine runs the same program identically on either engine.
+///
+/// **This is §10's "the VM must not care whether execution is performed by the
+/// interpreter or JIT", checked for the two engines that exist.** The engine is switched
+/// before every step, so the architectural state is handed from one engine to the other
+/// and back over and over, and the observations still match a run that never switched.
+///
+/// Compared against the *reference-only* run rather than against another switched run, so
+/// the oracle is the engine §10 makes authoritative and not a second opinion from the
+/// same code path.
+#[test]
+fn the_machine_runs_identically_on_either_engine() {
+    for config in MODES {
+        for program in curated(config) {
+            let (reference, reference_memory) = run_machine(&program, 32);
+            let (optimized, optimized_memory) =
+                run_machine_on_engine(&program, 32, EngineKind::Optimized);
+            assert_eq!(
+                reference.len(),
+                optimized.len(),
+                "the two engines stopped at different steps for {}",
+                describe(&program)
+            );
+            for (index, (a, b)) in reference.iter().zip(optimized.iter()).enumerate() {
+                assert_eq!(
+                    a.registers,
+                    b.registers,
+                    "step {index} of {}: the engines left different registers",
+                    describe(&program)
+                );
+                assert_eq!(
+                    a.pc,
+                    b.pc,
+                    "step {index} of {}: different PCs",
+                    describe(&program)
+                );
+                assert_eq!(
+                    a.sp,
+                    b.sp,
+                    "step {index} of {}: different SPs",
+                    describe(&program)
+                );
+                assert_eq!(
+                    a.flags,
+                    b.flags,
+                    "step {index} of {}: different status registers",
+                    describe(&program)
+                );
+                assert_eq!(
+                    a.halted,
+                    b.halted,
+                    "step {index} of {}: one halted and the other did not",
+                    describe(&program)
+                );
+                assert_eq!(
+                    a.trapped,
+                    b.trapped,
+                    "step {index} of {}: one trapped and the other did not",
+                    describe(&program)
+                );
+                assert_eq!(
+                    a.time,
+                    b.time,
+                    "step {index} of {}: the engines charged different virtual time",
+                    describe(&program)
+                );
+                assert_eq!(
+                    a.console,
+                    b.console,
+                    "step {index} of {}: the devices saw different output",
+                    describe(&program)
+                );
+                assert_eq!(
+                    without_site(&a.fault),
+                    without_site(&b.fault),
+                    "step {index} of {}: the engines failed differently",
+                    describe(&program)
+                );
+            }
+            assert_eq!(
+                reference_memory,
+                optimized_memory,
+                "and the two engines left memory differently for {}",
+                describe(&program)
+            );
+        }
     }
 }

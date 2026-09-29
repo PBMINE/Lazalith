@@ -62,7 +62,20 @@ impl Error for MemoryError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ram {
-    bytes: Vec<u8>,
+    /// Public so a differential test can compare two memories after every step.
+    ///
+    /// **Not a shortcut.** The point of that comparison is that the two engines wrote
+    /// the same bytes; a private field would mean asking `Ram` to report its own
+    /// equality, which is a different and weaker claim.
+    pub bytes: Vec<u8>,
+    /// Decoded instructions, by address — the cache `lazalith_memory::Bus` keeps.
+    ///
+    /// **Here so a benchmark is representative rather than pessimistic.** The real bus
+    /// caches decoded instructions and a memory without a cache makes every engine
+    /// decode every instruction every step, which measures the decoder rather than the
+    /// thing being compared. A benchmark run against a memory the system never uses
+    /// produces a number that is true and useless.
+    pub decoded: std::collections::HashMap<usize, lazalith_isa::Instruction>,
     pub readable: bool,
     pub writable: bool,
     pub executable: bool,
@@ -76,6 +89,7 @@ impl Default for Ram {
     fn default() -> Self {
         Self {
             bytes: vec![0; 512],
+            decoded: std::collections::HashMap::new(),
             readable: true,
             writable: true,
             executable: true,

@@ -51,6 +51,15 @@ use lazalith_isa::Instruction;
 pub enum EngineKind {
     /// The reference interpreter. The semantic authority, and always present.
     Reference,
+    /// An optimised interpreter with the same semantics, checked against the reference
+    /// step for step.
+    ///
+    /// **Present since B21, and never the authority.** §10 makes the Reference
+    /// Interpreter the semantic oracle; this is the same ISA executed with some
+    /// redundant work removed, and the only thing that makes it trustworthy is that
+    /// `crates/lazalith-cpu/tests/speed.rs` compares it against the reference after
+    /// every instruction.
+    Optimized,
 }
 
 impl EngineKind {
@@ -58,11 +67,12 @@ impl EngineKind {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Reference => "reference",
+            Self::Optimized => "optimized",
         }
     }
 
     /// Every engine this build has, in the order the machine reports them.
-    pub const ALL: &'static [EngineKind] = &[Self::Reference];
+    pub const ALL: &'static [EngineKind] = &[Self::Reference, Self::Optimized];
 }
 
 impl fmt::Display for EngineKind {

@@ -53,7 +53,7 @@ impl ReferenceInterpreter {
         instruction: &Instruction,
         memory: &mut M,
     ) -> Result<StepResult, CpuFault<M::Error>> {
-        let application = self.execute_application_body(processor, instruction, memory)?;
+        let application = self.execute_application(processor, instruction, memory)?;
         Ok(StepResult::new(application, instruction.opcode().cycles()))
     }
 }
@@ -126,7 +126,23 @@ impl ReferenceInterpreter {
     /// Ok(OutcomeApplication::...)` sites in the body below do not each have to know
     /// what the instruction cost.** Every one of them returns the outcome; the cost is
     /// attached once, by `execute_checked`, from the instruction that produced them.
-    fn execute_application_body<M: CpuMemory>(
+    pub(crate) fn execute_application<M: CpuMemory>(
+        &mut self,
+        processor: &mut Processor,
+        instruction: &Instruction,
+        memory: &mut M,
+    ) -> Result<OutcomeApplication, CpuFault<M::Error>> {
+        // Delegate to the one copy of the semantics.
+        self.execute_application_inner(processor, instruction, memory)
+    }
+
+    /// The instruction semantics, in one place.
+    ///
+    /// **Private, and reached by both engines.** `FastInterpreter` calls this rather
+    /// than having arms of its own, so the optimised engine cannot drift from the
+    /// reference: there is one copy of what an instruction means, and the only thing
+    /// the fast engine changes is what work happens *around* it.
+    fn execute_application_inner<M: CpuMemory>(
         &mut self,
         processor: &mut Processor,
         instruction: &Instruction,

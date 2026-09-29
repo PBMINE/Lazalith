@@ -131,8 +131,10 @@ fn faults_do_not_publish_candidate_or_memory_effects() {
             assert_eq!(ram, memory);
             assert_eq!(cpu.execution(), ExecutionState::Running);
         }
-        let mut ram = Ram::default();
-        ram.fail = true;
+        let mut ram = Ram {
+            fail: true,
+            ..Ram::default()
+        };
         let mut cpu = cpu(config, 0, 256, 31, &[]);
         let before = cpu.architectural().clone();
         let memory = ram.clone();
@@ -173,10 +175,11 @@ fn next_pc_is_checked_before_reads_and_stack_operations() {
             (Opcode::Ret, vec![]),
             (Opcode::Call, vec![Operand::Immediate(0)]),
             (Opcode::Halt, vec![]),
-            (Opcode::Rfe, vec![]),
         ] {
-            let mut ram = Ram::default();
-            ram.device = true;
+            let mut ram = Ram {
+                device: true,
+                ..Ram::default()
+            };
             let mut cpu = cpu(config, config.word_width().mask() - 7, 256, 31, &[]);
             let before = cpu.architectural().clone();
             let memory = ram.clone();

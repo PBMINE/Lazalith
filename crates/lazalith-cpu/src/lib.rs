@@ -3,6 +3,7 @@
 extern crate alloc;
 
 mod engine;
+mod fast;
 mod fault;
 mod interpreter;
 mod memory;
@@ -11,6 +12,7 @@ mod processor;
 mod trap;
 
 pub use engine::{EngineError, EngineKind, ExecutionEngine};
+pub use fast::FastInterpreter;
 pub use fault::{CpuFault, CpuFaultCause, FaultOrigin};
 pub use interpreter::ReferenceInterpreter;
 pub use memory::{CpuMemory, DataAccess, DataAccessError, DataAccessKind, FetchedInstruction};

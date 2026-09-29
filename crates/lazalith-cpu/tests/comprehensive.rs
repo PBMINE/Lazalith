@@ -497,8 +497,10 @@ fn data_faults_validate_ranges_permissions_and_transactions_without_effects() {
                 ));
             }
         }
-        let mut ram = Ram::default();
-        ram.device = true;
+        let mut ram = Ram {
+            device: true,
+            ..Ram::default()
+        };
         let mut machine = cpu(config, 0, 256, 31, &[(0, 128)]);
         run(
             &mut machine,
@@ -578,8 +580,10 @@ fn calls_returns_and_jumps_obey_stack_and_subsequent_fetch_policy() {
 #[test]
 fn stack_fault_priority_and_pure_return_peek_prevent_partial_effects() {
     for config in MODES {
-        let mut ram = Ram::default();
-        ram.device = true;
+        let mut ram = Ram {
+            device: true,
+            ..Ram::default()
+        };
         let mut machine = cpu(config, 0, 0, 31, &[(1, 3)]);
         let cause = unchanged(&mut machine, &mut ram, Opcode::Callr, &[r(1)]);
         assert!(matches!(
@@ -777,8 +781,10 @@ fn decode_mode_fetch_errors_retain_context_and_typed_sources() {
             assert_eq!(machine.architectural(), &before);
             assert_eq!(ram, memory);
         }
-        let mut ram = Ram::default();
-        ram.readable = false;
+        let mut ram = Ram {
+            readable: false,
+            ..Ram::default()
+        };
         ram.code(4, config, Opcode::Nop, &[]);
         let mut machine = cpu(config, 4, 256, 63, &[]);
         assert_outcome!(
