@@ -10,6 +10,7 @@ mod graphics;
 pub mod host_input;
 pub mod input;
 mod input_backend;
+mod net;
 mod storage;
 pub mod timer;
 pub use audio::{
@@ -56,6 +57,15 @@ pub use input_backend::usb;
 pub use input_backend::{
     AbsentInputBackend, InputBackend, InputBackendError, InputProfile, InputPump,
     ScriptedInputBackend, pump_input,
+};
+pub use net::{
+    LazFrame, MAX_FRAME_BYTES, MTU, NET_ABI_VERSION, NET_CONTROL_INTERRUPTS, NET_CONTROL_TX_ACTIVE,
+    NET_CONTROL_TX_COMMIT, NET_CONTROL_UP, NET_REGISTER_BYTES, NET_REGISTER_CONTROL,
+    NET_REGISTER_MAC_HIGH, NET_REGISTER_MAC_LOW, NET_REGISTER_RX_DATA, NET_REGISTER_RX_LENGTH,
+    NET_REGISTER_STATUS, NET_REGISTER_TX_DATA, NET_REGISTER_TX_LENGTH, NET_SNAPSHOT_BYTES,
+    NET_STATUS_LINK_DOWN, NET_STATUS_RX_READY, NET_STATUS_TX_READY, NET_STATUS_TX_REFUSED,
+    NetError, NetworkBackend, NetworkDevice, NullNetworkBackend, PumpOutcome, RX_QUEUE_FRAMES,
+    RecordingNetworkBackend, TX_BUFFER_BYTES, TransmitOutcome,
 };
 pub use storage::{
     BLOCK_ABI_VERSION, BLOCK_REGISTER_BYTES, BLOCK_REGISTER_CAPACITY, BLOCK_REGISTER_COMMAND,

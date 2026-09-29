@@ -7410,3 +7410,138 @@ produced length against the declared constant, which now exists in both places.
 **B11, networking architecture** (§32). The fourth of §26's device directions, and the
 first one with a *two-way* stream: a host socket in, a guest NIC out, with a host that
 may be slow, may refuse, and may be a different machine than the guest believes.
+
+---
+
+# B11 — networking architecture
+
+`binstruction.md` §32, and §25's "Standard Computer Hardware → network". Preceded by
+`98a41c4` (B10).
+
+## What was already there, confirmed
+
+- No network device of any kind. §32 was entirely unimplemented.
+- B10's `Device::take_interrupt`, which a network needs and which therefore cost nothing.
+
+## The design, and the one property it turns on
+
+§32 draws `Guest NIC → Lazalith NIC → host backend` and names five host backends —
+NAT, user-mode, bridged, host-only, tap/socket — as "host-side implementation details".
+
+A network is the **fourth** shape and the first two-way one. B7's display is pulled, B9's
+input is pushed, B10's audio has a rate. A network sends without being asked and receives
+without expecting, and the host may be slow, may refuse, or may be a different machine
+from the one the guest believes it is on.
+
+So a guest's transmit gets one of three answers:
+
+- **Accepted** — a frame left the guest and reached the host;
+- **Refused** — the host would not take it, and the guest is told *why*;
+- **Dropped** — it is gone, and somebody is told.
+
+**There is no "sent".** `NetworkDevice` has **no method that completes a transmit
+without a `&mut dyn NetworkBackend`**, so a device reporting "sent" on its own could not
+be written. A device that reported a transmit complete when the host had not accepted the
+frame would tell a guest a packet was delivered that never left the machine — and a
+network stack would retransmit nothing, because nothing looks wrong.
+
+`NullNetworkBackend::send` returns `Ok(false)`, not `Ok(true)`, and that is the point: a
+machine with no network has nowhere to put a frame, and a guest that believes otherwise
+will not retransmit it.
+
+## A frame is opaque, and that is a decision
+
+§32 does not name a link-layer format. `LazFrame` is a length and bytes, deliberately.
+
+An `Ethernet`-shaped frame would have decided the link layer *inside the guest-visible
+device*, where every later decision inherits it — and §32's own words are that the
+link-level concerns are host-side implementation details. A guest that wants Ethernet
+framing builds one; the device carries octets.
+
+`MAX_FRAME_BYTES` is 1514 and `MTU` is 1500, and the device refuses a larger frame
+because a host receiving one from a bridge will already have dropped it: a device that
+accepted it would be accepting a frame the network will never deliver.
+
+## A frame is a port, not a buffer — for the fourth time
+
+`Device` gives a device its registers and no access to guest memory, so a frame moves
+through a data port one access at a time. That is B5's block device and B10's audio
+device reaching the same conclusion independently, and the reason is always the same: a
+device that could name a guest address would be a device that could be pointed at
+anything.
+
+## Two real bugs, both in the control register
+
+Both were found by the test that drives the device **through MMIO** rather than through
+its Rust methods, which is the test that has to exist for a device a guest will use.
+
+1. **Begin-then-clear.** The control write called `begin_transmit` and then cleared
+   `TX_ACTIVE` in the same arm, so the transmit was unset before the guest could write a
+   byte into it. A guest could start a frame and not be able to put anything in it.
+2. **Commit-abandons.** The first fix cleared `TX_ACTIVE` whenever `TX_COMMIT` was
+   written, so committing a frame abandoned it. The arm now has **three written-out
+   cases** — begin, commit, abandon — because two of them were got wrong first and the
+   bit arithmetic was not the problem.
+
+`NET_CONTROL_TX_COMMIT` exists because of the first version: `commit_transmit` is a Rust
+call, so a guest driving the device through registers could assemble a frame and had no
+way to say "that is all of it". The guest sets the bit; the **host** pumps. Nothing
+transmits from inside a register write.
+
+## Loss is counted, never silent
+
+A network drops packets; that is what a network does. A receive queue of sixteen frames
+is about 120 µs of a 1 Gb link — longer than a guest scheduling quantum — and when it
+fills, the frames the host delivered that did not fit are counted in `dropped()`.
+
+The unacceptable thing is not the loss; it is a host that fills a queue and discards
+without saying so. `a_full_receive_queue_drops_and_counts` asserts the **exact** count
+rather than `> 0`, because a counter that over-reports is as useless as one that
+under-reports.
+
+## Invariants
+
+No new architecture test: B11's properties are all *behavioural* — a type that cannot be
+written wrong is better than a source check, and the boundary here is a method signature
+rather than an absence. `the_display_device_holds_no_backend` and its input sibling
+remain the shape checks; the network's equivalent is that `commit_transmit` requires a
+backend, which the compiler enforces.
+
+## Tests
+
+`crates/lazalith-devices/tests/net.rs`, 18 tests: the three transmit outcomes attacked
+separately, an empty transmit refused, a full staging buffer refused rather than
+truncated, a bounded pump, the two-way path, loss counting, the interrupt edge, register
+access through MMIO, a peek that does not consume, and the snapshot's exclusion of
+packets.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1481 passed, 0 failed**
+- `nix flake check`, `nix build`, `actionlint` ✅
+
+## Limitations at the end of this stage
+
+1. **No host network backend.** `NullNetworkBackend` and `RecordingNetworkBackend` stand
+   in. §32's five host backends are all unimplemented, and none of them is trivial: a
+   user-mode backend needs a host socket, a bridged one needs a host interface.
+2. **No MAC address.** `address()` returns `Vec<u8>` from the host and the two MAC
+   registers read zero, because a `u64` MAC would have decided the link is 48-bit
+   Ethernet — the decision §32 declines to make. A host that has an address has no way to
+   publish it to a guest yet.
+3. **Frames go through a port, one access at a time.** No DMA, for B10's reason: a device
+   has no way to reach guest memory. A 1500-byte frame is 188 register accesses.
+4. **No interrupts on transmit.** Only a waiting receive frame raises one. A guest that
+   wants to know its frame left polls `NET_STATUS_TX_REFUSED`.
+5. **No link-state change notification.** `commit_transmit` reads the link state; a
+   backend whose link goes down mid-pump is not watched between pumps.
+6. **No PIO**, unchanged since B4. Blocks B9's PS/2, B12's bus and B27's AT machine.
+7. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B12, expansion bus / device discovery** (§33). The stage several things above are now
+waiting on: PIO, USB (§30), and B27's compatibility machine all need a bus, and §33 says a
+native Lazalith expansion bus may come before PCI.
