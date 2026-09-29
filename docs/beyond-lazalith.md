@@ -50,8 +50,8 @@ Host implementations may change. Guest-visible semantics do not.
 | B1 | LZA architecture naming / contract freeze | **done** — `docs/architecture.md`, `docs/lza64.md`, `docs/virtual-machine.md` |
 | B2 | GitHub CI/CD and repository automation foundation | **done** — `.github/`, `docs/ci-cd.md` |
 | B3 | VM core / execution-engine boundary extraction | **done** — `Processor` + `ExecutionEngine`, tested |
-| B4 | machine profiles | designed, not built — `docs/machine-profiles.md` |
-| B5 | device frontend/backend model separation | designed, not built — `docs/device-model.md` |
+| B4 | machine profiles | **done** — heterogeneous device set, `MachineProfile`, `lza64-native-v1`; `docs/machine-profiles.md` |
+| B5 | device frontend/backend model separation | designed, not built — `docs/device-model.md` §5. **Next.** |
 | B6 | common VM lifecycle / reset / boot contracts | **partly present**; see §4 |
 | B7 | native display architecture | **present**; §4 |
 | B8 | storage architecture | not started |
@@ -149,6 +149,52 @@ one.
 
 ---
 
+### B4 — machine profiles, and the heterogeneous device set they need
+
+A profile cannot describe a device *inventory* while `DeviceManager` holds one
+concrete device type, so B4 was two things, in that order.
+
+**First, the device set.** `Box<dyn Device>` now implements `Device`, forwarding
+all ten methods. `DeviceManager<Box<dyn Device>>` is a `DeviceManager` of some
+`D: Device`, and every generic in `lazalith-memory` and `lazalith-machine` was
+already written in terms of `D`. **Not one existing call site changed.**
+`LazalithMachine<ConsoleDevice>` is still monomorphic, and `NoDevice` still means
+*a machine that cannot hold a device at all* — a stronger statement than an empty
+erased list, and the reason the Phase-I path is untouched rather than merely
+working.
+
+**Then the profile.** `MachineProfile` with a versioned `ProfileName`
+(`lza64-native-v1`), the machine's `LZA64_LAYOUT`, a device inventory, a timer and
+a compatibility class. `validate()` refuses a profile before a machine is built;
+`LazalithMachine::from_profile` builds one and maps every window;
+`matches_profile` checks the result is the machine the profile described.
+
+**The duplication this removed.** `KERNEL_IMAGE_LENGTH` and `KERNEL_INITIAL_SP`
+were each declared twice before B4 — once in `lazalith-boot`, once in
+`lazalith-os` — with the same values. That is the failure that mattered: a change
+to one would leave one crate describing a kernel window of one size and the other
+of another, and the symptom would be a kernel loaded somewhere it does not fit.
+The geometry now has one definition and both crates re-export it, held by
+`the_machine_geometry_is_defined_once` — which greps for a *literal*, not for a
+name, because a rule that greps for the identifier cannot tell a re-export from a
+redefinition and would be a rule that cannot fail.
+
+**What is true:** a machine built from `lza64-native-v1` holds a console and a
+timer, a *guest program* on such a machine reads four different device windows in
+one run and gets four different answers, and a profile describing two displays is
+valid because the inventory is a list.
+
+**What is not:** `lza64-virt-v1` and `lza64-at-v1` are nameable and **refused**.
+There is no backend layer, no storage, no audio, no network, no PIO space. `B4` did
+not change the `Device` trait.
+
+**One thing B4 got wrong and removed.** The first validation refused
+writable-and-executable RAM. The memory model builds what it is given, several
+Phase-I OS tests use executable RAM for code, and a test that needed a code region
+failed on the rule. A profile that refuses something the platform genuinely has
+would be inventing a policy; the rule is gone and the reason is in
+`docs/machine-profiles.md` §6.
+
 ## 4. What Phase I already satisfies
 
 Several roadmap stages ask for something that exists and works, arrived at from a
@@ -189,13 +235,15 @@ architecture → automation → VM abstraction → machine/device foundations
   → target-side OS → compatibility machine → Linux 0.01 port
 ```
 
-B1, B2 and B3 are the first three links and are now done. The next link is
-**B4, machine profiles**, and the reason is dependency order rather than appeal:
+B1 through B4 are the first four links and are now done. The next link is **B5,
+the device frontend/backend split**, and the reason is dependency order rather
+than appeal:
 
-- B5 (device frontend/backend) needs a thing to attach backends to. A machine
-  profile is the description of *what is attached* — architecture, CPU, RAM,
-  firmware, interrupt model, timers, device inventory, MMIO map. Building B5 first
-  means inventing a shape for that description twice.
+- B5 needs a thing to attach backends to, and B4 built it. A profile is the
+  description of *what is attached*; a backend is *how it reaches the host*. B4
+  made the first exist and made the device set able to hold several kinds, which
+  is what a per-device backend requires. B5 first would have meant inventing that
+  description twice.
 - B8/B10/B11 (storage, audio, networking) each need somewhere to say "this
   machine has a disk and this is its backend". That is the profile.
 - B13 (firmware/boot profiles) is *defined* by the profile, not alongside it.
@@ -204,13 +252,25 @@ B1, B2 and B3 are the first three links and are now done. The next link is
 - B27 (`lza64-at-v1`) is a profile plus a compatibility device set, and it is
   three stages away from the Linux port that consumes it.
 
-So B4 is next, and it is small: a versioned, serialisable description of a machine,
-and a check that a machine built from a profile matches its description.
+So B5 is next, and its first question is the one B4 deliberately left open: **a
+backend is a host resource, and nothing in the platform yet distinguishes a host
+resource from a device register.** `docs/device-model.md` §5 has the proposed shape
+and the three rules it has to obey — a backend is never a guest interface, a
+snapshot names the device's state and not the backend's, and a backend that cannot
+do something a guest asked for says so as a device fault rather than emulating
+badly.
+
+Two things B4 left open on purpose, because they belong to B5 rather than to a
+profile: **PIO** (`binstruction.md` §25 lists a PIO map as a profile property and
+LZA has none — `docs/linux-0.01-port.md` §3.2 makes it the largest single item in
+that port), and **whether a profile has an on-disk encoding** (a serialised
+profile is a management API's input, and that API is B19).
 
 **B2 changed the cost of everything that follows.** A new subsystem now has to add
-its tests to a job rather than to a developer's memory, so the next session should
-add whatever the new stage needs to `.github/workflows/` in the same commit that
-adds the code — not afterwards.
+its tests to a job rather than to a developer's memory. B4 did this: the
+`architecture` job in `.github/workflows/ci.yml` now names the profile round trip
+and the geometry tests individually, so a failure reads as a profile failure
+rather than as "a test failed somewhere". The next session should do the same.
 
 ---
 

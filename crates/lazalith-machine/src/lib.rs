@@ -4,6 +4,11 @@ extern crate alloc;
 
 mod interrupts;
 pub use interrupts::InterruptController;
+mod profile;
+pub use profile::{
+    Compatibility, DeviceClass, DeviceProfile, LZA64_LAYOUT, MachineLayout, MachineProfile,
+    ProfileError, ProfileFamily, ProfileName, ProfiledMachine, RegionProfile,
+};
 
 use alloc::{boxed::Box, collections::TryReserveError, vec::Vec};
 use core::{error::Error, fmt};

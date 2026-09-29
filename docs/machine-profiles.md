@@ -3,10 +3,10 @@
 `binstruction.md` §27 asks for versioned machine profiles, and §53 places them at
 **B4** — immediately after the VM core boundary, before the device model split.
 
-**Status: designed, not built.** This document is the design and the reasons for it.
-It is written before the code on purpose: a profile format is a compatibility
-promise, and a format that has been used once is much harder to change than one
-that has never been used.
+**Status: B4 is implemented.** The heterogeneous device set, the profile type, the
+validation, `LazalithMachine::from_profile`, and `lza64-native-v1` all exist and
+are tested. `lza64-virt-v1` and `lza64-at-v1` are designed and not built; §4 and
+§7 say why and what each is waiting on.
 
 ---
 
@@ -19,7 +19,7 @@ architecture
 CPU
 RAM
 firmware
-boot behaviour
+boot behavior
 interrupt model
 timer
 device inventory
@@ -30,188 +30,208 @@ storage
 serial
 network
 audio
-compatibility behaviour
+compatibility behavior
 ```
 
-**And it must be versioned to preserve guest compatibility.** That last clause is
-the whole design constraint. A profile is not a configuration file; it is the
-*statement of what a machine is*, and a guest that booted on `lza64-virt-v1` must
-still boot on it after the implementation changes. So a profile is addressed by
-name **and version**, the version is part of the identity, and an incompatible
-change is a new name-version rather than an edit.
+**And it must be versioned to preserve guest compatibility.**
 
----
+**Fact — how the list maps onto the type.** §27 lists the MMIO/PIO map *and*
+display, input, storage, serial, network and audio as separate items. They are not
+separate: a display is a device at an address. So `MachineProfile` has one
+`devices` list, and `device_of` / `devices_of` are how a caller asks "where is the
+display". A profile that also had a `display:` field could describe two different
+machines, and the disagreement would not be a build error — it would be a machine
+that boots and then draws nowhere.
 
-## 2. Why it is the next stage, and not an earlier one
-
-**The dependency argument**, which is the reason and not a preference:
-
-- **B5, the device frontend/backend split, needs something to attach backends
-  to.** A backend answers "how does this guest block device reach storage". The
-  profile is what says "this machine has a block device, and its backend is a
-  copy-on-write layer over a raw image". Doing B5 first means inventing that
-  description and then moving it.
-- **B8, B10, B11 (storage, audio, networking) each need it.** Each of those is a
-  guest device plus a host backend, and "which backends, and of what kind" is a
-  property of the machine, not of the device class.
-- **B13, firmware and boot profiles, are defined by it.** §34's chain is
-  `VM Manager → Machine Profile → Firmware → Bootloader → LazOS`. The profile is
-  second in that chain, not a peer of the firmware.
-- **B19, the VM manager, exists to create and run profiles.** A management API
-  with nothing to manage is a wrapper around `LazalithMachine::new`, which is
-  what exists now.
-- **B27, `lza64-at-v1`, is a profile plus a compatibility device set.** It is
-  three stages before the Linux port that needs it.
-
-**What exists today that a profile has to absorb.** The machine's configuration is
-currently scattered over four crates:
-
-| What | Where it lives |
+| §27 says | `MachineProfile` has |
 | --- | --- |
-| physical layout constants (ROM, header, payload, load address, initial SP) | `crates/lazalith-boot/src/lib.rs` |
-| kernel regions (image, stack, heap) | `crates/lazalith-os/src/memory.rs`, `KernelMemory::regions` |
-| user regions (code, data, stack) | `crates/lazalith-os/src/memory.rs`, `UserMemory::regions` |
-| `pc` / `sp` / `status` / `initial_time` | `crates/lazalith-boot/src/image.rs`, `BootImage::machine_setup` |
-| the trap vector | set **after** construction, by each caller |
-| the device set | supplied by each caller, and **monomorphic** |
+| architecture | `ProfileName::architecture()` |
+| CPU | the architecture's feature set, carried by the name |
+| RAM, firmware, boot behavior, MMIO/PIO map | `layout` (`LZA64_LAYOUT`) and `regions` |
+| device inventory | `devices` |
+| timer | `timer` |
+| compatibility behavior | `compatibility` |
+| display, input, storage, serial, network, audio | *derived* from `devices` by class |
 
-`BootImage::machine_setup` is the nearest thing to a single description, and it is
-one function in one crate, and it refuses any non-empty device manager outright
-(`BootError::UnexpectedDevices`). That refusal is the clearest statement of what a
-profile would fix.
+**What a profile is not:**
 
----
-
-## 3. A first-order constraint a profile has to solve
-
-**Fact.** `DeviceManager<D>` is monomorphic. Every entry in a machine's device
-manager is the same concrete type `D`. There is no trait object, no device enum,
-no heterogeneous device set.
-
-A machine today can hold a console, *or* a timer, *or* a display, *or* an input
-device — but not two of different kinds at once. A profile that says "this machine
-has a console and a display and a timer and a disk" is therefore not a matter of
-writing a description; it is impossible to honour until the device manager can hold
-more than one kind.
-
-**So B4 is two things, in this order:**
-
-1. **heterogeneous devices** — a device set that is a collection of distinct
-   device types, and
-2. **the profile** that describes one.
-
-Doing the profile first would produce a description the machine cannot be built
-from, which is the same failure as documenting an interface before deciding which
-layer it belongs to. The heterogeneous device set is small: a `Vec<Box<dyn Device>>`
-with each entry carrying its `DeviceId` and its address length, which is the shape
-`DeviceManager` already has internally (`Vec<Entry<D>>` with `id` and `length`).
-This is B5's first half and it is a prerequisite, not a separate project.
+- **not firmware.** It says *where* firmware lives and where the reset vector
+  points. The bytes are an image, and the boot path supplies them. That split is
+  what lets one machine run a different kernel without the machine changing.
+- **not the operating system.** The LazOS kernel and user region layout stays in
+  `lazalith-os`, layered over the machine, exactly as today.
+  `lazalith-machine` must not depend on the OS, and a profile carrying the OS's
+  region layout would be that dependency by another name.
 
 ---
 
-## 4. The three profiles `binstruction.md` names
+## 2. Why the device set had to be fixed first
 
-| Name | What it is for |
+**Fact, before B4.** `DeviceManager<D>` was `Vec<Entry<D>>` with one concrete `D`:
+no trait object, no device enum, no heterogeneous set. A machine could have a
+console, *or* a timer, *or* a display, *or* an input device — never two of different
+kinds at once. `BootImage::machine_setup` refused any non-empty device manager
+outright.
+
+So a profile describing a device *inventory* was a description no machine could be
+built from, and B4's first half is what makes one possible.
+
+**How it was fixed, and why it is additive.** `Box<dyn Device>` now implements
+`Device`, forwarding all ten methods. `DeviceManager<Box<dyn Device>>` is a
+`DeviceManager` of some `D: Device`, and every generic in `lazalith-memory` and
+`lazalith-machine` was already written in terms of `D` — so
+`LazalithMachine<Box<dyn Device>>` is a machine, from the same constructor, with
+the same `map_device`, the same routing by `DeviceId` and the same per-device
+snapshot contract.
+
+**Not one existing call site changed.** `LazalithMachine<ConsoleDevice>` is still
+monomorphic and still fast, and `NoDevice` still means something an empty erased
+list does not: *a machine that cannot hold a device at all*, rather than *a machine
+holding nothing*. Both distinctions are tested
+(`a_phase_i_machine_cannot_hold_a_device_at_all`).
+
+**The cost** is a dynamic call per register access, which is why a machine with one
+kind of device should not do this. It is a choice a profile makes, not a default
+that was imposed.
+
+---
+
+## 3. The versioned identity
+
+**Fact.** `ProfileName { architecture, family, version }`, and `Display` produces
+`lza64-native-v1`. The version is a *field*, not a string, so a profile cannot be
+called `lza64-native-v1` and then describe an LZ32 machine — the kind of
+disagreement otherwise found only by a guest.
+
+Three things make "versioned to preserve guest compatibility" a real property
+rather than a label:
+
+| | |
 | --- | --- |
-| `lza64-virt-v1` | the general-purpose profile. What the platform's own software targets. |
-| `lza64-native-v1` | the minimal profile: CPU, memory, console, timer. No display, no storage. The one a bootloader or a freestanding kernel is built against. |
-| `lza64-at-v1` | the compatibility profile for the Linux 0.01 port. AT-derived hardware, an LZA-compatibility presentation device, keyboard, and whatever else the port's source actually proves it needs. |
-
-**`lza64-native-v1` is the one to build first**, and the reason is dependency
-order: B25 and B26 — target-side LazOS in C, and LazOS built by the Lazalith
-toolchain — need a profile that means "a machine with nothing on it but a CPU and
-memory", because a kernel does not want a display it will never draw on. A
-`virt`-shaped profile as the only one would mean every freestanding target has to
-opt out of devices it never asked for.
-
-**`lza64-at-v1` is the one with the most research left**, and it should not be
-written from a list. `binstruction.md` §46 says "do not assume a device is required
-merely because it existed on the historical PC" and "prove the dependency from
-source". See `docs/linux-0.01-port.md`.
+| the version is in the name | a guest can say which machine it booted on |
+| `version() == 0` is refused | a profile that could be unversioned could be changed incompatibly |
+| `isa_version` is checked against `ISA_VERSION` | a profile for an ISA this build does not implement is refused, so an ISA version bump cannot leave existing profiles quietly describing a machine that no longer exists |
 
 ---
 
-## 5. Shape of the description
+## 4. The three profiles
 
-**Proposal.** A profile is data, not code, and it is versioned in the same
-namespace as the machine it describes.
+| Name | Status |
+| --- | --- |
+| `lza64-native-v1` | **built and tested.** Boot ROM, RAM, a console, a timer |
+| `lza64-virt-v1` | not built. Needs a storage backend (B8) to be worth having |
+| `lza64-at-v1` | nameable, and **refused** by `validate`. Needs the four compatibility devices in `docs/linux-0.01-port.md` §3.7 |
 
-```text
-lza64-native-v1
-    architecture   LZA64
-    cpu            default
-    ram            { base, length }
-    firmware       { kind, entry }
-    boot           { vector, kernel load, kernel initial sp }
-    interrupts     { controller, vector }
-    timer          { cycles-per-tick, irq }
-    devices        [ { id, kind, address, length, permissions, backend } ]
-    compatibility  { profile: none | at-v1 }
-```
+**`lza64-native-v1` is minimal on purpose.** §53 puts machine profiles before the
+target-side OS, and a freestanding kernel (B25, B26) is built against a machine
+with nothing on it but a CPU and memory. A native profile whose default shape
+included a display would mean every kernel target had to opt out of a device it
+never asked for, and opting out is how a guest quietly acquires a dependency on a
+device that is not always there. `the_native_profile_carries_only_what_a_kernel_needs`
+holds that.
 
-Three decisions in that shape are worth stating before the code, because they are
-the ones that are expensive to change:
-
-1. **`devices` is a list, not a map keyed by name.** A machine may have two
-   displays; a map would have to decide which one is "the" display, and that
-   decision belongs to the guest, not the host.
-2. **Every device carries its `backend` explicitly, including `none`.** A missing
-   backend and a deliberately-absent one must not be the same value, or a machine
-   profile that forgot to say so would silently produce a device that does nothing.
-3. **`compatibility` is a field, not a separate profile type.** `lza64-at-v1` is a
-   profile that happens to be a compatibility profile, and encoding "is it AT" as
-   a type rather than as data would make a profile that is *partly* AT impossible
-   to express — which is exactly the profile the Linux port may turn out to need.
-
-**The versioning rule:** the version is part of the name (`-v1`), a change that
-any guest could observe is a new version, and a change that no guest can observe is
-an edit. The archive, object and executable formats in this repository already
-work that way — `BOOT_FORMAT_VERSION`, `LZX_FORMAT_VERSION`, `LZA_FORMAT_VERSION`,
-`LZX_ISA_VERSION`, `LZX_ABI_VERSION` — and a machine profile should not invent a
-second convention.
+**`lza64-at-v1` is refused rather than absent.** The name has to be writable down
+and referable before the device set exists, and asking for a machine this build
+cannot produce has to be a clear refusal rather than an `lza64-at-v1` that quietly
+has no VGA in it.
 
 ---
 
-## 6. What a profile must not be able to do
+## 5. The layout, and the duplication it removed
 
-Stated now, because a machine description that can do these things is not a
-description of a machine.
+**Fact.** `MachineLayout` is the machine's physical geometry, and `LZA64_LAYOUT` is
+its one definition. It lives in `lazalith-machine` because that is where a profile
+is, and a profile that had to import its geometry from the boot crate would be a
+layering inversion.
 
-- **It cannot change guest-visible semantics.** A profile chooses which devices
-  exist and where they are mapped. It does not get to decide what `ADD` means, what
-  a syscall returns, or what `.lzx` contains. Those are the architecture, and they
-  are fixed by the ISA and ABI versions, which the profile *records* and does not
-  *define*.
-- **It cannot overlap its own mappings.** The bus already refuses overlapping
-  regions and a device that is already mapped; a profile that asked for one would
-  be refused at load, and that refusal is a test, not a runtime surprise.
-- **It cannot produce a machine that fails its own description.** A profile is
-  checked against the machine built from it, and a disagreement is a build failure.
+`lazalith-boot` and `lazalith-os` re-export from it. Two constants —
+`KERNEL_IMAGE_LENGTH` and `KERNEL_INITIAL_SP` — were **declared in both crates**
+with the same values before B4. That is the duplication that mattered: a change to
+one would have left one crate describing a kernel window of one size and the other
+of another, and the symptom would be a kernel loaded somewhere it does not fit.
+
+Three tests hold this, in `crates/lazalith-boot/tests/profile_layout.rs` — which is
+the only crate that can see boot, os and machine at once:
+
+- `the_phase_i_layout_is_unchanged` — the pre-B4 numbers, written down;
+- `every_re_export_points_at_the_one_definition` — every re-export resolves to
+  `LZA64_LAYOUT`;
+- `the_layout_is_internally_consistent` — the numbers agree *with each other*: a
+  header inside its ROM, a payload limit below the ROM size, a kernel window
+  inside RAM, a stack pointer above the image and inside RAM.
+
+And one architecture invariant, `the_machine_geometry_is_defined_once`, which
+greps for a **literal** rather than for a name. That distinction matters: a rule
+that greps for the identifier cannot tell a re-export from a redefinition, so it
+would be a rule that cannot fail — which is worse than no rule, because it looks
+like one. It was verified to fail when a second literal is reintroduced in
+`lazalith-os`, and to pass again when it was removed.
 
 ---
 
-## 7. What B4 is, concretely
+## 6. What a profile refuses
 
-The smallest correct stage, in order:
+Validated **before** a machine is built, so a bad profile is a refusal rather than
+a half-built machine. Each variant names the part to change.
 
-1. **Heterogeneous device set** — `DeviceManager` over a collection of distinct
-   device types, preserving the existing per-device `validate`/`snapshot`/
-   `restore` contract and the existing "a snapshot of the wrong shape is refused"
-   behaviour. `BootImage::machine_setup` stops refusing a non-empty manager.
-2. **`MachineProfile`** — the data above, with a version, a name, and validation
-   that refuses what §6 forbids.
-3. **`LazalithMachine::from_profile`** — and a test that a machine built from a
-   profile and then inspected matches the profile that described it. That test is
-   the deliverable; a profile type with no round-trip check is a comment.
-4. **`lza64-native-v1`** as the first real profile, because it is the one B25 and
-   B26 need.
-5. **CI**: the round-trip test runs in the `architecture` job, and a new
-   compatibility test for the profile encoding goes in the `campaign` job if the
-   encoding is something malformed input could reach.
+| Refused | Why |
+| --- | --- |
+| no version | a profile that could be unversioned could be changed incompatibly |
+| a different ISA version | the compatibility claim, checked |
+| a family that disagrees with its compatibility behaviour | a *native* profile claiming AT hardware is wrong about something more basic than its devices |
+| AT compatibility hardware | it does not exist in this build |
+| an empty region | there is no such thing |
+| an unaddressable region or device window | the architecture cannot name it |
+| two overlapping regions | a machine cannot map both |
+| two devices with one id | one address cannot route to two devices |
+| two overlapping device windows | the bus refuses, so the profile is what's wrong |
+| an executable device window | `Bus::map_device` refuses these |
+| a device class this build cannot construct | refused, **not skipped** — skipping builds a machine missing something the profile promised while the profile still validates |
 
-**What is not in B4:** `lza64-virt-v1`, `lza64-at-v1`, storage, audio, networking,
-hot-plug, or any change to the device trait. Those are B5, B8, B10, B11 and B12,
-and B4 should make them possible without doing any of them.
+**What is deliberately *not* refused: a region's permissions.** The memory model
+builds what it is given; writable-and-executable RAM is constructible and the
+Phase-I OS tests use it for code. A profile that refused it would be inventing a
+policy the platform does not have, and would refuse to describe machines that
+genuinely exist. (This was written, tested, found wrong by a test that needed
+executable RAM for its code, and removed.)
+
+**And after a machine exists**, `matches_profile` checks the machine is the one the
+profile describes: architecture, reset vector, initial stack pointer, and the
+device set in both directions. A profile that is accepted and a machine built from
+it can still disagree — a device mapped where the profile did not say — and the
+machine boots and then misbehaves. That is a round trip, not a construction.
+
+---
+
+## 7. What B4 is not, and what is next
+
+**Not built:** `lza64-virt-v1`, `lza64-at-v1`, storage, audio, networking, hot-plug,
+a device *backend* layer, and any change to the `Device` trait itself.
+
+**B4's two halves, and both are done:**
+1. a heterogeneous device set — `impl Device for Box<dyn Device>`;
+2. a profile that describes one, with a round-trip check.
+
+**What the next stage is.** B5 is the device **frontend/backend** split
+(`binstruction.md` §26), and the profile is what it attaches to: a profile says
+which devices a machine has, and a backend says how each one reaches the host's
+resources. `docs/device-model.md` §5 has the proposed shape and the three rules it
+has to obey.
+
+**Two open questions B4 deliberately did not answer**, both recorded rather than
+guessed:
+
+- **PIO.** `binstruction.md` §25 lists "MMIO/PIO map" as a profile property, and
+  LZA has no port I/O at all. `docs/linux-0.01-port.md` §3.2 makes this the single
+  largest item in that port: eleven driver files use `in`/`out` today. Whether LZA
+  gains a PIO space is an architectural decision, and it belongs with the device
+  model rather than with a profile that would have to describe something that does
+  not exist.
+- **A profile *file*.** A profile is a Rust value here. Whether there is an
+  on-disk encoding — and therefore something a third party could ship — is B19's
+  question, because a serialised profile is a management API's input and the
+  management API does not exist yet.
+
 
 ---
 

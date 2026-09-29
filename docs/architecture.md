@@ -143,8 +143,10 @@ and the check is named so you can run it yourself.
 | Only the debugger reaches the address-space mutators | `only_the_debugger_reaches_the_address_space_mutators` | source |
 | **No execution engine owns the architectural state** | `no_execution_engine_owns_the_architectural_state` | source |
 | **A machine holds its processor and its engine apart** | `a_machine_holds_the_processor_and_the_engine_apart` | source |
+| **The machine's geometry has one definition, and it is a literal** | `the_machine_geometry_is_defined_once` | source |
+| **A device manager can hold more than one kind of device** | `a_device_manager_can_hold_more_than_one_kind_of_device` | source |
 
-All sixteen are in `crates/lazalith-cli/tests/architecture.rs` and run under
+All twenty are in `crates/lazalith-cli/tests/architecture.rs` and run under
 `cargo test -p lazalith-cli --test architecture`. CI runs that suite as its own
 job — see `docs/ci-cd.md`.
 

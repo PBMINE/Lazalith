@@ -15,14 +15,26 @@ use lazalith_types::{ArchitectureConfig, InstructionAddress, PhysicalAddress, Wo
 pub const BOOT_MAGIC: [u8; 8] = *b"LZBOOT01";
 pub const BOOT_FORMAT_VERSION: u32 = 1;
 pub const BOOT_HEADER_SIZE: u16 = 48;
-pub const BOOT_ROM_START: u64 = 0x0000_0000;
-pub const BOOT_ROM_LENGTH: u64 = 0x0008_0000;
-pub const BOOT_HEADER_ADDRESS: u64 = 0x0000_0400;
-pub const KERNEL_PAYLOAD_ADDRESS: u64 = 0x0000_1000;
-pub const MAX_BOOT_ROM_PAYLOAD: u64 = 0x0007_f000;
-pub const KERNEL_LOAD_ADDRESS: u64 = 0x0010_0000;
-pub const KERNEL_IMAGE_LENGTH: u64 = 0x0008_0000;
-pub const KERNEL_INITIAL_SP: u64 = 0x0018_f000;
+
+// The machine's geometry comes from `lazalith-machine`, which is where a machine
+// profile lives and therefore the only place that should be able to answer "where
+// does the reset vector point" and "how much RAM is there".
+//
+// Two of these values — `KERNEL_IMAGE_LENGTH` and `KERNEL_INITIAL_SP` — were
+// previously declared here *and* in `lazalith-os`, as two independent constants
+// with the same numbers. B4 gives the machine one definition and both crates
+// re-export it, so the two can no longer agree today and disagree tomorrow. The
+// names and the values are unchanged, so nothing above this line moved.
+pub const BOOT_ROM_START: u64 = lazalith_machine::LZA64_LAYOUT.boot_rom_start;
+pub const BOOT_ROM_LENGTH: u64 = lazalith_machine::LZA64_LAYOUT.boot_rom_length;
+pub const BOOT_HEADER_ADDRESS: u64 = lazalith_machine::LZA64_LAYOUT.boot_header_address;
+pub const KERNEL_PAYLOAD_ADDRESS: u64 = lazalith_machine::LZA64_LAYOUT.kernel_payload_address;
+pub const MAX_BOOT_ROM_PAYLOAD: u64 = lazalith_machine::LZA64_LAYOUT.max_boot_rom_payload;
+pub const KERNEL_LOAD_ADDRESS: u64 = lazalith_machine::LZA64_LAYOUT.kernel_load_address;
+pub const KERNEL_IMAGE_LENGTH: u64 = lazalith_machine::LZA64_LAYOUT.kernel_image_length;
+pub const KERNEL_INITIAL_SP: u64 = lazalith_machine::LZA64_LAYOUT.kernel_initial_sp;
+pub const PHYSICAL_RAM_START: u64 = lazalith_machine::LZA64_LAYOUT.physical_ram_start;
+pub const PHYSICAL_RAM_LENGTH: u64 = lazalith_machine::LZA64_LAYOUT.physical_ram_length;
 pub const RESET_VECTOR: InstructionAddress = InstructionAddress::new(BOOT_ROM_START);
 pub const BOOT_ADDRESS: InstructionAddress = RESET_VECTOR;
 pub const BOOT_ROM_PHYSICAL_START: PhysicalAddress = PhysicalAddress::new(BOOT_ROM_START);

@@ -142,8 +142,14 @@ jobs:
           restore-keys: cargo-target-
       - name: dependency graph and layering invariants
         run: nix develop --command cargo test -p lazalith-cli --test architecture -- --nocapture
+      - name: machine profiles and the device inventory
+        run: nix develop --command cargo test -p lazalith-machine --test profile -- --nocapture
+      - name: the machine's geometry has one definition
+        run: nix develop --command cargo test -p lazalith-boot --test profile_layout -- --nocapture
       - name: interpreter/machine differential
         run: nix develop --command cargo test -p lazalith-machine --test differential -- --nocapture
+      - name: the execution-engine boundary
+        run: nix develop --command cargo test -p lazalith-machine --test engine -- --nocapture
       - name: boot, linker and object-format suites
         run: nix develop --command cargo test -p lazalith-boot -p lazalith-toolchain --all-features
 

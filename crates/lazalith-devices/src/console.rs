@@ -3,6 +3,15 @@ use alloc::vec::Vec;
 use lazalith_isa::DataSize;
 use lazalith_types::CycleCount;
 
+/// How many bytes of the console's register window exist.
+///
+/// One: a write is a byte of output, and a read is refused. This was a bare `1`
+/// in [`Device::address_len`], which is fine for a device and useless to anything
+/// that has to know how big the window is before it maps one — a machine profile
+/// describing a device inventory, for instance, which has to check the inventory
+/// does not overlap before it maps any of it.
+pub const CONSOLE_REGISTER_BYTES: u64 = 1;
+
 #[derive(Debug)]
 pub struct ConsoleDevice {
     output: Vec<u8>,
@@ -49,7 +58,7 @@ impl ConsoleDevice {
 
 impl Device for ConsoleDevice {
     fn address_len(&self) -> u64 {
-        1
+        CONSOLE_REGISTER_BYTES
     }
     fn reset(&mut self) {
         self.output.clear();

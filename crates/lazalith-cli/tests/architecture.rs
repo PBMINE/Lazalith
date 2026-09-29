@@ -546,6 +546,81 @@ fn a_machine_holds_the_processor_and_the_engine_apart() {
     );
 }
 
+/// B4: the machine's physical geometry is assigned a literal in exactly one place.
+///
+/// `KERNEL_IMAGE_LENGTH` and `KERNEL_INITIAL_SP` were each declared twice before
+/// B4 — once in `lazalith-boot` and once in `lazalith-os` — with the same values.
+/// That is the failure this rule exists to prevent: two constants that agree today
+/// and can drift apart on the first change to one of them, where the one that
+/// disagreed would be the one describing the kernel's memory window. The symptom
+/// is a kernel loaded somewhere it does not fit.
+///
+/// `lazalith-machine` owns `LZA64_LAYOUT`; `lazalith-boot` and `lazalith-os`
+/// re-export from it, and a re-export carries no literal.
+///
+/// The test looks for a *literal*, not for a name. A rule that greps for the
+/// identifier cannot tell `KERNEL_INITIAL_SP: u64 = lazalith_machine::…` from
+/// `KERNEL_INITIAL_SP: u64 = 0x0018_f000`, and only one of those is a second
+/// definition — so a rule written the obvious way is a rule that cannot fail,
+/// which is worse than no rule because it looks like one.
+#[test]
+fn the_machine_geometry_is_defined_once() {
+    const GEOMETRY: [&str; 10] = [
+        "boot_rom_start",
+        "boot_rom_length",
+        "boot_header_address",
+        "kernel_payload_address",
+        "max_boot_rom_payload",
+        "kernel_load_address",
+        "kernel_image_length",
+        "kernel_initial_sp",
+        "physical_ram_start",
+        "physical_ram_length",
+    ];
+    let definers = grep_crates(&|_, text| {
+        text.lines().any(|line| {
+            let line = line.to_ascii_lowercase();
+            // A literal, not a reference. `0x…` is how every one of these numbers
+            // is written in this repository, including in the one place they are
+            // allowed to be written.
+            line.contains("0x") && GEOMETRY.iter().any(|name| line.contains(name))
+        })
+    });
+    let mut names: Vec<String> = definers
+        .into_iter()
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["lazalith-machine".to_string()],
+        "only the machine profile may hold the machine's geometry as a literal, \
+         because two definitions that agree today are two definitions that can \
+         disagree tomorrow; {names:?} also holds one"
+    );
+}
+
+/// B4: a machine profile describes the device inventory, so the device manager has
+/// to be able to hold more than one kind of device.
+///
+/// `DeviceManager<D>` is a `Vec<Entry<D>>` with one concrete `D`, so without an
+/// erased device *also* being a `Device`, a profile can describe a console, a
+/// timer and an input device but no machine can hold all three. The impl is what
+/// makes `LazalithMachine<Box<dyn Device>>` exist, and this checks it has not been
+/// dropped: the failure it would cause is a compile error in every heterogeneous
+/// caller, but the *rule* is worth writing down because the alternative is that
+/// the capability is never deliberately removed — only discovered missing.
+#[test]
+fn a_device_manager_can_hold_more_than_one_kind_of_device() {
+    let devices = workspace().join("crates/lazalith-devices/src/lib.rs");
+    let text = std::fs::read_to_string(&devices).expect("the device crate reads");
+    assert!(
+        text.contains("impl Device for Box<dyn Device>"),
+        "an erased device must be a device, or a profile's device inventory \
+         describes machines that cannot be built"
+    );
+}
+
 /// Every `.rs` file under a directory.
 fn walk(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();

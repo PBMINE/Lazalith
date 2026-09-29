@@ -3,13 +3,23 @@ use alloc::vec::Vec;
 use lazalith_memory::{AddressSpace, MemoryRegion, RegionPermissions};
 use lazalith_types::{ArchitectureConfig, PhysicalAddress, VirtualAddress};
 
-pub const PHYSICAL_RAM_START: u64 = 0x0010_0000;
-pub const PHYSICAL_RAM_LENGTH: u64 = 0x0031_0000;
-pub const KERNEL_IMAGE_START: u64 = 0x0010_0000;
-pub const KERNEL_IMAGE_LENGTH: u64 = 0x0008_0000;
+// The machine's physical geometry is the machine's, and a machine profile is
+// where a machine is described — so these four come from there rather than being
+// restated. `PHYSICAL_RAM_START` and `PHYSICAL_RAM_LENGTH` were previously
+// declared here and then never used to build a region, which is a constant that
+// looks like it is doing something and is not; re-exporting makes that visible
+// instead of silent.
+//
+// The kernel and user *region* layout below is a different thing and stays here:
+// it is the LazOS address-space design, not the machine's physical geometry, and
+// `lazalith-machine` must not depend on the operating system.
+pub const PHYSICAL_RAM_START: u64 = lazalith_machine::LZA64_LAYOUT.physical_ram_start;
+pub const PHYSICAL_RAM_LENGTH: u64 = lazalith_machine::LZA64_LAYOUT.physical_ram_length;
+pub const KERNEL_IMAGE_START: u64 = lazalith_machine::LZA64_LAYOUT.kernel_load_address;
+pub const KERNEL_IMAGE_LENGTH: u64 = lazalith_machine::LZA64_LAYOUT.kernel_image_length;
 pub const KERNEL_STACK_START: u64 = 0x0018_0000;
 pub const KERNEL_STACK_LENGTH: u64 = 0x0001_0000;
-pub const KERNEL_INITIAL_SP: u64 = 0x0018_f000;
+pub const KERNEL_INITIAL_SP: u64 = lazalith_machine::LZA64_LAYOUT.kernel_initial_sp;
 pub const KERNEL_HEAP_START: u64 = 0x0019_0000;
 pub const KERNEL_HEAP_LENGTH: u64 = 0x0007_0000;
 pub const USER_CODE_START: u64 = 0x0020_0000;

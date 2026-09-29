@@ -7,12 +7,13 @@ mod display;
 pub mod host_input;
 pub mod input;
 pub mod timer;
-pub use console::ConsoleDevice;
+pub use console::{CONSOLE_REGISTER_BYTES, ConsoleDevice};
 pub use display::{
     DISPLAY_ABI_VERSION, DisplayDevice, DisplayError, MAX_DIMENSION, PIXEL_BYTES, PresentedFrame,
-    REGISTER_ABI_VERSION, REGISTER_BYTES, REGISTER_FRAMEBUFFER, REGISTER_HEIGHT,
-    REGISTER_LAST_PRESENT, REGISTER_PRESENT, REGISTER_PRESENT_COUNT, REGISTER_STATUS,
-    REGISTER_WIDTH, STATUS_PRESENTED, frame_bytes, pixel_at, zeroed_framebuffer,
+    REGISTER_ABI_VERSION, REGISTER_BYTES, REGISTER_BYTES as DISPLAY_REGISTER_BYTES,
+    REGISTER_FRAMEBUFFER, REGISTER_HEIGHT, REGISTER_LAST_PRESENT, REGISTER_PRESENT,
+    REGISTER_PRESENT_COUNT, REGISTER_STATUS, REGISTER_WIDTH, STATUS_PRESENTED, frame_bytes,
+    pixel_at, zeroed_framebuffer,
 };
 pub use host_input::{
     HostAction, HostKey, HostScript, KEY_BACKSLASH, KEY_BACKSPACE, KEY_COMMA, KEY_DIGIT_FIRST,
@@ -31,7 +32,7 @@ pub use input::{
 };
 pub use timer::{REGISTER_CYCLES as TIMER_REGISTER_CYCLES, TIMER_REGISTER_BYTES, TimerDevice};
 
-use alloc::{collections::TryReserveError, vec::Vec};
+use alloc::{boxed::Box, collections::TryReserveError, vec::Vec};
 use core::{error::Error, fmt};
 use lazalith_isa::DataSize;
 use lazalith_types::{ClockOverflow, VirtualClock};
@@ -163,6 +164,70 @@ impl Device for NoDevice {
     }
     fn restore(&mut self, _bytes: &[u8]) -> Result<(), DeviceError> {
         match *self {}
+    }
+}
+
+/// A *heterogeneous* device, erased.
+///
+/// A [`DeviceManager`] holds one concrete device type, so a machine built over it
+/// can have a console, *or* a timer, *or* a display, *or* an input device — never
+/// two of different kinds at once. This impl is what removes that restriction, and
+/// it is the reason a machine profile can describe a device *inventory* rather
+/// than a device *kind*.
+///
+/// Nothing above the device layer had to change to get it.
+/// `DeviceManager<Box<dyn Device>>` is a `DeviceManager` of some `D: Device`, and
+/// every generic in `lazalith-memory` and `lazalith-machine` is already written in
+/// terms of `D` — so `LazalithMachine<Box<dyn Device>>` is a machine, built from
+/// the same constructor, with the same `map_device`, the same routing by
+/// `DeviceId`, and the same per-device snapshot contract. Every existing caller
+/// keeps its concrete `D` and is untouched.
+///
+/// The cost is a dynamic call per register access, which is why a machine with one
+/// kind of device still should not do this: `LazalithMachine<ConsoleDevice>` stays
+/// monomorphic and stays fast. `NoDevice` also still means something an empty
+/// erased list does not — "a machine that can hold no device at all", rather than
+/// "a machine holding nothing".
+impl Device for Box<dyn Device> {
+    fn address_len(&self) -> u64 {
+        (**self).address_len()
+    }
+    fn reset(&mut self) {
+        (**self).reset()
+    }
+    fn validate_read(&self, offset: DeviceOffset, size: DataSize) -> Result<(), DeviceError> {
+        (**self).validate_read(offset, size)
+    }
+    fn validate_write(
+        &self,
+        offset: DeviceOffset,
+        size: DataSize,
+        value: u64,
+    ) -> Result<(), DeviceError> {
+        (**self).validate_write(offset, size, value)
+    }
+    fn read(&mut self, offset: DeviceOffset, size: DataSize) -> Result<u64, DeviceError> {
+        (**self).read(offset, size)
+    }
+    fn write(
+        &mut self,
+        offset: DeviceOffset,
+        size: DataSize,
+        value: u64,
+    ) -> Result<(), DeviceError> {
+        (**self).write(offset, size, value)
+    }
+    fn peek(&self, offset: DeviceOffset, output: &mut [u8]) -> Result<(), DeviceError> {
+        (**self).peek(offset, output)
+    }
+    fn tick(&mut self, elapsed: CycleCount) {
+        (**self).tick(elapsed)
+    }
+    fn snapshot(&self) -> Vec<u8> {
+        (**self).snapshot()
+    }
+    fn restore(&mut self, bytes: &[u8]) -> Result<(), DeviceError> {
+        (**self).restore(bytes)
     }
 }
 

@@ -3,9 +3,9 @@
 `binstruction.md` §25 and §26 ask for a tiered hardware model and for devices to
 be separated into a guest-facing **front end** and a host-facing **back end**.
 
-**Status: the front end is built; the back end does not exist.** This document
-states what is real, names the constraint that stops the back end from being
-written today, and describes the split `binstruction.md` asks for.
+**Status: the front end is built, and so is the heterogeneous device set; the back
+end does not exist.** This document states what is real, names what remains, and
+describes the split `binstruction.md` asks for.
 
 ---
 
@@ -59,9 +59,9 @@ is out, and so is any buffer the host is using to stage a window.
 
 ---
 
-## 2. The constraint that stops the back end
+## 2. The constraint that stopped the back end — and how B4 removed it
 
-**Fact, and it is first-order.** `DeviceManager<D>` is monomorphic:
+**Fact, before B4.** `DeviceManager<D>` was monomorphic:
 
 ```rust
 pub struct DeviceManager<D: Device> {
@@ -70,12 +70,12 @@ pub struct DeviceManager<D: Device> {
 }
 ```
 
-One machine holds exactly one concrete device type. A machine can have a console,
-*or* a timer, *or* a display, *or* an input device. It cannot have two of different
-kinds at once.
+One machine held exactly one concrete device type. A machine could have a console,
+*or* a timer, *or* a display, *or* an input device. It could not have two of
+different kinds at once.
 
-**This is the whole reason `binstruction.md` §26's model cannot be built on the
-current shape.** The four-layer model is:
+**This is why `binstruction.md` §26's model could not be built on the old shape.**
+The four-layer model is:
 
 ```text
 Guest
@@ -84,21 +84,33 @@ guest-visible device          ← the front end. This exists.
   ↓
 Lazalith device model         ← this is the trait. This exists.
   ↓
-host backend                  ← SDL3, a file, a socket, a host audio API. THIS DOES NOT EXIST.
+host backend                  ← SDL3, a file, a socket, a host audio API.
+                                 THIS DOES NOT EXIST.
 ```
 
 You cannot attach a *different* backend to different devices of the same machine
 when the manager has one homogeneous slot for all of them. A machine with a console
 backed by stdio and a display backed by SDL3 needs two different concrete device
-types in one device list, and the list cannot hold that today.
+types in one device list, and the list could not hold that.
 
-`BootImage::machine_setup` makes the consequence explicit by refusing any non-empty
+`BootImage::machine_setup` made the consequence explicit by refusing any non-empty
 device manager at all (`BootError::UnexpectedDevices`).
 
-**The fix is small and is B4's first half** (see `docs/machine-profiles.md` §3):
-`Vec<Box<dyn Device>>` with each entry carrying its `DeviceId` and its address
-length — which is exactly the shape `DeviceManager` has internally today, with `D`
-removed. Nothing in the per-device contract changes.
+**B4 removed the blocker, additively.** `Box<dyn Device>` now implements `Device`,
+forwarding all ten methods, so `DeviceManager<Box<dyn Device>>` is a `DeviceManager`
+of some `D: Device` and every generic above it was already written in terms of `D`.
+`LazalithMachine<Box<dyn Device>>` is a machine built from the same constructor,
+with the same `map_device`, the same routing by `DeviceId` and the same per-device
+snapshot contract.
+
+**Not one existing call site changed.** `LazalithMachine<ConsoleDevice>` is still
+monomorphic; `NoDevice` still means *a machine that cannot hold a device at all*,
+which is stronger than an empty erased list. Both distinctions are tested.
+
+**The cost** is a dynamic call per register access, and it is opt-in: a machine with
+one kind of device should keep its concrete `D`. `docs/machine-profiles.md` §2 has
+the full reasoning.
+
 
 ---
 
@@ -228,8 +240,9 @@ Backend                         how the host's resources are used
 ## 6. What is not here
 
 - **No storage, audio, network, USB, PCI or VGA.** Not "simplified": absent.
-- **No backend abstraction of any kind.** §5 is a proposal.
-- **No heterogeneous device set.** §2 is the blocker, and it is B4's first half.
+- **No backend abstraction of any kind.** §5 is a proposal, and it is B5.
+- **No `lza64-virt-v1` or `lza64-at-v1`.** Both are nameable; both are refused.
+  See `docs/machine-profiles.md` §4.
 - **No DMA, no MMU, no SMP, no power states.** See the tier tables.
 - **No device discovery or bus topology.** B12, and it needs B4's profile to have
   somewhere to record what was discovered.

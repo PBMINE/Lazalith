@@ -6190,3 +6190,230 @@ Two things the next session should carry forward:
   long something takes. Three numbers in this session would otherwise have been
   invented: the test suite's runtime, `nix flake check`'s, and the fact that the
   latter is a no-op against a warm store.
+
+---
+
+# BEYOND LAZALITH — SESSION 2: B4, MACHINE PROFILES
+
+B1–B3 were committed at `40587af`. This session completed **B4**, the first
+incomplete B-stage, and nothing else. B1's, B2's and B3's work was not redone.
+
+Read `docs/beyond-lazalith.md` first. That is the state; this is the record.
+
+---
+
+## What was inspected before anything was changed
+
+- `binstruction.md` §25, §26, §27, §53 — the hardware tiers, the device
+  frontend/backend model, the machine-profile list, the roadmap.
+- `crates/lazalith-devices/src/lib.rs` — the `Device` trait and `DeviceManager<D>`.
+- `crates/lazalith-memory/src/bus.rs`, in full — the routing, the mapping
+  overlap rules, and the `CpuMemory` implementation.
+- `crates/lazalith-boot/src/lib.rs` and `crates/lazalith-os/src/memory.rs` — the two
+  sets of layout constants.
+- Every `console`/`timer`/`display`/`input` device constructor, its
+  `address_len`, and its `peek`.
+- `crates/lazalith-machine/src/profile.rs`, written this session and reviewed
+  against the above.
+
+## What was already there, confirmed
+
+The B1 finding was right and still is: `DeviceManager<D>` was `Vec<Entry<D>>` with
+one concrete `D`. No trait object, no device enum, no heterogeneous set. A machine
+could hold a console, *or* a timer, *or* a display, *or* an input device, and
+`BootImage::machine_setup` refused any non-empty device manager outright.
+
+## What changed
+
+### `impl Device for Box<dyn Device>` — the heterogeneous device set
+
+Ten forwarding methods in `lazalith-devices`. `DeviceManager<Box<dyn Device>>` is
+a `DeviceManager` of some `D: Device`, and every generic in `lazalith-memory` and
+`lazalith-machine` was already written in terms of `D`.
+
+**Not one existing call site changed.** `LazalithMachine<ConsoleDevice>` is still
+monomorphic and still fast; `NoDevice` is still an uninhabited enum, so
+`DeviceManager<NoDevice>` is still *a machine that cannot hold a device at all*
+rather than an empty erased list. Both distinctions are tested, because the
+stronger one is the reason the Phase-I path is untouched rather than merely
+working.
+
+`CONSOLE_REGISTER_BYTES` was extracted from a bare `1` in `ConsoleDevice::address_len`
+— fine for a device, useless to anything that has to know the window size before
+mapping one, which is exactly what a profile's overlap check has to do. Display and
+input register sizes are now re-exported under unambiguous names alongside the
+existing ones.
+
+### `MachineProfile`, and the geometry it owns
+
+`crates/lazalith-machine/src/profile.rs`, new. `ProfileName { architecture, family,
+version }` displaying as `lza64-native-v1`; `MachineLayout` and `LZA64_LAYOUT`; a
+device inventory with `DeviceClass`; a region list; a timer period; a compatibility
+class; `validate()`; `machine_setup()`; `LazalithMachine::from_profile`; and
+`matches_profile`.
+
+`EngineKind`, `Processor` and the execution-engine boundary from B3 are untouched:
+`Processor` is still owned by the machine, `EngineKind::ALL` still has one entry,
+and `switch_execution_engine` still changes the engine without touching the
+architectural state.
+
+### The duplicated geometry, unified
+
+`KERNEL_IMAGE_LENGTH` and `KERNEL_INITIAL_SP` were each declared **twice** before
+B4 — once in `lazalith-boot`, once in `lazalith-os` — with the same values. That
+is the duplication that mattered: a change to one would have left one crate
+describing a kernel window of one size and the other of another, and the symptom
+would be a kernel loaded somewhere it does not fit.
+
+`lazalith-boot` and `lazalith-os` now re-export from `lazalith_machine::LZA64_LAYOUT`.
+**Every value and every public name is unchanged**; only the definition moved.
+
+## Invariants now checked rather than asserted
+
+| | |
+| --- | --- |
+| a profile with no version is refused | a profile that could be unversioned could be changed incompatibly |
+| a profile for another ISA version is refused | the §27 compatibility claim, checked rather than labelled |
+| a family that disagrees with its compatibility behaviour is refused | a *native* profile claiming AT hardware is wrong about more than its devices |
+| `lza64-at-v1` can be named and is refused | it exists in §27; it does not exist in this build |
+| a machine built from a profile is the machine the profile describes | a round trip, not a construction |
+| two devices with one id are refused *before* a machine exists | otherwise a half-built machine and an error about mapping |
+| two overlapping device windows are refused | the bus would refuse them, but the profile is what's wrong |
+| an executable device window is refused | `Bus::map_device` refuses these |
+| an unconstructible device class is refused, **not skipped** | skipping builds a machine missing what the profile promised |
+| the machine's geometry is a literal in exactly one crate | see below |
+| four devices of four kinds coexist, each window answering for itself | the thing B4's first half exists for |
+| one guest reads three device windows in one program | what a guest actually experiences |
+| a profile can describe two devices of one class | the inventory is a list, because a machine may have two displays |
+| `lza64-native-v1` carries nothing a freestanding kernel must opt out of | B25/B26 need it minimal |
+
+**The geometry rule was written wrong first, and the fix is the interesting part.**
+The obvious version greps for the identifier `kernel_initial_sp`, which matches
+both a re-export and a redefinition — so it cannot tell `KERNEL_INITIAL_SP: u64 =
+lazalith_machine::…` from `KERNEL_INITIAL_SP: u64 = 0x0018_f000`, and would have
+been a rule that cannot fail. It is written instead to look for a **literal**, and
+it was verified: reintroducing `0x0018_f000` into `lazalith-os` makes it fail with
+`["lazalith-machine", "lazalith-os"]`, and removing it makes it pass again.
+
+## Two things this session got wrong
+
+**A W^X rule that was not the platform's policy.** The first `validate()` refused
+writable-and-executable RAM. The memory model builds what it is given, several
+Phase-I OS tests use executable RAM for code, and B4's own guest test failed on the
+rule. A profile that refuses something the platform genuinely has is inventing
+policy, so the rule is gone, the test with it, and the reason is written into the
+`validate` documentation so it is not added back.
+
+**A test that reached for a seam the platform does not have.** The first attempt at
+the device-inventory test wanted to inject an event, which needs a downcast from
+`Box<dyn Device>`, which needs a production trait change made only for a test. It
+was replaced with a real guest program that reads three device windows — which is a
+stronger test anyway, because it checks the path a guest uses rather than a host
+peek. No test-only seam was added to the device layer.
+
+## One Phase-I defect found, recorded, not fixed
+
+**`TimerDevice::peek` returns `Ok` and writes nothing.**
+
+```rust
+fn peek(&self, offset: DeviceOffset, output: &mut [u8]) -> Result<(), DeviceError> {
+    let _ = output;
+    self.validate_read(offset, DataSize::Double)
+}
+```
+
+It validates the register and discards the buffer, so `Bus::peek` hands the caller
+back the bytes the caller already had. A debugger, or any host code reading a timer
+window, gets zeros and cannot tell them from a real reading. `DisplayDevice::peek`
+and `InputDevice::peek` both fill the buffer; `ConsoleDevice::peek` returns
+`Unpeekable`, which is honest. The timer is the odd one out.
+
+This is a wrong-answer defect in a device, which is the hardening phase's subject
+and not B4's, and fixing it here would have meant changing a device the B4 tests do
+not otherwise need. **It is recorded rather than fixed**, and the consequence is
+that B4's device test reads the timer through a guest `LDZ` — which goes through
+`Device::read` and does return the value — rather than through a peek, which does
+not. `docs/machine-profiles.md` and the test's own comment say so.
+
+## Tests and measurements
+
+```text
+cargo fmt --all --check                                      clean
+cargo clippy --workspace --all-targets --all-features -D    clean, no warnings
+cargo test  --workspace --all-features                       1318 passed, 0 failed
+                                                              3m16s wall, 13m24s user (debug)
+                                                              baseline 1295; +17 profile,
+                                                              +4 layout, +2 architecture
+actionlint .github/workflows/*.yml                           clean
+```
+
+New suites, and which job runs them:
+
+| Suite | Tests | CI job |
+| --- | --- | --- |
+| `crates/lazalith-machine/tests/profile.rs` | 17 | `architecture`, named individually |
+| `crates/lazalith-boot/tests/profile_layout.rs` | 4 | `architecture`, named individually |
+| `crates/lazalith-cli/tests/architecture.rs` | +2 | `architecture` |
+
+The layout tests live in `lazalith-boot` because it is the only crate that can see
+`lazalith_boot`, `lazalith_os` and `lazalith_machine` at once — `lazalith-boot`
+depends on `lazalith-machine`, so a test in the machine crate cannot see the other
+two and the claim could not be checked there at all.
+
+## CI implications
+
+`.github/workflows/ci.yml`'s `architecture` job now names the profile round trip,
+the geometry tests and the engine-boundary suite as separate steps, so a failure
+reads as a profile failure rather than as "a test failed somewhere in 1318". No new
+job and no new workflow: the suites are existing test targets, so `cargo test
+--workspace` already covered them, and the point was only to make a failure legible.
+
+`actionlint` is clean. **No workflow has run on GitHub**; that remains unknown, as
+B2 recorded it.
+
+## Limitations at the end of this stage
+
+1. **`lza64-virt-v1` and `lza64-at-v1` do not exist.** Both are nameable and both
+   are refused, with a reason.
+2. **No backend layer.** `docs/device-model.md` §5 is a proposal. That is B5.
+3. **No storage, audio, network, serial, VGA, PCI, USB, DMA, MMU, SMP or power
+   states.** Unchanged from B1's inventory.
+4. **No PIO address space.** §25 lists a PIO map as a profile property and LZA has
+   none. `docs/linux-0.01-port.md` §3.2 makes it the largest single item in that
+   port, because eleven driver files use `in`/`out`.
+5. **No on-disk profile encoding.** A profile is a Rust value. A serialised one is
+   a management API's input, and that API is B19.
+6. **`TimerDevice::peek` is still wrong**, as above. Recorded, not fixed.
+7. **`BootImage::machine_setup` still refuses a non-empty device manager.** A
+   profile-built machine bypasses it entirely, so the two paths exist side by side:
+   the boot path builds a Phase-I machine, the profile path builds a described one.
+   Uniting them is B6's business, and doing it here would have touched the boot
+   path for no gain.
+8. **The trap vector is still set after construction** by each caller rather than
+   being in the profile. A profile records the *interrupt model* in §27's list but
+   this build has no way to express "and the vector is here" without a guest-supplied
+   value, so the field is not in the type. Named rather than left to be noticed.
+9. **aarch64-linux is still unchecked**, and no cold `nix flake check` timing was
+   taken this session.
+
+## Next stage
+
+**B5, the device frontend/backend model separation** (`binstruction.md` §26). Its
+first question is the one B4 deliberately left open: a backend is a host resource,
+and nothing in the platform yet distinguishes a host resource from a device
+register. The shape and the three rules are in `docs/device-model.md` §5; the
+dependency argument for B5 immediately after B4 is in `docs/beyond-lazalith.md` §5.
+
+B5 should start by answering the PIO question, because B4's profiles have no way to
+express a PIO map and the Linux port needs one. The rest of B5 — a `Backend` trait,
+a per-device backend slot, and the snapshot rule for a backend that cannot restore
+its own state — follows from it.
+
+Two things the next session should carry forward, both learned here:
+
+- **Check that an invariant test can fail before trusting it.** The geometry rule
+  was written in the obvious way, looked correct, and could not fail. Introducing a
+  second definition and watching the test catch it is the only way to know.
+- **Do not add a rule the platform does not have.** The W^X refusal was a
+  reasonable-sounding policy that the memory model never adopted, and it cost a
+  test to discover.
