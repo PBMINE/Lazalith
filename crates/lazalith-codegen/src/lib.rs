@@ -859,8 +859,27 @@ pub(crate) const SYSCALL_PREFIX: &str = "syscall.";
 
 /// A function's symbol name in the object.
 pub(crate) fn function_symbol(name: &str) -> Name {
-    let mut symbol = String::from("fn.");
+    let mut symbol = String::from(SYMBOL_PREFIX);
     symbol.push_str(name);
+    symbol
+}
+
+/// The prefix code generation puts on every function's symbol in an object.
+///
+/// **Public because the prefix belongs to this stage and not to any one front end.**
+/// A linker, a debugger or a sysroot has to know what a function is *called* in an
+/// object, and a front end that repeated the `fn.` in its own constant would be a
+/// second spelling of this stage's mangling. B15 found exactly that: `C_OBJECT_ENTRY`
+/// was written out in the driver, and the two spellings agreed only by luck.
+pub const SYMBOL_PREFIX: &str = "fn.";
+
+/// A function's symbol name as it appears in an object.
+///
+/// Takes the **IR** name, so a caller that has lowered a program gets the object's
+/// spelling and does not have to know how the two relate.
+pub fn object_symbol(ir_name: &str) -> String {
+    let mut symbol = String::from(SYMBOL_PREFIX);
+    symbol.push_str(ir_name);
     symbol
 }
 

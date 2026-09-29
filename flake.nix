@@ -257,6 +257,30 @@
             fi
             test ! -e bad.lzo || { echo "lazcc wrote an object for a file it refused" >&2; exit 1; }
 
+            # B15: a target sysroot, written and then read back.
+            lazen sysroot "$work/hosted-sysroot"
+            for part in include/lazos/abi.h include/lazos/syscall.h \
+                        lib/libc.c runtime/lazen-runtime.lz \
+                        crt/crt1-lz64-lazen.lzo crt/crt1-lz64-c.lzo; do
+              test -f "$work/hosted-sysroot/$part" \
+                || { echo "the sysroot has no $part" >&2; exit 1; }
+            done
+
+            # A sysroot is the *same* target described somewhere a build can name it,
+            # so the object must be identical -- not merely equivalent.
+            lazcc hello.c -o built-in.lzo
+            lazcc hello.c --sysroot "$work/hosted-sysroot" -o via-sysroot.lzo
+            cmp built-in.lzo via-sysroot.lzo \
+              || { echo "a sysroot build and a built-in build disagree" >&2; exit 1; }
+
+            # A freestanding sysroot has no C library, and says so by name.
+            lazen sysroot "$work/kernel-sysroot" --freestanding
+            test ! -f "$work/kernel-sysroot/lib/libc.c" \
+              || { echo "a freestanding sysroot has a C library" >&2; exit 1; }
+            if lazcc hello.c --sysroot "$work/kernel-sysroot" -o kernel.lzo 2>/dev/null; then
+              echo "a hosted build used a freestanding sysroot" >&2; exit 1
+            fi
+
             touch "$out"
           '';
 

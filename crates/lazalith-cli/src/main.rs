@@ -49,6 +49,7 @@ mod format_cmd;
 mod new;
 mod pack;
 mod run;
+mod sysroot_cmd;
 
 /// The exit code for a program that refused, by diagnostic or by exit status.
 const EXIT_REFUSED: u8 = 1;
@@ -199,6 +200,7 @@ fn dispatch(arguments: &[OsString]) -> Result<Outcome, CliError> {
         "test" => run::tests(rest),
         "pack" => pack::run(rest),
         "deps" => deps::run(rest),
+        "sysroot" => sysroot_cmd::run(rest),
         "fmt" => format_cmd::run(rest),
         "help" | "--help" | "-h" => {
             print!("{}", usage_text());
@@ -230,7 +232,8 @@ COMMANDS
     run [file]       build, then execute the program under LazOS
     test [file]      run a project's tests and report pass or fail
     pack [out]       write a .lza from a manifest and a built image
-    deps             resolve a manifest's dependencies against local directories
+    deps             resolve a manifest.s dependencies against local directories
+    sysroot <dir>    write a target sysroot: headers, libraries, runtime, startup objects
     fmt [--check] [file]
                      format a file in the canonical style, or report that it is not
 

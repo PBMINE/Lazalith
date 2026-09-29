@@ -70,6 +70,7 @@ dependencies = [
  "lazalith-os",
  "lazalith-os-abi",
  "lazalith-runtime",
+ "lazalith-sysroot",
  "lazalith-toolchain",
  "lazalith-types",
 ]
@@ -163,6 +164,7 @@ dependencies = [
  "lazalith-machine",
  "lazalith-os",
  "lazalith-runtime",
+ "lazalith-sysroot",
  "lazalith-toolchain",
  "lazalith-types",
 ]
@@ -313,6 +315,21 @@ name = "lazalith-storage"
 version = "0.1.0"
 dependencies = [
  "lazalith-devices",
+ "lazalith-types",
+]
+
+[[package]]
+name = "lazalith-sysroot"
+version = "0.1.0"
+dependencies = [
+ "lazalith-c-compiler",
+ "lazalith-c-runtime",
+ "lazalith-codegen",
+ "lazalith-devices",
+ "lazalith-driver",
+ "lazalith-os-abi",
+ "lazalith-runtime",
+ "lazalith-toolchain",
  "lazalith-types",
 ]
 

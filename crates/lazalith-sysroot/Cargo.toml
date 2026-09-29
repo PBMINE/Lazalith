@@ -1,0 +1,23 @@
+[package]
+name = "lazalith-sysroot"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+description = "The target sysroot: where a build finds its headers, libraries, runtime and startup objects"
+
+[dependencies]
+lazalith-c-compiler = { path = "../lazalith-c-compiler" }
+lazalith-codegen = { path = "../lazalith-codegen" }
+lazalith-c-runtime = { path = "../lazalith-c-runtime" }
+lazalith-os-abi = { path = "../lazalith-os-abi" }
+lazalith-runtime = { path = "../lazalith-runtime" }
+lazalith-toolchain = { path = "../lazalith-toolchain" }
+lazalith-types = { path = "../lazalith-types" }
+
+[dev-dependencies]
+lazalith-devices = { path = "../lazalith-devices" }
+lazalith-driver = { path = "../lazalith-driver" }
+
+[lints]
+workspace = true

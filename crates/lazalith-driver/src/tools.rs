@@ -48,7 +48,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::{DriverError, IMAGE_SUFFIX, OBJECT_SUFFIX};
+use crate::{BuildTarget, DriverError, IMAGE_SUFFIX, OBJECT_SUFFIX};
 
 /// The exit code a tool uses when it refuses.
 const EXIT_REFUSED: u8 = 2;
@@ -174,7 +174,7 @@ fn job(arguments: &[OsString], suffix: &str, tool: &str) -> Result<Job, String> 
                 target = Some(PathBuf::from(value));
                 index += 1;
             }
-            "--target" => {
+            "--target" | "--sysroot" => {
                 let _ = arguments
                     .get(index + 1)
                     .ok_or_else(|| format!("{tool} --target needs a machine"))?;
@@ -259,6 +259,32 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), DriverError> {
 #[derive(Debug)]
 pub struct CcTool;
 
+/// The sysroot `--sysroot` names, or the built-in target.
+///
+/// **Absent is not an error.** No `--sysroot` means the target the toolchain was built
+/// with, which is what every build did before §19 and what most builds should keep
+/// doing: a sysroot is for a build that needs a *different* C library or runtime, and
+/// requiring one would make the common case pay for the uncommon one. A `--sysroot`
+/// that is *named* and cannot be opened is an error, because a build that asked for a
+/// target and silently got another one has been lied to.
+fn target_from(arguments: &[OsString], tool: &str) -> Result<BuildTarget, DriverError> {
+    let index = match arguments
+        .iter()
+        .position(|argument| argument.to_str() == Some("--sysroot"))
+    {
+        Some(index) => index,
+        None => return Ok(BuildTarget::BuiltIn),
+    };
+    let value = arguments
+        .get(index + 1)
+        .map(|value| value.to_string_lossy().into_owned())
+        .ok_or_else(|| DriverError::Io {
+            path: tool.to_string(),
+            message: format!("{tool} --sysroot needs a directory"),
+        })?;
+    BuildTarget::open(value)
+}
+
 impl CcTool {
     /// The tool's name, for a usage message.
     pub const NAME: &'static str = "lazcc";
@@ -270,27 +296,20 @@ impl CcTool {
             message,
         })?;
         let architecture = target_architecture(arguments, Self::NAME)?;
+        let target = target_from(arguments, Self::NAME)?;
         let text = read(&job.source)?;
         let source_path = job.source.display().to_string();
         let object = match job.source.extension().and_then(|ext| ext.to_str()) {
             // A `.c` file is a C program: the C frontend, the shared IR, the shared
             // backend. There is no branch downstream of this one.
-            Some("c") => {
-                let options = crate::CBuildOptions {
-                    architecture,
-                    source_path,
-                    runtime: String::from(lazalith_c_runtime::C_RUNTIME),
-                };
-                crate::compile_c(text.as_str(), &options)?
-            }
-            _ => {
-                let options = lazalith_runtime::BuildOptions {
-                    architecture,
-                    source_path,
-                    prelude: lazalith_runtime::library_text(),
-                };
-                crate::compile_lazen(text.as_str(), &options)?
-            }
+            Some("c") => crate::compile_c(
+                text.as_str(),
+                &target.c_build_options(architecture, source_path)?,
+            )?,
+            _ => crate::compile_lazen(
+                text.as_str(),
+                &target.build_options(architecture, source_path)?,
+            )?,
         };
         let bytes = object.to_bytes()?;
         Ok((job.target, bytes))
@@ -302,7 +321,7 @@ impl CcTool {
             arguments,
             Self::NAME,
             "compile a Lazen or C program to a `.lzo` object",
-            "<file.lz|file.c> [--target lz64]",
+            "<file.lz|file.c> [--target lz64] [--sysroot DIR]",
             || Self::run(arguments),
         )
     }

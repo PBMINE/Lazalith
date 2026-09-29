@@ -7932,3 +7932,107 @@ checked by executing them.**
 **B15, target sysroot** (§19) — the directory layout a hosted build, a freestanding
 build and a `lazpkg` install all agree on, and the first thing that makes
 `CBuildOptions::freestanding` mean something beyond a field.
+
+---
+
+# B15 — target sysroot (§19)
+
+## What this stage is
+
+§19 asks for a directory a build reads its target from, and for the six things a
+build needs to be **separate**: the compiler, the C library, the runtime, the startup
+objects, the OS headers and the target libraries.
+
+**Four of the six did not exist separately before this stage.** The C library was a
+Rust `const` in `lazalith-c-runtime`; the Lazen runtime was a `const` in
+`lazalith-runtime`; the startup object was not a file at all but a `format!` inside
+the linker; and the OS headers did not exist in any form, so a C program could not
+`#include` anything and had to write its own prototypes by hand.
+
+```text
+$ lazen sysroot ./sysroot
+wrote a hosted sysroot at ./sysroot
+  include/lazos/   abi.h, syscall.h
+  lib/libc.c
+  runtime/lazen-runtime.lz
+  crt/crt1-lz64-lazen.lzo
+  crt/crt1-lz64-c.lzo
+
+$ lazcc prog.c --sysroot ./sysroot -o prog.lzo
+```
+
+## What is real
+
+- **`lazalith-sysroot` writes and opens one.** `lazen sysroot <dir>` and
+  `lazalith_sysroot::Sysroot::{create, open}`.
+- **`lazcc --sysroot DIR` reads one.** The driver has a `BuildTarget`, which is either
+  the built-in target or a sysroot on disk.
+- **A sysroot is the same target, not a second one.** `lazcc prog.c` and
+  `lazcc prog.c --sysroot ./sysroot` produce **byte-identical objects** —
+  `the_toolchain_reads_a_sysroot_and_gets_the_same_object`, and again in `nix flake
+  check` and in CI by `cmp`.
+- **The headers are generated from the ABI's own table.** `include/lazos/syscall.h`
+  comes from `lazalith_os_abi::ABI_SYSCALLS` and `abi_signature`, so the header and
+  the compiler cannot disagree about a syscall's shape.
+
+## The tests, and the three that would catch a fake
+
+A directory is easy to test without testing anything — check four folders exist and
+call it a sysroot. That would pass for a sysroot no build ever reads, and the fact
+that the whole B14 toolchain worked without one is the reason it is worthless alone.
+So:
+
+- `a_c_program_built_against_a_sysroot_runs` — the library is read off disk, linked
+  with the sysroot's *own* startup object, and **executed**.
+- `the_generated_declarations_round_trip_through_the_c_front_end` — every generated
+  declaration is parsed by the C front end and its type compared with `abi_signature`.
+- `a_freestanding_sysroot_refuses_the_hosted_library` — the distinction is a refusal.
+- `the_toolchain_reads_a_sysroot_and_gets_the_same_object`, `a_sysroot_that_is_not_
+  there_is_refused`, `a_hosted_build_against_a_freestanding_sysroot_is_refused`.
+
+## Three things the evidence corrected
+
+1. **One startup object cannot serve both languages.** The first version wrote a single
+   `crt1-lz64.lzo` using the Lazen entry, and a C program linked against it failed with
+   `UndefinedSymbol: fn.main` — a C `main` is `fn.c.main`. §19 says *startup objects*,
+   and there is now one per entry language, named for both.
+2. **The flavour must be read from the directory.** Every sysroot was being opened
+   *as hosted*, so a freestanding one failed with `lib/libc.c: No such file or
+   directory` — a file the caller believed existed. A sysroot with `lib/libc.c` in it
+   is hosted; one without is freestanding.
+3. **A library is not a program.** The check that a sysroot's C library is valid C
+   initially *built* it into an object, and `lazen sysroot` refused to write anything
+   with `there is no main to start at`. A C library has no `main` — it is a collection
+   of definitions a program links against. The check is now a frontend check
+   (lex, parse, resolve, type-check), which is the question a library actually has.
+
+Also: `C_OBJECT_ENTRY` was a third spelling of the `fn.` mangling that codegen owns.
+It is now `lazalith_codegen::object_symbol`, and both the driver and the sysroot ask
+that stage for it.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1535 passed, 0 failed** (13 new)
+- `nix flake check`, `nix build`, `actionlint` ✅
+
+## Limitations at the end of this stage
+
+1. **No preprocessor, so nothing includes from the sysroot yet.** The header is on
+   disk and is the right bytes; `#include "lazos/syscall.h"` does not work. This is the
+   one thing standing between a sysroot and a kernel that includes its own headers.
+2. **The C library is stored as source, not as a prebuilt `.lzo`.** Deliberate — an
+   object is a build artefact of one compiler version. A `lazpkg`-installed library is
+   the later form.
+3. **No 32-bit sysroot**, and `lazen sysroot --target` says so rather than writing a
+   64-bit sysroot under a 32-bit name.
+4. **The kernel memory layout is still not in the sysroot.** `KernelMemory::regions`
+   describes where a kernel goes, and §19's layout has no place for it yet.
+5. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B16, C + ASM + Lazen interoperability** (§16.1) — the three front ends converging
+into one object pipeline, with a cross-language program that links objects from all
+three and runs.

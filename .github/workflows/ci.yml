@@ -172,6 +172,8 @@ jobs:
         run: nix develop --command cargo test -p lazalith-boot -p lazalith-toolchain --all-features
       - name: "B14: the toolchain stages are independent and agree"
         run: nix develop --command cargo test -p lazalith-driver --test stages -- --nocapture
+      - name: "B15: the target sysroot, and hosted against freestanding"
+        run: nix develop --command cargo test -p lazalith-sysroot --test sysroot -- --nocapture
 
   # Tier 3. Reproducibility: the same five checks the flake publishes, in the
   # same sandbox, on the same pinned nixpkgs that a developer's `nix flake check`
@@ -285,6 +287,26 @@ jobs:
             echo "lazcc accepted a C file with a type error" >&2; exit 1
           fi
           test ! -e "$work/bad.lzo"
+
+          # B15: a target sysroot, written and then read back by lazcc.
+          lazen sysroot "$work/hosted-sysroot"
+          for part in include/lazos/abi.h include/lazos/syscall.h \
+                      lib/libc.c runtime/lazen-runtime.lz \
+                      crt/crt1-lz64-lazen.lzo crt/crt1-lz64-c.lzo; do
+            test -f "$work/hosted-sysroot/$part" || { echo "no $part" >&2; exit 1; }
+          done
+          # A sysroot is the same target described somewhere a build can name it,
+          # so the object is identical, not merely equivalent.
+          lazcc "$work/hello.c" -o "$work/built-in.lzo"
+          lazcc "$work/hello.c" --sysroot "$work/hosted-sysroot" -o "$work/via-sysroot.lzo"
+          cmp "$work/built-in.lzo" "$work/via-sysroot.lzo"
+
+          # A freestanding sysroot has no C library, and refuses by name.
+          lazen sysroot "$work/kernel-sysroot" --freestanding
+          test ! -f "$work/kernel-sysroot/lib/libc.c"
+          if lazcc "$work/hello.c" --sysroot "$work/kernel-sysroot" -o "$work/kernel.lzo" 2>/dev/null; then
+            echo "a hosted build used a freestanding sysroot" >&2; exit 1
+          fi
       - name: Keep the built artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -67,10 +67,12 @@ use lazalith_types::ArchitectureConfig;
 
 mod c_frontend;
 mod lazen_frontend;
+mod target;
 pub mod tools;
 
 pub use c_frontend::{C_OBJECT_ENTRY, CBuildOptions, CFrontendError, compile_c};
 pub use lazen_frontend::{LazenFrontendError, compile_lazen};
+pub use target::BuildTarget;
 
 /// A stage of the toolchain, for a tool that reports which one it is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -160,6 +162,11 @@ pub enum DriverError {
     },
     /// A build stage failed inside `RuntimeProgram`, which owns its own error type.
     Runtime(RuntimeError),
+    /// The sysroot was missing, incomplete, or of the wrong flavour.
+    Sysroot {
+        /// What it said, already rendered.
+        error: lazalith_sysroot::SysrootError,
+    },
 }
 
 impl DriverError {
@@ -182,7 +189,10 @@ impl DriverError {
             Self::Object(_) => Some(Stage::Backend),
             Self::Link { .. } => Some(Stage::Link),
             Self::Image(_) => Some(Stage::Image),
-            Self::Io { .. } | Self::WrongArchitecture { .. } | Self::Runtime(_) => None,
+            Self::Io { .. }
+            | Self::WrongArchitecture { .. }
+            | Self::Runtime(_)
+            | Self::Sysroot { .. } => None,
         }
     }
 }
@@ -208,6 +218,7 @@ impl fmt::Display for DriverError {
                 wanted.word_width()
             ),
             Self::Runtime(source) => write!(f, "{source}"),
+            Self::Sysroot { error } => write!(f, "{error}"),
         }
     }
 }

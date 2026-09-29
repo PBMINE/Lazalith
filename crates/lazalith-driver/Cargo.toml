@@ -16,6 +16,7 @@ lazalith-ir = { path = "../lazalith-ir" }
 lazalith-isa = { path = "../lazalith-isa" }
 lazalith-os = { path = "../lazalith-os" }
 lazalith-runtime = { path = "../lazalith-runtime" }
+lazalith-sysroot = { path = "../lazalith-sysroot" }
 lazalith-toolchain = { path = "../lazalith-toolchain" }
 lazalith-types = { path = "../lazalith-types" }
 
