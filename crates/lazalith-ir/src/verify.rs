@@ -172,10 +172,21 @@ fn check_calls(module: &Module, function: &Function) -> Result<(), IrError> {
                     check_call_arity_and_types(function, callee, args)?;
                 }
                 CallTarget::Imported(name) => {
-                    return Err(
-                        IrError::new(IrErrorKind::UnresolvedImport { name: name.clone() })
-                            .in_function(&function.name),
-                    );
+                    // §16. A cross-module call is the one thing this module refers to
+                    // without defining, so **no local declaration is required** — there
+                    // may be none, and the linker is what finds the definition.
+                    //
+                    // This used to be refused outright, and that refusal was the reason
+                    // §16's three front ends could not call each other: C lowered a
+                    // function into one namespace, a Lazen `extern "c"` declaration
+                    // into the same one, and there was no way to *call* it from another
+                    // object. When a declaration happens to be present the call is
+                    // checked against it, exactly as a local one is; when it is not,
+                    // the call stands and the arity was already checked by the front
+                    // end that wrote the declaration.
+                    if let Some(callee) = module.function(name) {
+                        check_call_arity_and_types(function, callee, args)?;
+                    }
                 }
             }
         }

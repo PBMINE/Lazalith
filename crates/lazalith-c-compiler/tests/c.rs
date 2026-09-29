@@ -45,7 +45,7 @@ fn message(source: &str) -> String {
 fn only_function(lowered: &Lowered) -> &lazalith_ir::Function {
     lowered
         .module
-        .function(&lowered.entry)
+        .function(lowered.entry.as_deref().expect("a program has an entry"))
         .expect("a checked program always has an entry function")
 }
 
@@ -63,7 +63,11 @@ fn instructions(function: &lazalith_ir::Function) -> Vec<&Instruction> {
 #[test]
 fn an_empty_main_compiles() {
     let lowered = build("int main(void) { return 0; }").expect("an empty main compiles");
-    assert_eq!(lowered.entry, "c.main", "the entry is the C name, prefixed");
+    assert_eq!(
+        lowered.entry.as_deref(),
+        Some("c.main"),
+        "the entry is the C name, prefixed"
+    );
     assert!(lowered.module.function("c.main").is_some());
 }
 
@@ -100,7 +104,7 @@ fn a_local_is_a_named_frame_slot() {
     let lowered = build("int main(void) { int x = 7; return x; }")
         .expect("a local with a constant initialiser compiles");
     let frame = lowered
-        .frame(&lowered.entry)
+        .frame(lowered.entry.as_deref().expect("a program has an entry"))
         .expect("the entry has a frame");
     let local = frame
         .slots
@@ -295,7 +299,7 @@ fn a_struct_can_be_declared_and_held() {
     )
     .expect("a struct declaration and a local of that type compile");
     let frame = lowered
-        .frame(&lowered.entry)
+        .frame(lowered.entry.as_deref().expect("a program has an entry"))
         .expect("the entry has a frame");
     let slot = frame
         .slots
@@ -376,7 +380,7 @@ fn a_short_circuiting_operator_branches() {
 fn an_array_is_its_own_storage() {
     let lowered = build("int main(void) { int a[3]; return 0; }").expect("an array local compiles");
     let frame = lowered
-        .frame(&lowered.entry)
+        .frame(lowered.entry.as_deref().expect("a program has an entry"))
         .expect("the entry has a frame");
     let slot = frame
         .slots
@@ -418,7 +422,7 @@ fn the_integer_sizes_are_the_ones_the_abi_decided() {
         build("int main(void) { char a = 0; short b = 0; int c = 0; long d = 0; return 0; }")
             .expect("a program declaring each integer type compiles");
     let frame = lowered
-        .frame(&lowered.entry)
+        .frame(lowered.entry.as_deref().expect("a program has an entry"))
         .expect("the entry has a frame");
     for (name, size) in [("a", 1u32), ("b", 2), ("c", 4), ("d", 8)] {
         let slot = frame

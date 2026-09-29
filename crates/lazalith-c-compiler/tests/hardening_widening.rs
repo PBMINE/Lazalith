@@ -27,7 +27,7 @@ fn run_c(body: &str) -> (String, u32) {
     let program = generate(
         &lowered.module,
         &lowered.frames,
-        &lowered.entry,
+        lowered.entry.as_deref(),
         &CodegenOptions::lz64("t.c"),
         &unit,
     )

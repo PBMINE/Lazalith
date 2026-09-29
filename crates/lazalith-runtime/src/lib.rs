@@ -179,7 +179,7 @@ impl RuntimeProgram {
         let program = generate(
             &lowered.module,
             &lowered.frames,
-            &lowered.entry,
+            Some(&lowered.entry),
             &CodegenOptions {
                 architecture: options.architecture,
                 source_path: options.source_path.clone(),

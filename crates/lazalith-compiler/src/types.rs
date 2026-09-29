@@ -30,6 +30,7 @@ use lazalith_diagnostics::{Diagnostic, DiagnosticCode, Help, Label, Note, Severi
 use lazalith_os_abi::Syscall;
 use lazalith_types::{SourceId, SourceManager, SourceSpan, WordWidth};
 
+use crate::ast::Abi;
 use crate::ast::{ArithOp, BinaryOp, Block, CompareOp, Expr, IfArm, Stmt, TypeExpr, UnaryOp};
 use crate::diagnostic::StageError;
 use crate::lexer::IntSuffix;
@@ -765,6 +766,13 @@ pub struct CheckedFunction {
 pub struct CheckedExtern {
     /// The declared name.
     pub name: String,
+    /// The convention it was declared in.
+    ///
+    /// **Carried so the call side can name the same symbol the declaration did.** §16
+    /// added `extern "c"`, and a declaration that said `c.` while the call reached
+    /// `syscall.` would type-check and then fail to link with an undefined symbol 2014 the
+    /// kind of defect that only appears once a second language is involved.
+    pub abi: Abi,
     /// The syscall it maps to, or `None` for a call the design reserves for a
     /// later ABI step, which has no number yet.
     pub syscall: Option<Syscall>,
@@ -994,9 +1002,13 @@ impl<'a> Checker<'a> {
 
     // ------------------------------------------------------------- externs
 
-    fn check_extern(&mut self, item: &ResolvedExtern) -> Result<CheckedExtern, StageError> {
-        let syscall = abi_syscall(&item.name);
-        if syscall.is_none() && !is_reserved_design_syscall(&item.name) {
+    /// Checks that a `syscall` declaration names a call the ABI has actually numbered.
+    ///
+    /// Split out from [`Self::check_extern`] so the syscall rule is one function rather
+    /// than a branch inside a function that also handles C declarations, and so the
+    /// diagnostic says *which* rule was broken.
+    fn check_extern_syscall(&mut self, item: &ResolvedExtern) -> Result<(), StageError> {
+        if abi_syscall(&item.name).is_none() && !is_reserved_design_syscall(&item.name) {
             return Err(self.error(
                 codes::ABI_MISMATCH,
                 format!("`{}` is not an OS ABI syscall", item.name),
@@ -1008,8 +1020,25 @@ impl<'a> Checker<'a> {
                 &[],
             ));
         }
+        Ok(())
+    }
+
+    fn check_extern(&mut self, item: &ResolvedExtern) -> Result<CheckedExtern, StageError> {
+        // `extern "c"` names another language's function, and there is no table to
+        // check it against — which is correct: the check exists to catch a syscall
+        // name the ABI has not numbered, and a C function is not a syscall at all.
+        // What *is* checked for a C declaration is the same thing that is checked for
+        // a syscall: the arity, against the maximum this machine's ABI has registers
+        // and stack words for. A call with more arguments than the ABI can pass is
+        // refused whether the callee is the kernel or a C function.
+        if !matches!(item.abi, Abi::C) {
+            self.check_extern_syscall(item)?;
+        }
+        let syscall = abi_syscall(&item.name);
         // A reserved name has no number yet, so its arity cannot be checked
-        // against the ABI. The declaration is still fully type-checked.
+        // against the ABI. The declaration is still fully type-checked. A `c`
+        // declaration has no arity table either; `parameters.len()` is the answer
+        // either way, and the word-count check in the lowerer is what bounds it.
         let abi_arguments = match syscall {
             Some(syscall) => syscall.argument_count(),
             None => item.parameters.len(),
@@ -1047,6 +1076,7 @@ impl<'a> Checker<'a> {
         let result = self.type_of(&item.result)?;
         Ok(CheckedExtern {
             name: item.name.clone(),
+            abi: item.abi,
             syscall,
             parameters,
             result,

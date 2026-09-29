@@ -70,13 +70,14 @@ fn run(source: &str) -> Finished {
         .unwrap_or_else(|error| panic!("{source} should compile:\n{}", error.render()));
     let lowered = lower(&checked).unwrap_or_else(|error| panic!("{source} should lower: {error}"));
     assert_eq!(
-        lowered.entry, "c.main",
+        lowered.entry.as_deref(),
+        Some("c.main"),
         "the entry is the C `main`, and the C compiler's own prefix is the IR's"
     );
     let program = generate(
         &lowered.module,
         &lowered.frames,
-        &lowered.entry,
+        lowered.entry.as_deref(),
         &CodegenOptions::lz64("t.c"),
         source,
     )

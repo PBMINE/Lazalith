@@ -47,7 +47,7 @@ fn generate_lowered(
     generate(
         &lowered.module,
         &lowered.frames,
-        &lowered.entry,
+        Some(&lowered.entry),
         options,
         source,
     )

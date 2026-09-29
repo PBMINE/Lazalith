@@ -81,7 +81,7 @@ fn run_with_files(source: &str, files: &[(&str, &[u8])]) -> Finished {
     let program = generate(
         &lowered.module,
         &lowered.frames,
-        &lowered.entry,
+        lowered.entry.as_deref(),
         &CodegenOptions::lz64("program.c"),
         &unit,
     )

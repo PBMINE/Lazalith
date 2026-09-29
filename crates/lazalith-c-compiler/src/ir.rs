@@ -73,14 +73,20 @@ use crate::ctypes::{CType, RecordType};
 use crate::types::{CheckedCProgram, CheckedFunction, CheckedVariable};
 
 /// The prefix a lowered C function's symbol carries in the IR.
-pub const FUNCTION_PREFIX: &str = "c.";
+///
+/// **Re-exported from `lazalith-ir` rather than declared here**, because B16 found
+/// that a Lazen `extern "c"` declaration has to name a C function, and two crates
+/// holding a copy of the same prefix is a namespace collision waiting to happen.
+pub use lazalith_ir::C_FUNCTION_PREFIX as FUNCTION_PREFIX;
 
 /// The prefix a lowered ABI syscall's symbol carries in the IR.
 ///
 /// Distinct from [`FUNCTION_PREFIX`] so a C function called `write` and the
 /// ABI's `write` are two symbols. The backend strips this one, because the
 /// backend is what turns it into a number.
-pub const SYSCALL_PREFIX: &str = "syscall.";
+///
+/// Also from `lazalith-ir`, for the same reason as [`FUNCTION_PREFIX`].
+pub use lazalith_ir::SYSCALL_PREFIX;
 
 /// The most argument words a call may use: four registers and two stack words.
 pub const MAX_ARGUMENT_WORDS: u32 = 6;
@@ -169,8 +175,14 @@ pub struct Lowered {
     pub module: Module,
     /// One frame per lowered function, in module order.
     pub frames: Vec<FrameLayout>,
-    /// The IR name of the function the runtime starts at.
-    pub entry: String,
+    /// The IR name of the function the runtime starts at, or `None` for a library.
+    ///
+    /// **`None` is not a missing value, it is the fact.** A C *library* has no entry
+    /// point: it is linked into something that has one, and the thing that has one is
+    /// the only thing that can say where the image starts. Making this an `Option`
+    /// rather than an empty string is what stops a linker from being handed a name that
+    /// looks real and belongs to no function.
+    pub entry: Option<String>,
     /// A data segment per string literal, in the order they were interned.
     pub strings: Vec<String>,
 }
@@ -194,13 +206,42 @@ pub fn global_segment(name: &str) -> String {
 
 /// Lowers a checked C program into a verified IR module.
 pub fn lower(program: &CheckedCProgram) -> Result<Lowered, LowerError> {
-    if !program
-        .functions
-        .iter()
-        .any(|function| function.name == "main")
-    {
+    let lowered = lower_with_entry(program)?;
+    if lowered.entry.is_none() {
         return Err(LowerError::NoEntryPoint);
     }
+    Ok(lowered)
+}
+
+/// Lowers a **translation unit** that need not have a `main`.
+///
+/// **This is B16, and it is what a library is.** §16 requires C, Lazen and assembly to
+/// converge into one object pipeline, and the first thing that stops them converging is
+/// that there was no way to build a C file that is not a program. `lazcc lib.c` failed
+/// with `there is no `main` to start at` — a correct refusal of a *program*, asked of a
+/// *library*.
+///
+/// A library has no entry point because it is not entered; it is linked into something
+/// that is. So the answer is not to invent an entry but to carry `Option`: `None` here
+/// means "this module has no entry", and every consumer of it is a linker that will be
+/// told one by the thing that has a `main`.
+///
+/// The two entry points exist rather than one taking a flag because "may have an entry"
+/// is the kind of question whose answer is a `Result` in one direction and a plain value
+/// in the other. `lower` keeps its old meaning — a program — and `lower_library` is the
+/// new one.
+pub fn lower_library(program: &CheckedCProgram) -> Result<Lowered, LowerError> {
+    lower_with_entry(program)
+}
+
+/// Lowers a translation unit, with an entry point if it has a `main`.
+///
+/// Private because every caller wants a stated answer, not a decision made for it.
+fn lower_with_entry(program: &CheckedCProgram) -> Result<Lowered, LowerError> {
+    let has_main = program
+        .functions
+        .iter()
+        .any(|function| function.name == "main");
     let mut lowerer = Lowerer {
         program,
         module: ModuleBuilder::new("c"),
@@ -214,7 +255,7 @@ pub fn lower(program: &CheckedCProgram) -> Result<Lowered, LowerError> {
     Ok(Lowered {
         module,
         frames,
-        entry: ir_name("main"),
+        entry: has_main.then(|| ir_name("main")),
         strings,
     })
 }

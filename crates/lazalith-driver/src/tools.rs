@@ -174,12 +174,17 @@ fn job(arguments: &[OsString], suffix: &str, tool: &str) -> Result<Job, String> 
                 target = Some(PathBuf::from(value));
                 index += 1;
             }
+            // `--target` and `--sysroot` take a value; `-c` and `--library` do not.
+            // Both are skipped here and read by the function that owns them, so
+            // argument parsing has one home per option rather than two that must
+            // agree about where the value is.
             "--target" | "--sysroot" => {
                 let _ = arguments
                     .get(index + 1)
                     .ok_or_else(|| format!("{tool} --target needs a machine"))?;
                 index += 1;
             }
+            "-c" | "--library" => {}
             other if other.starts_with('-') => {
                 return Err(format!("{tool} does not take {other}"));
             }
@@ -259,6 +264,18 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), DriverError> {
 #[derive(Debug)]
 pub struct CcTool;
 
+/// Whether `-c` or `--library` was given.
+///
+/// **The `-c` of a real toolchain, and the same spelling.** A flag meaning "produce
+/// an object, do not link" is called `-c` by every compiler a user has met, and
+/// inventing a different name for it would be a worse decision than it is small. It
+/// carries its long form because the long form says what it does.
+fn library_flag(arguments: &[OsString]) -> bool {
+    arguments
+        .iter()
+        .any(|argument| matches!(argument.to_str(), Some("-c") | Some("--library")))
+}
+
 /// The sysroot `--sysroot` names, or the built-in target.
 ///
 /// **Absent is not an error.** No `--sysroot` means the target the toolchain was built
@@ -297,19 +314,33 @@ impl CcTool {
         })?;
         let architecture = target_architecture(arguments, Self::NAME)?;
         let target = target_from(arguments, Self::NAME)?;
+        let library = library_flag(arguments);
         let text = read(&job.source)?;
         let source_path = job.source.display().to_string();
         let object = match job.source.extension().and_then(|ext| ext.to_str()) {
             // A `.c` file is a C program: the C frontend, the shared IR, the shared
             // backend. There is no branch downstream of this one.
-            Some("c") => crate::compile_c(
-                text.as_str(),
-                &target.c_build_options(architecture, source_path)?,
-            )?,
-            _ => crate::compile_lazen(
-                text.as_str(),
-                &target.build_options(architecture, source_path)?,
-            )?,
+            Some("c") => {
+                let mut options = target.c_build_options(architecture, source_path)?;
+                options.library = library;
+                crate::compile_c(text.as_str(), &options)?
+            }
+            _ => {
+                if library {
+                    return Err(DriverError::Io {
+                        path: Self::NAME.to_string(),
+                        message: String::from(
+                            "lazcc --library is for C translation units. A Lazen file with \\
+                             no `fn main` is refused by the compiler, which is the right \\
+                             answer for a language whose programs are entered at fn.main",
+                        ),
+                    });
+                }
+                crate::compile_lazen(
+                    text.as_str(),
+                    &target.build_options(architecture, source_path)?,
+                )?
+            }
         };
         let bytes = object.to_bytes()?;
         Ok((job.target, bytes))

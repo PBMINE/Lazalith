@@ -331,8 +331,20 @@ fn a_call_to_a_missing_function_is_rejected() {
     );
 }
 
+/// An import to a name this module does not declare is **allowed**, and that is §16.
+///
+/// This test used to assert the opposite — that every `Imported` was refused — and it
+/// was right at the time: a cross-module call could not be written at all, which is
+/// why §16's three front ends could be linked together but never called each other.
+///
+/// The rule now is narrower and more useful. An import is *by definition* a reference
+/// to something this module does not define, so requiring a local declaration would
+/// require the module to contain a stub for every foreign function it uses — which is
+/// the thing that made the earlier attempt emit a `TRAP` and call it. When a
+/// declaration is present the call is checked against it; when it is absent the call
+/// stands, and the linker is what finds the definition.
 #[test]
-fn an_unresolved_import_is_rejected() {
+fn an_import_without_a_local_declaration_is_accepted() {
     let mut module = ModuleBuilder::new("test");
     let mut function = function_builder(&mut module, Type::Void);
     function.switch_to_block("entry").expect("entry");
@@ -348,13 +360,9 @@ fn an_unresolved_import_is_rejected() {
         .expect("terminator");
     let function = function.finish().expect("function");
     module.add_function(function).expect("add");
-    let error = module.finish().expect_err("unresolved import");
-    assert_eq!(
-        error.kind,
-        IrErrorKind::UnresolvedImport {
-            name: String::from("other::helper")
-        }
-    );
+    module
+        .finish()
+        .expect("a cross-module call with nothing to resolve against is still a call");
 }
 
 #[test]

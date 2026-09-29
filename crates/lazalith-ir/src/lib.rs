@@ -32,9 +32,10 @@ pub use builder::{BlockBuilder, FunctionBuilder, ModuleBuilder};
 pub use error::{IrError, IrErrorKind};
 pub use frame::{FrameLayout, FrameSlot, SlotPurpose};
 pub use ir::{
-    BinaryOp, Block, BlockId, CallArg, CallTarget, ComparisonOp, ConstValue, DataSegment, Function,
-    IrModule, Linkage, MemorySpace, Module, Name, Parameter, RecordField, ReturnValue, SourceEntry,
-    StoreWidth, Terminator, Type, UnaryOp, ValueId,
+    BinaryOp, Block, BlockId, C_FUNCTION_PREFIX, CallArg, CallTarget, ComparisonOp, ConstValue,
+    DataSegment, Function, IrModule, Linkage, MemorySpace, Module, Name, Parameter, RecordField,
+    ReturnValue, SYMBOL_PREFIX, SYSCALL_PREFIX, SourceEntry, StoreWidth, Terminator, Type, UnaryOp,
+    ValueId, c_ir_name, syscall_ir_name,
 };
 pub use ir::{Instruction, Intrinsic, LoadWidth};
 pub use verify::{

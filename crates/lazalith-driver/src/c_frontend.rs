@@ -124,6 +124,13 @@ pub struct CBuildOptions {
     /// rather than a convenience: B25's freestanding kernel will pass the empty
     /// string here and must not get a hosted runtime it did not ask for.
     pub runtime: String,
+    /// Whether this translation unit is a **library** rather than a program.
+    ///
+    /// **A library is a C file with no `main`, and refusing one would stop §16 before
+    /// it starts.** A library is a collection of definitions that something else is
+    /// linked into; demanding an entry point of it is asking a library to be a program.
+    /// With this set, a missing `main` is the fact being stated rather than an error.
+    pub library: bool,
 }
 
 impl CBuildOptions {
@@ -133,7 +140,17 @@ impl CBuildOptions {
             architecture: ArchitectureConfig::lz64(),
             source_path: source_path.into(),
             runtime: String::from(lazalith_c_runtime::C_RUNTIME),
+            library: false,
         }
+    }
+
+    /// Marks this translation unit as a library: definitions with no `main`.
+    ///
+    /// The runtime stays, because a library usually calls the C library too ''"strlen"''.
+    /// What changes is only the entry-point requirement.
+    pub fn as_library(mut self) -> Self {
+        self.library = true;
+        self
     }
 
     /// A freestanding C program: nothing in front but the program.
@@ -142,6 +159,7 @@ impl CBuildOptions {
             architecture: ArchitectureConfig::lz64(),
             source_path: source_path.into(),
             runtime: String::new(),
+            library: false,
         }
     }
 }
@@ -155,7 +173,7 @@ impl Default for CBuildOptions {
 /// The name a program gets when the caller did not say.
 const DEFAULT_PROGRAM_NAME: &str = "program.c";
 
-/// Compiles a C program to an object, stopping before the link.
+/// Compiles a C translation unit to an object, stopping before the link.
 ///
 /// **The stages are the same ones Lazen uses.** C is lexed, parsed, resolved and
 /// type-checked by `lazalith-c-compiler`, lowered to the shared `lazalith_ir::Module`,
@@ -166,6 +184,14 @@ const DEFAULT_PROGRAM_NAME: &str = "program.c";
 /// A `.c` file therefore produces a `.lzo` that `lazld` links and the machine runs,
 /// with nothing downstream knowing which language it came from. That is the claim
 /// §14 and §18 make, and `tests/stages.rs` checks it by running the result.
+///
+/// # A library and a program are both translation units
+///
+/// §16 requires C, Lazen and assembly to converge into one object pipeline, and the
+/// first thing that stopped them converging was that there was no way to build a C
+/// file that is not a program. A C *library* has no `main` — it is linked into
+/// something that has one — so `compile_c` does not demand an entry point, and the
+/// object records that it has none. See [`CBuildOptions::library`].
 pub fn compile_c(text: &str, options: &CBuildOptions) -> Result<ObjectFile, DriverError> {
     // The runtime and the program are one translation unit, exactly as the Lazen
     // standard library and a Lazen program are. That is what lets a C program call
@@ -197,15 +223,27 @@ pub fn compile_c(text: &str, options: &CBuildOptions) -> Result<ObjectFile, Driv
         Some(checked) => checked,
         None => return Err(DriverError::C(CFrontendError::Allocation)),
     };
-    let lowered = ir::lower(&checked).map_err(|error: LowerError| {
+    // A library and a program differ in one thing: whether they have to have a
+    // `main`. Everything after this line is identical, and that is the point of §16 —
+    // there is no second object pipeline, there is one pipeline and two questions
+    // about the entry point.
+    let lowered = if options.library {
+        ir::lower_library(&checked)
+    } else {
+        ir::lower(&checked)
+    }
+    .map_err(|error: LowerError| {
         DriverError::C(CFrontendError::Lower {
             detail: error.to_string(),
         })
     })?;
+    // `generate` marks the entry symbol callable, and a library has none: `None` is
+    // passed straight through, so the object records that it is not entered.
+    let entry = lowered.entry.clone();
     let program = generate(
         &lowered.module,
         &lowered.frames,
-        &lowered.entry,
+        entry.as_deref(),
         &CodegenOptions {
             architecture: options.architecture,
             source_path: options.source_path.clone(),

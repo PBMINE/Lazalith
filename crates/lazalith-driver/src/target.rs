@@ -148,6 +148,7 @@ impl BuildTarget {
             architecture,
             source_path,
             runtime: self.c_library()?,
+            library: false,
         })
     }
 }

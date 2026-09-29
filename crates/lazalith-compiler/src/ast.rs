@@ -500,6 +500,15 @@ pub struct Function {
 pub enum Abi {
     /// `extern "syscall"`: the OS ABI's own argument order.
     Syscall,
+    /// `extern "c"`: another language's ordinary calling convention.
+    ///
+    /// **The same ABI, which is the point.** §16 requires all three front ends to
+    /// converge into one object pipeline, and two front ends can only call each other
+    /// through one calling convention. Every generated function on this machine
+    /// already uses one: the entry sequence that calls a Lazen `main` uses the same
+    /// shape it would use to call a C one. So `extern "c"` adds no new calling
+    /// machinery at all — it names a different symbol in the same one.
+    C,
 }
 
 /// An `extern` declaration.

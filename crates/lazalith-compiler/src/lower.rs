@@ -67,6 +67,7 @@ use lazalith_ir::{
 };
 use lazalith_types::{SourceSpan, WordWidth};
 
+use crate::ast::Abi;
 use crate::types::{
     CheckedArm, CheckedBlock, CheckedExpr, CheckedExtern, CheckedFunction, CheckedPlace,
     CheckedProgram, CheckedStmt, LocalSlot, Type, ty_name,
@@ -254,7 +255,11 @@ pub fn lower(program: &CheckedProgram) -> Result<Lowered, LowerError> {
     // a call can be checked against it, and its body is unreachable because the
     // symbol is defined elsewhere.
     for declaration in &program.externs {
-        module.add_function(extern_declaration(declaration)?)?;
+        // `None` for a `c` declaration, which is a reference and not a definition 2014
+        // see `extern_declaration`.
+        if let Some(function) = extern_declaration(declaration)? {
+            module.add_function(function)?;
+        }
     }
     let mut frames = Vec::new();
     for function in &program.functions {
@@ -279,7 +284,7 @@ pub fn lower(program: &CheckedProgram) -> Result<Lowered, LowerError> {
 /// read is defined twice". A dot cannot appear in a Lazen qualified name, which
 /// either has no separator or joins its module with `::`, so the prefix cannot
 /// collide with a function however the language changes.
-fn extern_declaration(declaration: &CheckedExtern) -> Result<Function, LowerError> {
+fn extern_declaration(declaration: &CheckedExtern) -> Result<Option<Function>, LowerError> {
     let mut params = Vec::new();
     for parameter in &declaration.parameters {
         params.push(Parameter {
@@ -287,25 +292,52 @@ fn extern_declaration(declaration: &CheckedExtern) -> Result<Function, LowerErro
             ty: ir_type(&parameter.ty)?,
         });
     }
+    // A `c` declaration is **not emitted at all**, and that is the whole of what
+    // makes a cross-language call work.
+    //
+    // The first attempt declared it `Local` and bodiless, which is what an ABI syscall
+    // declaration is, and the program *linked* ''"no duplicate symbols, the two front ends
+    // agreed on the name"'' and then **trapped**: codegen emits a bodiless function as a
+    // `TRAP`, so the call reached this module's trap rather than the C definition in the
+    // other object. A symbol a module does not define must not be defined in it, even as
+    // a trap. The reference is the call; there is nothing to emit.
+    //
+    // The arity is not lost: `check_extern` already checked it in the front end, which
+    // is the stage that knows what the declaration was written against.
+    if declaration.abi == Abi::C {
+        return Ok(None);
+    }
     let mut module = ModuleBuilder::new("declaration");
     let mut builder = module.function(
-        &syscall_symbol(&declaration.name),
+        &extern_symbol(&declaration.abi, &declaration.name),
         Linkage::External,
         params,
         ir_type(&declaration.result)?,
     )?;
     builder.switch_to_block("declaration")?;
     builder.terminate(Terminator::Unreachable)?;
-    Ok(builder.finish()?)
+    Ok(Some(builder.finish()?))
 }
 
-/// The IR name of an ABI syscall.
+/// The IR name of an `extern` declaration, given the convention it was declared in.
 ///
-/// Used by both the declaration and the call that reaches it, because the IR
-/// verifier resolves a call target by name and a declaration the verifier cannot
-/// find is the same as a call to a function that is not there.
-fn syscall_symbol(name: &str) -> String {
-    format!("syscall.{name}")
+/// **This is where §16's three front ends meet.** One naming function, asked about a
+/// convention, rather than a name assembled at each use site:
+///
+/// - `extern "syscall" fn write(..)` names `syscall.write`, which the backend turns
+///   into the ABI's `SYSCALL`;
+/// - `extern "c" fn strlen(..)` names `c.strlen`, which is *exactly* what
+///   `lazalith_c_compiler::ir::ir_name` produces for a C `strlen` — so the declaration
+///   and the C definition are the same symbol, and a linker binds them.
+///
+/// The call side asks this same function (see the call lowering), because a
+/// declaration the verifier cannot find is the same as a call to a function that is
+/// not there.
+fn extern_symbol(abi: &Abi, name: &str) -> String {
+    match abi {
+        Abi::Syscall => lazalith_ir::syscall_ir_name(name),
+        Abi::C => lazalith_ir::c_ir_name(name),
+    }
 }
 
 /// Whether a type is a view: a pointer and a length, two words.
@@ -1859,16 +1891,38 @@ impl<'a> FunctionLowering<'a> {
                     detail: format!("a call to the undeclared extern `{callee}`"),
                     span: span.clone(),
                 })?;
-            if declaration.syscall.is_none() {
+            if declaration.syscall.is_none() && !matches!(declaration.abi, Abi::C) {
                 // The graphics and input designs name calls the ABI has not
                 // numbered. Inventing a number would make a program that calls
                 // the wrong thing, so this is refused here.
+                //
+                // **Not for `extern "c"`.** A C function is not a syscall and is not
+                // looked for in the syscall table at all; the table has nothing to say
+                // about it, and asking it anyway would refuse every C call as though it
+                // were an unnumbered syscall.
                 return Err(LowerError::UnnumberedSyscall {
                     name: String::from(callee),
                     span: span.clone(),
                 });
             }
-            CallTarget::Syscall(Name::from(&syscall_symbol(callee)))
+            // The convention decides the namespace, and the declaration already
+            // chose one — so this asks the same function the declaration did. A
+            // call that reached a different symbol than its own declaration would
+            // type-check and then fail to link.
+            match declaration.abi {
+                Abi::Syscall => {
+                    CallTarget::Syscall(Name::from(&extern_symbol(&declaration.abi, callee)))
+                }
+                // **Imported, not Function.** A `c.` function is defined in *another*
+                // module 2014 usually another language's object 2014 so this call is the only thing in
+                // this module that refers to it. The IR name is the same one the
+                // declaration carries, which is what lets the verifier resolve it; what
+                // makes it a *cross-module* reference is that the declaration is
+                // bodiless, and the linker that finds the definition.
+                Abi::C => {
+                    CallTarget::Imported(Name::from(&extern_symbol(&declaration.abi, callee)))
+                }
+            }
         } else {
             CallTarget::Function(Name::from(callee))
         };

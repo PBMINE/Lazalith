@@ -230,7 +230,7 @@ fn c_image() -> Vec<u8> {
     let program = generate_c(
         &lowered.module,
         &lowered.frames,
-        &lowered.entry,
+        lowered.entry.as_deref(),
         &CodegenOptions::lz64("program.c"),
         C,
     )

@@ -404,7 +404,7 @@ pub trait Backend {
         &self,
         module: &Module,
         frames: &[FrameLayout],
-        entry: &str,
+        entry: Option<&str>,
         options: &CodegenOptions,
         source_text: &str,
     ) -> Result<Program, CodegenError>;
@@ -425,7 +425,7 @@ impl Backend for NativeBackend {
         &self,
         module: &Module,
         frames: &[FrameLayout],
-        entry: &str,
+        entry: Option<&str>,
         options: &CodegenOptions,
         source_text: &str,
     ) -> Result<Program, CodegenError> {
@@ -450,7 +450,7 @@ pub fn available_backends() -> Vec<&'static dyn Backend> {
 pub fn generate(
     module: &Module,
     frames: &[FrameLayout],
-    entry: &str,
+    entry: Option<&str>,
     options: &CodegenOptions,
     source_text: &str,
 ) -> Result<Program, CodegenError> {
@@ -733,7 +733,7 @@ impl<'a> Generated<'a> {
         mut self,
         module: &Module,
         _frames: &[FrameLayout],
-        entry: &str,
+        entry: Option<&str>,
         source: &str,
         source_text: &str,
     ) -> Result<ObjectFile, CodegenError> {
@@ -795,7 +795,7 @@ impl<'a> Generated<'a> {
             // visibility between modules; a private `main` is still the only way in
             // for the loader, and a local symbol would leave the image with an
             // entry no startup code could call.
-            let binding = if function.name == entry {
+            let binding = if Some(function.name.as_str()) == entry {
                 SymbolBinding::Global
             } else {
                 binding
@@ -806,6 +806,27 @@ impl<'a> Generated<'a> {
         for (name, binding, section, offset, size) in &order {
             let symbol = Symbol::section_defined(name.clone(), *binding, *section, *offset, *size);
             indices.push((name.clone(), builder.add_symbol(symbol)?));
+        }
+        // **Undefined symbols for names this module references but does not define.**
+        //
+        // §16 is what needed this. Three front ends have to converge into one object
+        // pipeline, and a cross-language call is a reference to a symbol defined in
+        // another object — so an object that makes such a call and defines nothing
+        // under that name *has* to record the name, or the linker has nothing to
+        // resolve and the call is a relocation with no target.
+        //
+        // It is emitted here rather than at the call site because the call site does
+        // not know whether this module will define the name; a function may be called
+        // before it is defined, and a name this module *does* define must stay a
+        // definition. Deciding after the whole module is known is the only place where
+        // the answer is right.
+        for pending in &self.relocations {
+            if indices.iter().any(|(name, _)| *name == pending.label) {
+                continue;
+            }
+            let symbol = Symbol::undefined(pending.label.clone(), SymbolBinding::Global);
+            let index = builder.add_symbol(symbol)?;
+            indices.push((pending.label.clone(), index));
         }
         for pending in &self.relocations {
             let index = indices
@@ -834,15 +855,22 @@ impl<'a> Generated<'a> {
                 mapping.length,
             ))?;
         }
-        let entry_name = function_symbol(entry);
-        let entry = indices
-            .iter()
-            .find(|(name, _)| *name == entry_name)
-            .map(|(_, index)| *index)
-            .ok_or_else(|| CodegenError::MissingFrame {
-                function: entry.to_string(),
-            })?;
-        builder.set_entry(entry)?;
+        // A **library** sets no entry, and that is a fact rather than a failure. §16
+        // needs a C file with no `main` to lower to an object, and a library is not
+        // entered — it is linked into something that is. An object with no entry
+        // symbol is the honest outcome; the linker is told the entry by the module that
+        // has one.
+        if let Some(entry) = entry {
+            let entry_name = function_symbol(entry);
+            let entry = indices
+                .iter()
+                .find(|(name, _)| *name == entry_name)
+                .map(|(_, index)| *index)
+                .ok_or_else(|| CodegenError::MissingFrame {
+                    function: entry.to_string(),
+                })?;
+            builder.set_entry(entry)?;
+        }
         Ok(builder.build()?)
     }
 }
@@ -866,12 +894,12 @@ pub(crate) fn function_symbol(name: &str) -> Name {
 
 /// The prefix code generation puts on every function's symbol in an object.
 ///
-/// **Public because the prefix belongs to this stage and not to any one front end.**
-/// A linker, a debugger or a sysroot has to know what a function is *called* in an
-/// object, and a front end that repeated the `fn.` in its own constant would be a
-/// second spelling of this stage's mangling. B15 found exactly that: `C_OBJECT_ENTRY`
-/// was written out in the driver, and the two spellings agreed only by luck.
-pub const SYMBOL_PREFIX: &str = "fn.";
+/// **Re-exported from `lazalith-ir`**, where B16 put it because a front end writing a
+/// cross-module call has to build the same string this stage mangles definitions with,
+/// and a front end cannot depend on codegen. A linker, a debugger or a sysroot also
+/// needs it: B15 found `C_OBJECT_ENTRY` written out by hand in the driver, agreeing
+/// with this mangling only by luck.
+pub use lazalith_ir::SYMBOL_PREFIX;
 
 /// A function's symbol name as it appears in an object.
 ///

@@ -8036,3 +8036,111 @@ that stage for it.
 **B16, C + ASM + Lazen interoperability** (§16.1) — the three front ends converging
 into one object pipeline, with a cross-language program that links objects from all
 three and runs.
+
+---
+
+# B16 — C + ASM + Lazen interoperability (§16)
+
+## What this stage is
+
+§16 requires all three front ends to converge into one object pipeline, and says it
+plainly: "There must NOT be separate executable ecosystems for C, Lazen, and
+assembly."
+
+**Linking them together was the easy half, and it already worked.** Three objects, one
+`lazld`, one `.lzx` — B14 proved that. The hard half is that they can **call** each
+other, because a link is not interoperability: two objects that share an image and
+never reference each other are two executables sharing a file format.
+
+## What it took
+
+**A Lazen `extern "c"`.** §16.1's own text used to forbid it — the Lazen parser said
+"`extern \"c\"`, `extern \"system\"`, and inline assembly are not in v1". It now
+parses, type-checks and lowers, naming `c.<name>` — **exactly** what
+`lazalith_c_compiler::ir::ir_name` produces for the C function of the same name, so
+the declaration and the definition are one symbol and the linker binds them.
+
+**A C file with no `main` is a library.** `lazcc lib.c` failed with `there is no main
+to start at`, which is the *right* refusal of a *program* asked of a *library*.
+`lazcc -c` (or `--library`) builds one; `Lowered::entry` is now an `Option`, and
+`generate` takes an `Option<&str>` rather than a name that might belong to nothing.
+
+**The IR had to be able to express a cross-module call at all.** `CallTarget::Imported`
+existed and `lazalith_ir::verify` rejected **every** use of it. There was no way to
+write a call to a function in another object. It now checks an import against a local
+declaration when there is one and lets it stand when there is not.
+
+**An object must record a symbol it references but does not define.** See below.
+
+## The trap, and why only running the image found it
+
+The first working-looking attempt declared the Lazen side `Local` and bodiless — which
+is what an ABI syscall declaration is. The two objects then agreed on `fn.c.triple`
+and **linked**. And the program **trapped**: codegen emits a bodiless function as a
+`TRAP`, so the call reached this module's own trap instead of the C definition in the
+other object.
+
+> A symbol a module does not define must not be defined in it, even as a trap. The
+> reference is the call; there is nothing to emit.
+
+So `extern "c"` declarations are not emitted at all, and `lazalith_codegen` now
+records an **undefined symbol** for a name it calls and does not define — decided
+after the whole module is known, because the call site cannot know whether this
+module will define the name.
+
+## Tests
+
+`crates/lazalith-driver/tests/interop.rs`, 5 tests:
+
+- `lazen_calls_c` — `triple(14)` returns **42**. A wrong register or a wrong target
+  cannot produce that.
+- `a_cross_language_call_carries_a_pointer_and_a_length` — C reads a Lazen *view* (a
+  pointer and a length) and checksums exactly the bytes named. A single-integer call
+  fits in registers; a view is the difference between agreeing on a symbol and
+  agreeing on a machine.
+- `all_three_front_ends_share_one_linker_and_one_image` — C + assembly + Lazen
+  objects in one image, executed.
+- `a_c_file_with_no_main_is_a_library_and_says_so` — the `-c` distinction.
+- `a_call_to_a_missing_c_function_is_a_link_error` — an unresolved import is a link
+  error naming `fn.c.nowhere`, not a silent trap.
+
+**A near-miss worth recording.** The first draft of the pointer test passed a Lazen
+`str` to a C `const char *` and had C walk to a NUL. A Lazen `str` is a pointer and a
+length; it is *not* NUL terminated, so C read past the end of the string and counted
+one byte too many — an out-of-bounds read that a plausible-looking expected value would
+have hidden. The two languages agree about how to pass a pointer and **do not** agree
+about what a string is. §16's "same ABI" is about the calling convention, not about the
+languages' types being interchangeable.
+
+## Also: one namespace, one place
+
+`lazalith_c_compiler::ir` had its own `FUNCTION_PREFIX` and `SYSCALL_PREFIX`, and a
+Lazen `extern "c"` declaration has to name the same namespace a C definition does. Two
+constants, one meaning, two crates that can be edited independently. They now live in
+`lazalith_ir` (`C_FUNCTION_PREFIX`, `SYSCALL_PREFIX`, `SYMBOL_PREFIX`) and both front
+ends re-export them.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1540 passed, 0 failed** (5 new)
+- `nix flake check`, `nix build`, `actionlint` ✅
+
+## Limitations at the end of this stage
+
+1. **Lazen calls C and assembly; C does not yet call Lazen.** The other direction needs
+   C's front end a way to name a symbol outside its own namespace — the C equivalent of
+   `__asm__("name")`. It is a parser and resolver change of the same size as this one.
+2. **The two languages' types are not interchangeable.** A Lazen `str` is a view; a C
+   string is NUL terminated. The ABI is shared; the types are not, and nothing pretends
+   otherwise.
+3. **No preprocessor**, so an object cannot `#include` a header that would declare a
+   foreign function for it.
+4. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B17, debugging all three languages** (§17) — one debug format covering C, Lazen and
+assembly, so a debugger can answer "which language is this line in?" without the
+answer being per-object guesswork.

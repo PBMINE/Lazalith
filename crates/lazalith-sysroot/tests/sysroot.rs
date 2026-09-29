@@ -361,6 +361,7 @@ fn a_c_program_built_against_a_sysroot_runs() {
             architecture: ArchitectureConfig::lz64(),
             source_path: String::from("sysroot.c"),
             runtime: library,
+            library: false,
         },
     )
     .expect("a C program builds against the sysroot's library");

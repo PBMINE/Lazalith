@@ -820,3 +820,38 @@ impl fmt::Display for RecordField {
         write!(f, "{}: {}", self.name, self.ty)
     }
 }
+
+/// The prefix code generation puts on every function's symbol in an object.
+///
+/// **In the IR, not in codegen, because two front ends have to build it.** A
+/// `extern "c"` declaration becomes a cross-module call, and a cross-module call is
+/// written with the *object* symbol, not the IR name. The front end that writes the
+/// call and the stage that mangles the definition therefore both need this string,
+/// and B16 put it in codegen first, which is one crate the front end cannot see.
+pub const SYMBOL_PREFIX: &str = "fn.";
+
+/// The namespace a lowered **C** function's symbol lives in.
+///
+/// **Here, and not in a front end, because two front ends have to agree on it.**
+/// `lazalith_c_compiler::ir` has always had its own `FUNCTION_PREFIX`, and
+/// `lazalith_compiler` maps a Lazen `extern "c"` declaration into that same namespace
+/// so a Lazen program can call a C function. Two constants, one meaning, two crates
+/// that can be edited independently — which is a namespace collision waiting for the
+/// first time either is changed.
+pub const C_FUNCTION_PREFIX: &str = "c.";
+
+/// The namespace an **ABI syscall's** symbol lives in.
+///
+/// Distinct from [`C_FUNCTION_PREFIX`] so a C function called `write` and the ABI's
+/// `write` are two symbols, and distinct from everything a *language* defines.
+pub const SYSCALL_PREFIX: &str = "syscall.";
+
+/// The IR name of a C function called `name`.
+pub fn c_ir_name(name: &str) -> String {
+    alloc::format!("{C_FUNCTION_PREFIX}{name}")
+}
+
+/// The IR name of the ABI syscall called `name`.
+pub fn syscall_ir_name(name: &str) -> String {
+    alloc::format!("{SYSCALL_PREFIX}{name}")
+}

@@ -61,10 +61,10 @@ fn the_seam_is_real_because_the_native_backend_produces_the_same_object() {
     // because "the same object" has to mean the same object.
     let (module, frames, entry) = lowered(PROGRAM);
     let options = CodegenOptions::lz64("t.lazen");
-    let direct = generate(&module, &frames, &entry, &options, PROGRAM)
+    let direct = generate(&module, &frames, Some(&entry), &options, PROGRAM)
         .expect("the free function should generate");
     let through_the_trait = NativeBackend
-        .generate(&module, &frames, &entry, &options, PROGRAM)
+        .generate(&module, &frames, Some(&entry), &options, PROGRAM)
         .expect("the native backend should generate");
     assert_eq!(
         direct
@@ -169,7 +169,7 @@ fn the_native_backend_generates_a_program_the_linker_can_use() {
     let (module, frames, entry) = lowered(PROGRAM);
     let options = CodegenOptions::lz64("t.lazen");
     let program = NativeBackend
-        .generate(&module, &frames, &entry, &options, PROGRAM)
+        .generate(&module, &frames, Some(&entry), &options, PROGRAM)
         .expect("the native backend should generate");
     assert!(
         program

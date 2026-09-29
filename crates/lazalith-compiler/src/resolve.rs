@@ -20,6 +20,7 @@ use alloc::{
 use lazalith_diagnostics::{Diagnostic, DiagnosticCode, Help, Label, Note, Severity};
 use lazalith_types::{SourceId, SourceManager, SourceSpan};
 
+use crate::ast::Abi;
 use crate::ast::{
     Block, ConstDecl, Expr, ExternDecl, Function, Item, Name, Path, Program, Stmt, TypeAnnotation,
 };
@@ -101,6 +102,8 @@ pub struct Parameter {
 /// An `extern` declaration with everything the later stages need.
 #[derive(Clone, Debug)]
 pub struct ResolvedExtern {
+    /// The convention, from the declaration.
+    pub abi: Abi,
     /// The declared name.
     pub name: String,
     /// The parameters, in ABI order.
@@ -469,6 +472,7 @@ fn resolve_extern(
         });
     }
     Ok(ResolvedExtern {
+        abi: extern_decl.abi,
         name: extern_decl.name.text.clone(),
         parameters,
         result: extern_decl.result.clone(),

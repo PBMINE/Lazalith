@@ -1391,7 +1391,10 @@ impl<'a> FunctionEmitter<'a> {
         match target {
             CallTarget::Syscall(name) => self.syscall(name, args, result),
             CallTarget::Function(name) => self.call_function(&function_symbol(name), args, result),
-            CallTarget::Imported(name) => self.call_function(name, args, result),
+            // Mangled like any other function symbol: an import names an IR name, and
+            // the object symbol is this stage's business. B16 found it using the name
+            // verbatim, which would have called `triple` rather than `fn.c.triple`.
+            CallTarget::Imported(name) => self.call_function(&function_symbol(name), args, result),
         }
     }
 

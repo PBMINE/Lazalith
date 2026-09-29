@@ -257,6 +257,20 @@
             fi
             test ! -e bad.lzo || { echo "lazcc wrote an object for a file it refused" >&2; exit 1; }
 
+            # B16: three front ends, one linker, one image 2014 and a cross-language call.
+            printf "int triple(int value) { return value * 3; }\n" > math.c
+            lazcc -c math.c -o math.lzo
+            cat > bridge.lz <<LAZEN
+            extern "c" fn triple(value: i32) -> i32;
+
+            fn main() -> i32 {
+                return triple(14);
+            }
+            LAZEN
+            lazcc bridge.lz -o bridge.lzo
+            lazld math.lzo bridge.lzo -o interop.lzx --entry fn.main
+            test -s interop.lzx
+
             # B15: a target sysroot, written and then read back.
             lazen sysroot "$work/hosted-sysroot"
             for part in include/lazos/abi.h include/lazos/syscall.h \

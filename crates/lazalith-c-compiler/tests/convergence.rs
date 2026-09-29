@@ -116,13 +116,14 @@ fn c_object() -> ObjectFile {
     let lowered = lazalith_c_compiler::ir::lower(&checked)
         .unwrap_or_else(|error| panic!("the C program should lower: {error}"));
     assert_eq!(
-        lowered.entry, "c.main",
+        lowered.entry.as_deref(),
+        Some("c.main"),
         "the entry is the C `main`, under the C compiler's own prefix"
     );
     generate(
         &lowered.module,
         &lowered.frames,
-        &lowered.entry,
+        lowered.entry.as_deref(),
         &CodegenOptions::lz64("t.c"),
         C,
     )
@@ -151,7 +152,7 @@ fn lazen_object() -> ObjectFile {
     generate(
         &lowered.module,
         &lowered.frames,
-        &lowered.entry,
+        Some(&lowered.entry),
         &CodegenOptions::lz64("t.lz"),
         &source,
     )

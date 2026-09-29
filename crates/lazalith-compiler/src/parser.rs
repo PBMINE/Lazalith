@@ -450,19 +450,27 @@ impl<'a> Parser<'a> {
 
     fn parse_extern(&mut self) -> Result<ExternDecl, StageError> {
         let start = self.expect(&TokenKind::Extern)?.span.start().as_u32();
-        if !self.at_str("syscall") {
+        if !self.at_str("syscall") && !self.at_str("c") {
             let abi_token = self.peek().clone();
             return Err(self.diagnostic(
                 codes::EXPECTED,
-                "the only foreign calling convention in Lazen v1 is `syscall`",
+                "the foreign calling conventions in Lazen v1 are `syscall` and `c`",
                 self.token_span(&abi_token),
-                &["`extern \"c\"`, `extern \"system\"`, and inline assembly are not in v1"],
-                Some("write `extern \"syscall\"`"),
+                &[
+                    "`extern \"c\"` calls a C or assembly function; `extern \"syscall\"` \
+                     calls the OS ABI",
+                ],
+                Some("write `extern \"syscall\"` or `extern \"c\"`"),
                 &[],
             ));
         }
-        self.advance();
-        let abi = Abi::Syscall;
+        let abi = if self.at_str("syscall") {
+            self.advance();
+            Abi::Syscall
+        } else {
+            self.advance();
+            Abi::C
+        };
         self.expect(&TokenKind::Fn)?;
         let name = self.parse_name()?;
         let parameters = self.parse_parameters()?;
