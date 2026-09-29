@@ -8,6 +8,7 @@ mod display;
 mod graphics;
 pub mod host_input;
 pub mod input;
+mod input_backend;
 mod storage;
 pub mod timer;
 pub use backend::{
@@ -40,6 +41,11 @@ pub use input::{
     REGISTER_LAST_CAPACITY, REGISTER_LAST_COUNT, REGISTER_PENDING,
     REGISTER_POLL as INPUT_REGISTER_POLL, REGISTER_STATUS as INPUT_REGISTER_STATUS,
     STATUS_INJECTED,
+};
+pub use input_backend::usb;
+pub use input_backend::{
+    AbsentInputBackend, InputBackend, InputBackendError, InputProfile, InputPump,
+    ScriptedInputBackend, pump_input,
 };
 pub use storage::{
     BLOCK_ABI_VERSION, BLOCK_REGISTER_BYTES, BLOCK_REGISTER_CAPACITY, BLOCK_REGISTER_COMMAND,

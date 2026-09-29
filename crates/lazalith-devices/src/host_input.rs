@@ -45,6 +45,8 @@
 use alloc::vec::Vec;
 
 use crate::input::{Event, EventKind, InputDevice, InputError};
+use crate::input_backend::ScriptedInputBackend;
+use lazalith_types::DeviceId;
 
 /// A key, in the *host's* numbering.
 ///
@@ -502,14 +504,57 @@ impl HostScript {
     /// device's own `inject_all` does: skipping the action that did not fit would
     /// deliver a *reordered* stream, and a program whose keys arrived out of order
     /// would have no way to tell. Returns how many actions went in.
+    ///
+    /// **Now a call through the B9 boundary rather than a direct reach into the
+    /// device.** The body used to be the loop below, pushing events at `device`
+    /// itself. It is still that loop, but it runs as a `ScriptedInputBackend` being
+    /// pumped, which is what makes it possible for a caller to have two input sources —
+    /// a script *and* a real keyboard — without either reaching the device itself.
+    ///
+    /// The budget is the number of events the script can produce, so the pump cannot
+    /// stop early: an unbounded budget would be a no-argument guess, and a budget too
+    /// small would truncate a replay for no reason.
     pub fn replay(&self, device: &mut InputDevice) -> Result<u64, InputError> {
-        let mut done: u64 = 0;
-        for action in &self.actions {
-            for event in action.events() {
-                device.inject(event)?;
+        let budget = self.events().count().max(1) as u64;
+        let mut backend = ScriptedInputBackend::from_actions(self.actions.clone(), device_id());
+        match crate::input_backend::pump_input(device, &mut backend, budget) {
+            Ok(crate::input_backend::InputPump::Delivered { count }) => Ok(count),
+            Ok(crate::input_backend::InputPump::Idle) => Ok(0),
+            Ok(crate::input_backend::InputPump::QueueFull { limit }) => {
+                Err(InputError::QueueFull { limit })
             }
-            done += 1;
+            // A scripted backend cannot produce a host failure: it is a list of
+            // events, and there is no host to fail. `ScriptedInputBackend` returns
+            // `Ok` from every poll, so the `Host` arm is unreachable by construction
+            // and there is no `InputError` that means it.
+            //
+            // It is still handled rather than `unreachable!()`-ed, because the
+            // alternative is a panic in a library and this arm is three lines. The
+            // `QueueFull` with a limit of zero is the closest honest report: nothing
+            // was delivered, and a limit of zero is a queue that accepted nothing.
+            Err(crate::input_backend::InputBackendError::Device(source)) => Err(source),
+            Err(crate::input_backend::InputBackendError::Host { .. }) => {
+                Err(InputError::QueueFull { limit: 0 })
+            }
         }
-        Ok(done)
     }
+
+    /// Every guest event this script would produce, in order.
+    ///
+    /// `HostAction` is `Copy`, so this hands out owned events rather than borrows. That
+    /// is what lets a caller count them without cloning a script first.
+    pub fn events(&self) -> impl Iterator<Item = Event> {
+        self.actions.iter().flat_map(|action| action.events())
+    }
+}
+
+/// A device id for a script that is replayed into a device directly.
+///
+/// A script has no device of its own — it is a *source*, and the device it feeds is
+/// whichever one the caller passed to `replay` — so this is the id the backend reports
+/// for "who is producing these events", and it is deliberately not derived from the
+/// device. A caller that wants the script to claim a particular device should use
+/// [`ScriptedInputBackend::from_actions`] directly.
+fn device_id() -> DeviceId {
+    DeviceId::new(0)
 }

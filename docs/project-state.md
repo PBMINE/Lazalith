@@ -7128,3 +7128,139 @@ and USB as a pair.
 
 **B8's remaining half** is smaller and would finish §31: a `BlockStorage::File` variant
 so `lza64-virt-v1` becomes a profile a caller can actually build.
+
+---
+
+# B9 — input architecture
+
+`binstruction.md` §30, and §25's "Standard Computer Hardware → keyboard, mouse".
+Preceded by `1dfc92b` (B8).
+
+## What was already there, confirmed
+
+- `InputDevice`: a real guest-visible register interface with an event queue, poll,
+  pending, delivered, injected and status registers.
+- `Event`, `EventKind`, and an `InputError` that distinguishes a full queue from a
+  capacity mistake.
+- `host_input`: `HostKey`, `HostAction`, and `HostScript` with a `replay` that pushed
+  events **directly into the device**.
+
+## What changed
+
+### `InputBackend`, a source rather than a sink
+
+`InputBackend::poll` asks the host for the next event; `pump_input` moves events from a
+backend into a device up to a budget. `ScriptedInputBackend` and `AbsentInputBackend` in
+`lazalith-devices`; `Sdl3InputBackend` in `lazalith-gui`.
+
+**Source, not sink, and the reason is B7's.** Input is produced by the host
+asynchronously, and a guest's register read must not call into SDL — a host that had
+stopped answering would stall the machine with no fault and no timeout. So the device
+never asks for an event; a free function the host calls writes it.
+
+`HostScript::replay` still exists and still returns `Result<u64, InputError>`, but it is
+now a `ScriptedInputBackend` being pumped. **The capability that buys is two sources on
+one device** — a deterministic script *and* a real keyboard — which was impossible while
+`replay` reached into the device itself.
+
+### `InputProfile` and §30's USB hierarchy
+
+`Virtual` (buildable), `Ps2`, `UsbHid` (named, unbuildable). `usb::LEVELS` is
+`[Controller, Bus, Device]` with `is_buildable() == false` for all three.
+
+PS/2 needs the PIO address space LZA does not have — **B4's recorded, still-open
+question** — and USB HID needs a bus, which is §33. §30's fourth level, the host
+backend, is this crate and exists.
+
+### A design error, caught and fixed: `poll` has to be fallible
+
+The first `InputBackend::poll` returned a bare `Option<Event>`. That left the SDL backend
+nowhere to put a failure: it could only count it as a dropped event, which made "SDL is
+broken" and "the keyboard is unplugged" **indistinguishable to a caller** — and those
+are the two diagnoses a user actually reports. It also created an `InputBackendError::
+Host` variant that could never be constructed, which is the clearest sign a design is
+wrong.
+
+So `poll` is `Result<Option<Event>, InputBackendError>` and an SDL failure is reported
+with SDL's own words.
+
+## The bug the stdlib suite caught
+
+`ScriptedInputBackend` returned an action's **first** event and advanced its cursor past
+the action. `HostAction::Printable` is a key *and* a character — two guest events — so
+every `Printable` in a script silently lost its second event.
+
+Nothing in `lazalith-devices` noticed, because every device test used single-event
+actions. What caught it was
+`lazalith-stdlib`'s `a_program_reacts_to_scripted_keyboard_input`: a real guest program,
+booted, handed a six-event script, and asked to count what it received. It failed with
+`"the program read the whole script: \"\""` and exit code 1.
+
+**This is the strongest argument in this project's history for keeping the end-to-end
+suites.** The boundary was new, the unit tests were new, and they all passed on a
+backend that dropped events — because the bug was only visible in a guest that asked for
+more than one. Two tests now exist at the devices level
+(`a_multi_event_action_delivers_every_event_in_order` and
+`a_multi_event_action_survives_the_pump`) so it is caught in the crate that owns it, and
+the stdlib test remains as the one that boots a real program.
+
+## Invariants now checked rather than asserted
+
+| Invariant | Test |
+| --- | --- |
+| The input device and the input backend do not hold each other | `the_input_device_and_the_input_backend_do_not_hold_each_other` |
+
+The first draft of that test forbade `&mut InputDevice` anywhere in the module, and
+**failed on `pump_input`** — which is the boundary, written as a free function precisely
+so the one place the device is written is visible in a signature. The test now checks the
+`InputBackend` trait body and every `impl InputBackend for` block, and separately
+asserts that at least two implementations exist so the test cannot quietly stop checking
+the rest.
+
+## Tests
+
+`crates/lazalith-devices/tests/input_backend.rs`, 17 tests: the pump (delivery, idleness,
+budget, a zero budget refused, a full queue reported, a host failure propagated rather
+than flattened), the boundary (a pump does not move the device's counters, two sources on
+one device), the profiles, and the scripted backend including the two multi-event tests.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
+- `cargo test --workspace --all-features`: **1439 passed, 0 failed**
+- `nix flake check`, `nix build`, `actionlint` ✅
+
+## Limitations at the end of this stage
+
+1. **No PS/2, no USB HID.** Named and unbuildable. PS/2 needs PIO, which needs B4's
+   question answered; USB HID needs a bus, which is §33.
+2. **No USB bus, controller or device.** `usb::LEVELS` is a list of names. A USB device
+   with no bus behind it is a device that can be described and not attached.
+3. **The SDL backend maps only key presses.** SDL also reports mouse motion, buttons and
+   text, and `SdlInput` currently reduces most of that away. `EventKind` and `HostAction`
+ * both model pointers, so the guest side is ready; the SDL side is not. §30 asks for
+   "keyboard/mouse/controller" and only the keyboard is mapped.
+4. **Auto-repeat is dropped**, deliberately, so a replayed session and a live one produce
+   the same event stream. The counter `dropped()` makes that visible.
+5. **The keycode is sent, not the scancode.** Keycodes are layout dependent, so "the
+   user pressed the key labelled Q" arrives as whatever that layout produces. A guest
+   that cares about *position* needs the scancode, and there is no way to ask for it.
+6. **`InputBackendError::Host` is unreachable from a scripted backend**, so
+   `HostScript::replay`'s handler for it returns `QueueFull { limit: 0 }`. That is the
+   least-wrong mapping and it is documented as such rather than `unreachable!()`-ed,
+   because a panic in a library is worse than an approximation nobody can reach.
+7. **PIO still does not exist**, which now blocks three things: B9's PS/2, B12's
+   expansion bus, and B27's AT machine. It is the single highest-leverage unbuilt thing
+   in the roadmap and it has been open since B4.
+8. **aarch64-linux unchecked**, no cold `nix flake check` timing.
+
+## Next stage
+
+**B10, audio architecture** (§29). The third of §26's device list, and the one where the
+pull/push question is *different again*: audio has a rate, so a backend has a clock and a
+device has a buffer. That is worth getting right rather than copying B9's shape.
+
+**B12, expansion bus / device discovery**, is the other candidate and is now the
+bottleneck for several stages above: USB (§30), PIO, and B27's compatibility machine
+all need a bus.

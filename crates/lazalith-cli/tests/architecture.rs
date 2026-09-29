@@ -1014,3 +1014,66 @@ fn a_backend_error_cannot_name_a_host_path() {
         );
     }
 }
+
+// -- B9: the input backend boundary ---------------------------------------------
+
+/// The guest's input device holds no backend, and a backend cannot reach it.
+///
+/// B9's boundary is a **source**, which is the mirror of B7's and of B5's. B5 forbade a
+/// device from exposing its backend; B9 forbids a device from *holding* one, because
+/// input is produced by the host asynchronously and a guest register read must not call
+/// out. A backend has no method that takes a device, and a device has no method that
+/// takes a backend — which is why two independent input sources can feed one device,
+/// and why the previous `HostScript::replay(&mut InputDevice)` was a boundary that did
+/// not exist.
+#[test]
+fn the_input_device_and_the_input_backend_do_not_hold_each_other() {
+    let input = strip_comments(
+        &std::fs::read_to_string(workspace().join("crates/lazalith-devices/src/input.rs"))
+            .expect("the input device reads"),
+    );
+    assert!(
+        !input.contains("InputBackend"),
+        "lazalith-devices/src/input.rs mentions InputBackend: a guest's input device that \
+         holds a backend is a device whose register read can call into the host. Input is \
+         produced asynchronously by the host, so the device must be written BY a pump the \
+         host calls and never ask for an event itself."
+    );
+
+    let backend = strip_comments(
+        &std::fs::read_to_string(workspace().join("crates/lazalith-devices/src/input_backend.rs"))
+            .expect("the input backend module reads"),
+    );
+
+    // The trait and its implementations, but **not** `pump_input`. The free function
+    // taking `&mut InputDevice` is the boundary itself: it is the one place the guest's
+    // device is written, and putting it in a signature is what makes it visible. What
+    // must not exist is a *backend* that can write the device, because that gives the
+    // host a handle on something the guest owns and makes "the one place" untrue.
+    let trait_start = backend
+        .find("pub trait InputBackend")
+        .expect("the InputBackend trait is the thing being checked");
+    let trait_body = item_at(&backend, trait_start);
+    assert!(
+        !trait_body.contains("InputDevice"),
+        "the InputBackend trait mentions InputDevice: a backend that is handed the guest's \
+         device is a sink, and a sink gives the host a handle on something the guest owns."
+    );
+
+    let mut checked = 0;
+    for (index, _) in backend.match_indices("impl InputBackend for") {
+        let body = item_at(&backend, index);
+        assert!(
+            !body.contains("InputDevice"),
+            "an InputBackend implementation holds an InputDevice: the backend and the \
+             device would hold each other, and the one place the device is written would \
+             stop being one place."
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 2,
+        "expected at least a scripted and an absent backend, found {checked}. A count that \
+         drops means a backend was removed and this test stopped checking the rest."
+    );
+}
