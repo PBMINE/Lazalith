@@ -1,0 +1,61 @@
+name: Bug report
+description: Something Lazalith does that `docs/` says it does not.
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A bug here is a disagreement between the repository and its
+        documentation: a wrong answer, a fault that should not happen, a state
+        that was not restored, a program that compiles when it should not. If the
+        behaviour is a recorded limitation, it is a limitation, not a bug —
+        `docs/project-state.md` has a Limits section for most subsystems.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The observed behaviour, in one or two sentences.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should have happened instead
+      description: And where in `docs/` that behaviour is written down, if it is.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: |
+        The smallest thing that shows it. A command, a `.lz` or `.c` or `.lzs`
+        source, or a test that fails.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        `uname -a`, the nixpkgs revision from `nix flake metadata`, and whether
+        this reproduces inside `nix develop` or only outside it.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: >
+            I ran the suite and it is green
+            (`cargo test --workspace --all-features`), so this is a case the
+            existing tests do not reach.
+        - label: >
+            I found this by a differential or campaign run, and I have the seed
+            and the input that reproduces it.

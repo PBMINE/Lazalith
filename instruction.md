@@ -3127,3 +3127,98 @@ is not
 ```
 
 The purpose of these steps is to find what the current tests are **not** seeing.
+
+---
+
+# BEYOND LAZALITH
+
+The phase after the Step-100 roadmap and the hardening phase.
+
+The historical Phase-I roadmap above is not erased and not rewritten. Everything
+from `# STEP 1` to the end of the hardening phase stands as the record of what was
+built and is still the specification of what that part of the platform is.
+
+This section exists so that the roadmap has one place to read from end to end. It
+points at the specification and at the record; it does not restate either.
+
+## The specification
+
+```text
+binstruction.md
+```
+
+`binstruction.md` is the Beyond Lazalith instruction list. It contains the actual
+architecture, requirements, roadmap, constraints and goals for the post-Step-100
+phase, and the `B1`–`B29` roadmap.
+
+**It is a specification, not a record of what has been built.** Nothing in this
+section or in `binstruction.md` should be read as a claim that a JIT, a target-side
+C LazOS, a VGA device, an audio device, a VM manager, or a running Linux 0.01
+exists. None of them do.
+
+## The record
+
+```text
+docs/beyond-lazalith.md    the master Beyond document, and where the roadmap stands
+docs/architecture.md       the platform contract, and the boundaries with their tests
+docs/lza64.md              LZA32/LZA64 against the LZ32/LZ64 terminology
+docs/virtual-machine.md    the VM contract, the engine model, and the JIT's requirements
+docs/device-model.md       the device contract, and the frontend/backend split
+docs/machine-profiles.md   versioned machine configurations
+docs/toolchain.md          the toolchain split, the sysroot, and packaging
+docs/compatibility.md      the compatibility hardware tier
+docs/linux-0.01-port.md    the pinned source and the shape of the port
+docs/ci-cd.md              the GitHub automation and what it does not check
+docs/project-state.md      the running record, and every measurement taken
+```
+
+## The dependency order
+
+`binstruction.md` §53 fixes this, and dependency order takes precedence over
+feature size:
+
+```text
+architecture
+  → automation
+  → VM abstraction
+  → machine/device foundations
+  → host-facing platform services
+  → toolchain/runtime infrastructure
+  → native Lazen system/runtime
+  → debugger/snapshot infrastructure
+  → optimized execution
+  → JIT
+  → interpreter/JIT interoperability
+  → target-side OS
+  → compatibility machine
+  → Linux 0.01 architecture port
+```
+
+## The rule that carries across every stage
+
+```text
+The Reference Interpreter remains the semantic oracle.
+The JIT and the Reference Interpreter are two execution modes of one VM,
+sharing one canonical guest-visible architectural state, and a switch between
+them is an execution-engine change rather than a machine reset.
+```
+
+That rule is a property of the machine, not a promise, and it is checked:
+`no_execution_engine_owns_the_architectural_state` and
+`a_machine_holds_the_processor_and_the_engine_apart` in
+`crates/lazalith-cli/tests/architecture.rs`, and the switch's own guarantees in
+`crates/lazalith-machine/tests/engine.rs`.
+
+## Working in this phase
+
+The same rules that governed Phase I govern this one, and they are not relaxed
+because the work is different:
+
+1. inspect → design against existing contracts → implement → test → document →
+   validate → commit → update `docs/project-state.md`;
+2. write tests immediately; do not skip them because the change is "small";
+3. run `cargo fmt`, `cargo clippy`, `cargo test`, and the relevant Nix checks;
+4. extend CI in the same commit as the subsystem it covers — see `docs/ci-cd.md`;
+5. do not claim a future feature exists because the specification says it should;
+6. record a measurement rather than a guess wherever a decision depends on how
+   long something takes or how fast it runs.

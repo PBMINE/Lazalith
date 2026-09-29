@@ -21,15 +21,36 @@
         filter = path: _type: nixpkgs.lib.hasSuffix ".md" path;
       });
 
+      # The documents at the repository root, which are the specifications rather
+      # than the `docs/` record: the Phase-I roadmap, the Beyond specification, the
+      # README and the licence.
+      #
+      # A filter is not enough here, because the root is a mixed directory — a
+      # filter over it would put the flake, the workspace manifest and the
+      # `.github` workflows into every release tarball. So these are named, and
+      # naming them is safe for a different reason than the list it replaced: this
+      # is a closed set that cannot grow, because adding a specification document to
+      # the repository root is a deliberate act rather than something a filter picks
+      # up by accident. A document that *is* added and not listed is still missed,
+      # and the way that stops being a silent failure is the CI job that builds the
+      # package and runs the program out of it.
+      rootDocuments = [
+        ./instruction.md
+        ./binstruction.md
+        ./README.md
+        ./LICENSE
+      ];
+
       source = nixpkgs.lib.fileset.toSource {
         root = ./.;
-        fileset = nixpkgs.lib.fileset.unions [
+        fileset = nixpkgs.lib.fileset.unions ([
           ./Cargo.toml
           ./Cargo.lock
           ./crates
           ./examples
-          docs
-        ];
+        ]
+        ++ rootDocuments
+        ++ [ docs ]);
       };
 
       packageFor = system:

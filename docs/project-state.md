@@ -5867,3 +5867,326 @@ nix build path:.                                             result/bin/{lazen, 
 lazen run examples/hello/main.lz                            Hello, Lazalith
 lazen run examples/window/main.lz                           exit 0
 ```
+
+---
+
+# BEYOND LAZALITH — SESSION 1: B1, B2, B3
+
+The first Beyond-Lazalith session. `binstruction.md` §53's roadmap begins at B1;
+this session completed the first three stages and left the fourth for the next
+queued run.
+
+**Read `docs/beyond-lazalith.md` first.** This file is the chronological record;
+that one is the state.
+
+---
+
+## What this session inspected
+
+Not a summary. The repository, at `7b424ce` (the Phase-I freeze), before anything
+was changed.
+
+| | |
+| --- | --- |
+| Workspace | 25 crate directories, 238 Rust files, 122 695 lines, one binary (`lazen`) |
+| `git status` | clean except two untracked files: `binstruction.md` (the specification, never committed) and `myapp/main.lz` (a stray `lazen new` scaffold) |
+| `.github/` | **did not exist.** No CI, no templates, no CODEOWNERS, no dependabot |
+| `docs/` | 45 files, `project-state.md` at 353 KB |
+| Tests | 1279 passing at baseline, 0 failing, 2m41s wall / 9m41s user in a debug build |
+| Toolchain | no `cargo` or `rustc` on `PATH` outside Nix; everything runs through `nix develop` |
+
+Read in full: `crates/lazalith-machine/src/lib.rs`,
+`crates/lazalith-cpu/src/{interpreter,state,memory,lib}.rs`,
+`crates/lazalith-devices/src/lib.rs`, `crates/lazalith-boot/src/lib.rs`,
+`crates/lazalith-os/src/lib.rs`, `crates/lazalith-debug/src/lib.rs`,
+`crates/lazalith-sdl3/{src/lib.rs,build.rs}`, `crates/lazalith-memory/src/{bus,cache}.rs`,
+`crates/lazalith-cli/src/main.rs`, `crates/lazalith-fuzz/src/main.rs`, `flake.nix`,
+`Cargo.toml`, and every crate manifest.
+
+Surveyed in depth by subagents: the SDL3 boundary (18 SDL symbols, 32 `unsafe`
+blocks, 1 `unsafe fn`, the C probe, every call site), and the LazOS↔VM coupling
+(what `LazalithKernel` owns, the complete list of machine APIs the OS uses, the
+boot path, every `LazalithMachine` construction site, and the full
+test/fuzz/property inventory).
+
+## What this session discovered
+
+Findings that changed a decision, rather than confirming one.
+
+**The execution engine could not have been made pluggable without moving the
+state.** `LazalithMachine` held a `ReferenceInterpreter` *by value*, and the
+interpreter *owned* `ArchitecturalState`, `ExecutionState` and `TrapController`.
+A second engine would have had to reach inside the first — the exact door
+`lazalith-debug` is built not to have — or hold a copy. A copy is a second
+architectural truth, which `binstruction.md` §11 forbids. This is B3's whole
+reason for existing, and it was not visible from the file layout.
+
+**`DeviceManager<D>` is monomorphic.** `Vec<Entry<D>>`, one concrete device type
+per machine, no trait object and no device enum. A machine can have a console
+*or* a timer *or* a display *or* an input device, never two of different kinds.
+`BootImage::machine_setup` refuses any non-empty device manager outright. This is
+the blocker on `binstruction.md` §26's frontend/backend model and on any profile
+with a device inventory, which is why it is B4's first half rather than part of
+B4.
+
+**The guest-visible kernel is two instructions.** `crates/lazalith-runtime/src/run.rs`
+builds `NOP; RFE` and hands it to `BootImage::new`; the scheduler and syscall
+dispatcher are host Rust running *outside* the machine. The OS uses a narrow slice
+of the machine's API and never touches the bus, devices, clock or interrupts.
+So the host scheduler is not part of the VM contract, and B25 replaces it.
+
+**`docs/fuzzing.md` says "ten targets" and lists ten; `TARGETS` has eleven.** The
+`package reader` target is missing from the document. Recorded, not fixed.
+
+**`lazalith-sdl3`'s module documentation claims a test that does not exist.** It
+says the event buffer size "is checked by a test, which compares it against the
+headers' declared structs". There is no `tests/` directory in that crate. What
+exists is a C static assert in `build.rs` plus eight compile-time `const`
+assertions — both compile-time, neither a test. Recorded, not fixed.
+
+**The SDL3 probe does not cover the values most likely to break.** It measures
+`sizeof(SDL_Event)`, `sizeof(SDL_KeyboardEvent)`, three `offsetof`s, `sizeof(bool)`,
+`sizeof(SDL_Keycode)`, `sizeof(SDL_Keymod)` and eight scancodes. It does *not*
+measure `SDL_Rect`, `SDL_FPoint`, the event-type discriminants, the pixel format,
+the scale mode or the access mode — those are hardcoded Rust constants, so a
+header change that moved `SDL_EVENT_KEY_DOWN` would not be caught.
+
+**The flake's source fileset omitted every document at the repository root.**
+`instruction.md`, `README.md` and `LICENSE` were not in the tarball a release
+builds from — which is precisely the failure the fileset comment warns about
+("a document missing from the source tarball is not a build error, it is a
+document that is missing from a release"). Fixed in this session.
+
+**`nix build` builds the git tree, not the working directory.** A new source file
+that is not `git add`ed is invisible to it, and the failure appears *inside the
+sandbox* as `error[E0583]: file not found for module 'engine'` while `cargo check`
+in the same directory passes. Reproduced here, twice. Harmless in CI, a real local
+footgun.
+
+**`nix flake check` against a warm store is a no-op.** It reported
+`running 0 flake checks` in 3.4 seconds. A check that validates nothing looks
+exactly like a check that passed.
+
+## External research, and what it changed
+
+| Source | What was taken | What it changed |
+| --- | --- | --- |
+| QEMU, *system emulation* | machine / CPU / accelerator / device / backend / boot as separate concerns; TCG as a JIT | the shape of `docs/machine-profiles.md` and of B4 |
+| QEMU, *device emulation* | front end / bus / back end / pass-through, and "back ends can sometimes be stacked to implement features like snapshots"; "features will not be reported to the guest if the back end is unable to support it" | the proposed backend layer in `docs/device-model.md`, and the rule that a backend that cannot do something says so rather than emulating badly |
+| GCC, *Overall Options* / *Invoking GCC* | preprocessing → compile → assemble → link, coordinated by a *driver* | the argument in `docs/toolchain.md` that splitting `lazen` into eight binaries is a usability question, not a stage prerequisite |
+| GitHub Actions, *workflow syntax* | "any permission not named is set to `none`" | the permissions table in `docs/ci-cd.md`: `contents: read` everywhere, `contents: write` on the release job only |
+| Rust `sdl3`, crate page | version 0.18.4 over `sdl3-sys 0.6.0+SDL-3.4.0`; the crate's own text says the bindings are still in progress and to "expect some bugs and missing features" | B20 is **not** recommended on the strength of a direction alone; the trade is 32 `unsafe` blocks in an already-probed file against a first third-party dependency that self-describes as incomplete |
+| `zavg/linux-0.01` | `master` head is `5839d67d5825265fc665c9dc0ec2e767ff47a6dd`; the source was **read** at that revision, not cloned | the whole of `docs/linux-0.01-port.md` §3, which quotes real code rather than describing a kernel from memory |
+
+## B1 — the architecture contract is frozen
+
+Ten new documents, each grounded in the repository rather than in the
+specification's description of it:
+
+```text
+docs/architecture.md        the platform contract, the real dependency order, and
+                            the sixteen boundaries with the test that enforces each
+docs/lza64.md               LZA32/LZA64 against LZ32/LZ64, and why no rename happened
+docs/virtual-machine.md     the VM contract, the engine model, the switch guarantees,
+                            and the six things a JIT must satisfy
+docs/device-model.md        the device contract, the monomorphic blocker, and the
+                            proposed frontend/backend split
+docs/machine-profiles.md    versioned profiles, and why B4 starts with heterogeneous
+                            devices rather than with a profile type
+docs/toolchain.md           the toolchain split, the missing sysroot, the four gaps
+                            the Linux port depends on
+docs/compatibility.md       the compatibility tier, what it must not become
+docs/linux-0.01-port.md     the pinned revision, and the port grounded in real source
+docs/beyond-lazalith.md     the master Beyond document and the B1–B29 status table
+docs/ci-cd.md               the automation, and what it does not check
+```
+
+Plus a `# BEYOND LAZALITH` section appended to `instruction.md`, which points at
+the specification and at the record without restating either. The Phase-I roadmap
+above it is untouched.
+
+**A decision, not a deferral: the name LVMI was not adopted.** `binstruction.md`
+§9 offers it and says not to finalize it until research confirms it is suitable.
+Research did not confirm it. There is no interface in this repository to name —
+there is one concrete type, `LazalithMachine<D>`, which is not a trait and could
+not become one without splitting the machine — so naming it after an interface it
+does not implement would invite callers to write code that cannot compile. The
+name stays open for B19, where a real management API exists to name. The reasoning
+is in `docs/virtual-machine.md`.
+
+## B2 — GitHub CI/CD exists
+
+There was no `.github/` directory. Now:
+
+```text
+.github/workflows/ci.yml        push to main and pull_request. fmt, clippy, test,
+                                architecture, nix flake check, smoke. Layered with
+                                `needs`, cheapest first.
+.github/workflows/campaign.yml  nightly + workflow_dispatch. The fuzz campaign and a
+                                release-profile property/differential sweep.
+.github/workflows/release.yml   tag `v*` only. Builds, verifies artifacts BEFORE
+                                publishing, emits SHA256SUMS and BUILDINFO.
+.github/dependabot.yml          cargo (weekly) and github-actions (weekly).
+.github/CODEOWNERS              one owner, with the architectural core called out.
+.github/PULL_REQUEST_TEMPLATE.md
+.github/ISSUE_TEMPLATE/{bug_report,limitation,beyond_lazalith}.yml, config.yml
+```
+
+Every action is pinned to a full commit SHA resolved from the upstream release tag
+at the time of writing, with the version in a trailing comment. Every job runs in
+the project's own Nix dev shell, because `lazalith-sdl3` compiles a C probe
+against real SDL3 headers and a CI job without SDL3 would be green only by not
+building the frontend.
+
+**Status, stated plainly and not to be read otherwise: nothing here has run on
+GitHub.** No tag has been cut, so **no GitHub Release exists**. No branch
+protection, required status check, or security scan is claimed — those are
+repository settings, not files, and `docs/ci-cd.md` §9 lists them as unknown.
+
+## B3 — the execution-engine boundary
+
+The one stage with code behind it, and the one `binstruction.md` §11 depends on.
+
+```rust
+// lazalith-cpu, new
+Processor                    the canonical guest-visible state
+ExecutionEngine<M: CpuMemory>  step(&mut Processor, &mut M) -> ...
+EngineKind                   the closed set of engines, with Reference the only member
+EngineError                  unknown engine, or a refused switch with a reason
+
+// lazalith-machine
+processor: Processor,                        // never replaced by a switch
+engine: Box<dyn ExecutionEngine<Bus<D>>>,   // replaced by a switch
+LazalithMachine::switch_execution_engine(EngineKind)
+```
+
+`ReferenceInterpreter` went from a state-owning struct to a zero-sized engine. Its
+`execute` still builds a candidate `ArchitecturalState`, mutates the candidate and
+only then commits — validate, calculate, commit — so the semantics are byte for
+byte what they were; only the owner changed.
+
+Fourteen tests in `crates/lazalith-machine/tests/engine.rs` and two new
+architecture invariants. What is now *checked* rather than asserted:
+
+- a switch preserves pc, sp, every register, status, execution state, the
+  machine's own state, the virtual clock and device state;
+- a switch **survives a live trap frame**, with the frame and the resume point
+  unchanged — the case that matters most, because a fault in compiled code has to
+  be able to return to the interpreter with the frame intact;
+- the same program produces the same answer with a switch between every
+  instruction;
+- a switch is refused during an active user execution context, and on a faulted
+  machine, each with a named reason;
+- a reset after a switch still resets;
+- **an `ExecutionEngine` implemented outside the workspace can take over a running
+  machine's processor and hand it back** — the property a JIT will need, proven
+  with a trivial counting wrapper so the test is about the seam and not about a
+  compiler that does not exist;
+- `no_execution_engine_owns_the_architectural_state` reads the sources and asserts
+  that only `Processor` and the debugger's `CpuSnapshot` hold an
+  `ArchitecturalState` — the invariant that makes a switch unable to fork the
+  state, and the one whose failure would be invisible to every other test;
+- `a_machine_holds_the_processor_and_the_engine_apart` asserts the two are two
+  fields and that the switch exists as one checked operation.
+
+**What is not true:** `EngineKind::ALL` has one entry. The switch replaces an
+engine with one of identical semantics and discards its private state, which is
+nothing. **There is no JIT.** `docs/virtual-machine.md` §4 lists the six things
+one would have to satisfy, and none of them is satisfied.
+
+## A change with a release consequence
+
+`flake.nix`'s source fileset gained `instruction.md`, `binstruction.md`,
+`README.md` and `LICENSE`. They are named rather than filtered because the root is
+a mixed directory, and the comment explains why a named list here is safe where
+the replaced list was not. Verified: the store path the package builds from now
+contains all four plus `docs/`, `crates/`, `examples/`, `Cargo.toml` and
+`Cargo.lock`.
+
+## Scratch material removed
+
+`myapp/main.lz` was a leftover `lazen new myapp` scaffold — the default template,
+unreferenced by any code, test, flake or document. The repository already ships
+`examples/hello/main.lz` for the same purpose. Deleted rather than committed, so
+that the tree is clean and nothing implies a second example project exists.
+
+## Tests and measurements taken
+
+```text
+cargo fmt --all --check                                     clean
+cargo check --workspace --all-targets                       clean
+cargo clippy --workspace --all-targets --all-features -D    clean, no warnings
+cargo test  --workspace --all-features                      1295 passed, 0 failed
+                                                             (2m53s wall, 10m19s user, debug)
+                                                             baseline was 1279; +14 engine
+                                                             tests, +2 architecture tests
+nix flake check --print-build-logs                          all checks passed (2m42s)
+nix build --print-build-logs                                result/bin/{lazen, lazalith-fuzz}
+result/bin/lazen --version                                  lazen 0.1.0
+result/bin/lazen check   examples/{hello,window}/main.lz    both ok
+result/bin/lazen fmt --check examples/{hello,window}/main.lz both formatted
+result/bin/lazen run     examples/hello/main.lz             Hello, Lazalith
+result/bin/lazen run     examples/window/main.lz            exit 0
+result/bin/lazalith-fuzz --list                             11 targets
+actionlint .github/workflows/*.yml                          clean (also shellchecks every run:)
+yq over the eight YAML files                                all parse
+```
+
+**The one measurement that was attempted and did not work:** a genuinely cold
+`nix flake check`. A warm store makes it a no-op, and clearing the local store is
+not something this session should do to a developer's machine. What is recorded —
+2m42s against a changed tree with a warm binary cache, 3.4s and zero checks
+against a warm one — is in `docs/ci-cd.md` §12, and the cold number is left
+unmeasured rather than guessed.
+
+## Known limitations, at the end of this session
+
+1. **No workflow has run on GitHub.** Every one is locally validated and none has
+   executed. The first run is the first real test of the runner assumptions,
+   including whether `cachix/install-nix-action` is permitted here.
+2. **No release has ever been produced.** The pipeline is written; no tag was cut.
+3. **No branch protection, no required status checks, no security scanning.** All
+   repository settings; unknown from here.
+4. **`flake.lock` is not automated.** Dependabot has no Nix ecosystem, and the
+   pinned nixpkgs revision is what the reproducibility guarantee rests on.
+5. **Cold `nix flake check` is unmeasured.** See above.
+6. **`aarch64-linux` is declared and never checked**, here or in CI. Unchanged
+   from the freeze.
+7. **One execution engine exists.** The switch is the operation; the JIT is not.
+8. **`DeviceManager` is still monomorphic.** B4's first half.
+9. **No sysroot, no freestanding C, no C preprocessor, no separate tool binaries,
+   no command-line debugger** — the four toolchain gaps `docs/toolchain.md` §5
+   lists, all of which B25/B26 depend on.
+10. **No storage, audio, network, USB, PCI, VGA, RTC, serial, DMA, MMU, SMP or
+    power states.** The hardware tiers in `docs/device-model.md` §4 say which of
+    these are absent and which block.
+11. **Two documentation defects found and recorded but not fixed**: the fuzz
+    target count, and the `lazalith-sdl3` claim of a test that does not exist.
+    Both are one-line corrections and are left for a session that is already
+    editing those files.
+12. **The Linux 0.01 source was read, not cloned**, and 8 files of the 84 were
+    read in detail. `binstruction.md` §43's "read the whole repository" is the
+    start of that work, not its end.
+
+## Next step
+
+**B4, machine profiles** — and its first half is heterogeneous devices, not a
+profile type, because `DeviceManager<D>` cannot currently express a machine with
+a console *and* a display. The dependency argument for B4 over B5 is in
+`docs/beyond-lazalith.md` §5 and `docs/machine-profiles.md` §2.
+
+B4 should build `lza64-native-v1` first, because B25 and B26 need a profile that
+means "a machine with nothing on it but a CPU and memory" and a freestanding
+kernel does not want a display it will never draw on. Its round-trip test — a
+machine built from a profile, then inspected, must match the profile — runs in
+the `architecture` job, and a fuzz target for the profile encoding goes in the
+`campaign` job if the encoding is something malformed input can reach.
+
+Two things the next session should carry forward:
+
+- **Extend CI in the same commit as the subsystem it covers.** B2 made the cost of
+  a new invariant a line in a workflow file rather than a habit.
+- **Record a measurement rather than a guess** wherever a decision depends on how
+  long something takes. Three numbers in this session would otherwise have been
+  invented: the test suite's runtime, `nix flake check`'s, and the fact that the
+  latter is a no-op against a warm store.

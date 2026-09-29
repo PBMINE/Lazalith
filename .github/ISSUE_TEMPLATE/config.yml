@@ -1,0 +1,19 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Project state and what is not implemented
+    url: https://github.com/PBMINE/Lazalith/blob/main/docs/project-state.md
+    about: >
+      What exists, what is a recorded limitation, and what the next step is. Check
+      this first: most "missing" features are recorded limitations rather than
+      defects, and most defects have a minimal reproducer in `docs/hardening.md`.
+  - name: The Beyond Lazalith specification
+    url: https://github.com/PBMINE/Lazalith/blob/main/binstruction.md
+    about: >
+      What the platform is intended to become, and the B1–B29 roadmap it is
+      intended to become it by. This is the specification, not a record of what
+      has been built; `docs/` is the record of what has.
+  - name: The Phase-I roadmap
+    url: https://github.com/PBMINE/Lazalith/blob/main/instruction.md
+    about: >
+      The hundred steps and the hardening phase, all of which are complete. Useful
+      for understanding why something is shaped the way it is.

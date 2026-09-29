@@ -629,11 +629,7 @@ impl ReplaySession {
                 .devices()
                 .device(DeviceId::new(DEVICE_ID))
                 .map_or(0, |device| device.delivered()),
-            in_trap: self
-                .machine
-                .processor()
-                .trap_controller()
-                .has_active_frame(),
+            in_trap: self.machine.processor().traps().has_active_frame(),
         }
     }
 

@@ -1,4 +1,6 @@
-use lazalith_cpu::{ArchitecturalState, CpuFaultCause, ReferenceInterpreter};
+use lazalith_cpu::{
+    ArchitecturalState, CpuFaultCause, ExecutionEngine, Processor, ReferenceInterpreter,
+};
 use lazalith_devices::{DeviceManager, NoDevice};
 use lazalith_isa::{DataSize, Instruction, Opcode, Operand, encode};
 use lazalith_memory::{AddressSpace, Bus, RegionPermissions};
@@ -194,7 +196,8 @@ fn user_code_heap_and_stack_execute_through_real_cpu_memory() {
         let (layout, space) = memory.into_parts();
         let mut bus = Bus::with_devices(space, DeviceManager::<NoDevice>::new());
 
-        let mut cpu = ReferenceInterpreter::new(
+        let mut engine = ReferenceInterpreter::new();
+        let mut cpu = Processor::new(
             ArchitecturalState::new(
                 config,
                 InstructionAddress::new(USER_CODE_START),
@@ -203,18 +206,15 @@ fn user_code_heap_and_stack_execute_through_real_cpu_memory() {
             )
             .unwrap(),
         );
-        cpu.step(&mut bus).unwrap();
+        engine.step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.architectural().pc().as_u64(), USER_CODE_START + 16);
         assert_eq!(
-            cpu.architectural_state().pc().as_u64(),
-            USER_CODE_START + 16
-        );
-        assert_eq!(
-            cpu.architectural_state().sp().as_u64(),
+            cpu.architectural().sp().as_u64(),
             USER_INITIAL_SP - u64::from(config.word_bytes())
         );
-        cpu.step(&mut bus).unwrap();
-        assert_eq!(cpu.architectural_state().pc().as_u64(), USER_CODE_START + 8);
-        assert_eq!(cpu.architectural_state().sp().as_u64(), USER_INITIAL_SP);
+        engine.step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.architectural().pc().as_u64(), USER_CODE_START + 8);
+        assert_eq!(cpu.architectural().sp().as_u64(), USER_INITIAL_SP);
 
         let store_data = instruction(
             config,
@@ -254,12 +254,9 @@ fn user_code_heap_and_stack_execute_through_real_cpu_memory() {
             ],
         );
         for item in [&store_data, &store_value, &store, &load] {
-            cpu.execute(item, &mut bus).unwrap();
+            engine.execute(&mut cpu, item, &mut bus).unwrap();
         }
-        assert_eq!(
-            cpu.architectural_state().registers().read_raw(2).unwrap(),
-            0x1234
-        );
+        assert_eq!(cpu.architectural().registers().read_raw(2).unwrap(), 0x1234);
     }
 }
 
@@ -334,7 +331,8 @@ fn complete_layout_is_backed_and_kernel_code_heap_and_stack_run_through_bus() {
             .initialize(PhysicalAddress::new(KERNEL_IMAGE_START), &code)
             .unwrap();
         let mut bus = Bus::with_devices(space, DeviceManager::<NoDevice>::new());
-        let mut cpu = ReferenceInterpreter::new(
+        let mut engine = ReferenceInterpreter::new();
+        let mut cpu = Processor::new(
             ArchitecturalState::new(
                 config,
                 InstructionAddress::new(KERNEL_IMAGE_START),
@@ -343,16 +341,13 @@ fn complete_layout_is_backed_and_kernel_code_heap_and_stack_run_through_bus() {
             )
             .unwrap(),
         );
-        cpu.step(&mut bus).unwrap();
-        cpu.step(&mut bus).unwrap();
+        engine.step(&mut cpu, &mut bus).unwrap();
+        engine.step(&mut cpu, &mut bus).unwrap();
         for item in &items {
-            cpu.execute(item, &mut bus).unwrap();
+            engine.execute(&mut cpu, item, &mut bus).unwrap();
         }
-        assert_eq!(
-            cpu.architectural_state().registers().read_raw(2).unwrap(),
-            0x1234
-        );
-        assert_eq!(cpu.architectural_state().sp().as_u64(), KERNEL_INITIAL_SP);
+        assert_eq!(cpu.architectural().registers().read_raw(2).unwrap(), 0x1234);
+        assert_eq!(cpu.architectural().sp().as_u64(), KERNEL_INITIAL_SP);
     }
 }
 
@@ -362,7 +357,8 @@ fn user_stack_is_not_executable_in_either_mode() {
         let memory = UserMemory::new(config).unwrap();
         let (_, space) = memory.into_parts();
         let mut bus = Bus::with_devices(space, DeviceManager::<NoDevice>::new());
-        let mut cpu = ReferenceInterpreter::new(
+        let mut engine = ReferenceInterpreter::new();
+        let mut cpu = Processor::new(
             ArchitecturalState::new(
                 config,
                 InstructionAddress::new(USER_INITIAL_SP),
@@ -371,7 +367,7 @@ fn user_stack_is_not_executable_in_either_mode() {
             )
             .unwrap(),
         );
-        let error = cpu.step(&mut bus).unwrap_err();
+        let error = engine.step(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(
             error.cause,
             CpuFaultCause::Fetch(lazalith_memory::MemoryFault {

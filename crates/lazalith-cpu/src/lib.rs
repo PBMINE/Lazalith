@@ -2,12 +2,15 @@
 
 extern crate alloc;
 
+mod engine;
 mod fault;
 mod interpreter;
 mod memory;
 mod outcome;
+mod processor;
 mod trap;
 
+pub use engine::{EngineError, EngineKind, ExecutionEngine};
 pub use fault::{CpuFault, CpuFaultCause, FaultOrigin};
 pub use interpreter::ReferenceInterpreter;
 pub use memory::{CpuMemory, DataAccess, DataAccessError, DataAccessKind, FetchedInstruction};
@@ -17,6 +20,8 @@ pub use outcome::{
     ControlTarget, ExecutionOutcome, OutcomeApplication, OutcomeError, OutcomeErrorKind,
     PreparedOutcome, StackEffect, TrapRequest, checked_next_pc, checked_return_sp, prepare_outcome,
 };
+
+pub use processor::Processor;
 
 mod state;
 mod status;
@@ -31,3 +36,5 @@ pub use trap::{
     DoubleTrap, ExecutionContextId, PrepareEntryError, SyscallAdmission, SyscallCompletion,
     TrapAttempt, TrapCause, TrapController, TrapFrame, TrapSnapshot,
 };
+
+pub(crate) use trap::prepare_entry_control;

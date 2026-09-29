@@ -1,5 +1,8 @@
 mod support;
-use lazalith_cpu::{CpuFaultCause as Cause, ExecutionState, OutcomeApplication, TrapRequest};
+use lazalith_cpu::{
+    CpuFaultCause as Cause, ExecutionEngine, ExecutionState, OutcomeApplication,
+    ReferenceInterpreter, TrapRequest,
+};
 use lazalith_isa::{DataSize, Opcode, Operand};
 use support::*;
 
@@ -19,11 +22,14 @@ fn tiny_fetched_call_sequence_runs_both_modes() {
         ram.code(32, config, Opcode::Ret, &[]);
         let mut cpu = cpu(config, 0, 256, 0, &[]);
         for pc in [8, 24, 32, 16] {
-            assert_eq!(cpu.step(&mut ram), Ok(OutcomeApplication::Continue));
-            assert_eq!(cpu.architectural_state().pc().as_u64(), pc);
+            assert_eq!(
+                ReferenceInterpreter::new().step(&mut cpu, &mut ram),
+                Ok(OutcomeApplication::Continue)
+            );
+            assert_eq!(cpu.architectural().pc().as_u64(), pc);
         }
-        assert_eq!(cpu.architectural_state().registers().read_raw(0), Ok(5));
-        assert_eq!(cpu.architectural_state().sp().as_u64(), 256);
+        assert_eq!(cpu.architectural().registers().read_raw(0), Ok(5));
+        assert_eq!(cpu.architectural().sp().as_u64(), 256);
         assert_eq!(
             ram.word(
                 256 - usize::from(config.word_bytes()),
@@ -31,16 +37,22 @@ fn tiny_fetched_call_sequence_runs_both_modes() {
             ),
             16
         );
-        assert_eq!(cpu.step(&mut ram), Ok(OutcomeApplication::Halted));
-        let before = cpu.architectural_state().clone();
+        assert_eq!(
+            ReferenceInterpreter::new().step(&mut cpu, &mut ram),
+            Ok(OutcomeApplication::Halted)
+        );
+        let before = cpu.architectural().clone();
         let memory = ram.clone();
         assert!(matches!(
-            cpu.step(&mut ram).unwrap_err().cause,
+            ReferenceInterpreter::new()
+                .step(&mut cpu, &mut ram)
+                .unwrap_err()
+                .cause,
             Cause::Halted
         ));
-        assert_eq!(cpu.architectural_state(), &before);
+        assert_eq!(cpu.architectural(), &before);
         assert_eq!(ram, memory);
-        assert_eq!(cpu.execution_state(), ExecutionState::Halted);
+        assert_eq!(cpu.execution(), ExecutionState::Halted);
     }
 }
 
@@ -55,38 +67,43 @@ fn byte_fetch_arithmetic_and_memory_use_shared_width() {
             31,
             &[(1, config.word_width().mask()), (2, 1), (3, 128)],
         );
-        cpu.step_bytes(&[0x10, 0x10, 2, 0, 0, 0, 0, 0], &mut ram)
+        ReferenceInterpreter::new()
+            .step_bytes(&mut cpu, &[0x10, 0x10, 2, 0, 0, 0, 0, 0], &mut ram)
             .unwrap();
-        assert_eq!(cpu.architectural_state().registers().read_raw(0), Ok(0));
-        assert_eq!(cpu.architectural_state().status().bits(), 22);
+        assert_eq!(cpu.architectural().registers().read_raw(0), Ok(0));
+        assert_eq!(cpu.architectural().status().bits(), 22);
         let mem = Operand::Memory {
             base: lazalith_types::RegisterIndex::try_from(3).unwrap(),
             displacement: -4,
         };
-        cpu.execute(
-            &instruction(
-                config,
-                Opcode::St,
-                &[r(1), mem, Operand::DataSize(DataSize::Byte)],
-            ),
-            &mut ram,
-        )
-        .unwrap();
-        cpu.execute(
-            &instruction(
-                config,
-                Opcode::Lds,
-                &[r(0), mem, Operand::DataSize(DataSize::Byte)],
-            ),
-            &mut ram,
-        )
-        .unwrap();
+        ReferenceInterpreter::new()
+            .execute(
+                &mut cpu,
+                &instruction(
+                    config,
+                    Opcode::St,
+                    &[r(1), mem, Operand::DataSize(DataSize::Byte)],
+                ),
+                &mut ram,
+            )
+            .unwrap();
+        ReferenceInterpreter::new()
+            .execute(
+                &mut cpu,
+                &instruction(
+                    config,
+                    Opcode::Lds,
+                    &[r(0), mem, Operand::DataSize(DataSize::Byte)],
+                ),
+                &mut ram,
+            )
+            .unwrap();
         assert_eq!(
-            cpu.architectural_state().registers().read_raw(0),
+            cpu.architectural().registers().read_raw(0),
             Ok(config.word_width().mask())
         );
-        assert_eq!(cpu.architectural_state().pc().as_u64(), 24);
-        assert_eq!(cpu.architectural_state().status().bits(), 22);
+        assert_eq!(cpu.architectural().pc().as_u64(), 24);
+        assert_eq!(cpu.architectural().status().bits(), 22);
     }
 }
 
@@ -102,35 +119,37 @@ fn faults_do_not_publish_candidate_or_memory_effects() {
             let mut ram = Ram::default();
             ram.put(128, &3u64.to_le_bytes());
             let mut cpu = cpu(config, 0, sp, 31, &registers);
-            let before = cpu.architectural_state().clone();
+            let before = cpu.architectural().clone();
             let memory = ram.clone();
-            let error = cpu
-                .execute(&instruction(config, opcode, &operands), &mut ram)
+            let error = ReferenceInterpreter::new()
+                .execute(&mut cpu, &instruction(config, opcode, &operands), &mut ram)
                 .unwrap_err();
             assert_eq!(error.pc.as_u64(), 0);
             assert_eq!(error.opcode, Some(opcode.as_u8()));
-            assert_eq!(cpu.architectural_state(), &before);
+            assert_eq!(cpu.architectural(), &before);
             assert_eq!(ram, memory);
-            assert_eq!(cpu.execution_state(), ExecutionState::Running);
+            assert_eq!(cpu.execution(), ExecutionState::Running);
         }
         let mut ram = Ram::default();
         ram.fail = true;
         let mut cpu = cpu(config, 0, 256, 31, &[]);
-        let before = cpu.architectural_state().clone();
+        let before = cpu.architectural().clone();
         let memory = ram.clone();
         assert!(matches!(
-            cpu.execute(
-                &instruction(config, Opcode::Call, &[Operand::Immediate(0)]),
-                &mut ram
-            )
-            .unwrap_err()
-            .cause,
+            ReferenceInterpreter::new()
+                .execute(
+                    &mut cpu,
+                    &instruction(config, Opcode::Call, &[Operand::Immediate(0)]),
+                    &mut ram
+                )
+                .unwrap_err()
+                .cause,
             Cause::Memory {
                 source: MemoryError::Transaction,
                 ..
             }
         ));
-        assert_eq!(cpu.architectural_state(), &before);
+        assert_eq!(cpu.architectural(), &before);
         assert_eq!(ram, memory);
     }
 }
@@ -158,15 +177,16 @@ fn next_pc_is_checked_before_reads_and_stack_operations() {
             let mut ram = Ram::default();
             ram.device = true;
             let mut cpu = cpu(config, config.word_width().mask() - 7, 256, 31, &[]);
-            let before = cpu.architectural_state().clone();
+            let before = cpu.architectural().clone();
             let memory = ram.clone();
             assert!(matches!(
-                cpu.execute(&instruction(config, opcode, &operands), &mut ram)
+                ReferenceInterpreter::new()
+                    .execute(&mut cpu, &instruction(config, opcode, &operands), &mut ram)
                     .unwrap_err()
                     .cause,
                 Cause::NextPc(_)
             ));
-            assert_eq!(cpu.architectural_state(), &before);
+            assert_eq!(cpu.architectural(), &before);
             assert_eq!(ram, memory);
         }
     }
@@ -185,16 +205,20 @@ fn traps_are_events_and_controller_instructions_are_not_emulated() {
                 ),
             ] {
                 let mut cpu = cpu(config, 0, 256, status, &[]);
-                let before = cpu.architectural_state().clone();
+                let before = cpu.architectural().clone();
                 let mut ram = Ram::default();
                 assert_eq!(
-                    cpu.execute(&instruction(config, opcode, &operands), &mut ram),
+                    ReferenceInterpreter::new().execute(
+                        &mut cpu,
+                        &instruction(config, opcode, &operands),
+                        &mut ram
+                    ),
                     Ok(OutcomeApplication::Trap {
                         request,
                         resume_pc: lazalith_types::InstructionAddress::new(8)
                     })
                 );
-                assert_eq!(cpu.architectural_state(), &before);
+                assert_eq!(cpu.architectural(), &before);
             }
             for (opcode, operands) in [
                 (Opcode::Rfe, vec![]),
@@ -204,38 +228,45 @@ fn traps_are_events_and_controller_instructions_are_not_emulated() {
                 ),
             ] {
                 let mut cpu = cpu(config, 0, 256, status, &[]);
-                let before = cpu.architectural_state().clone();
-                let error = cpu
-                    .execute(&instruction(config, opcode, &operands), &mut Ram::default())
+                let before = cpu.architectural().clone();
+                let error = ReferenceInterpreter::new()
+                    .execute(
+                        &mut cpu,
+                        &instruction(config, opcode, &operands),
+                        &mut Ram::default(),
+                    )
                     .unwrap_err();
                 if status == 32 {
                     assert!(matches!(error.cause, Cause::PrivilegeViolation));
                 } else {
                     assert!(matches!(error.cause, Cause::Control(_)));
                 }
-                assert_eq!(cpu.architectural_state(), &before);
+                assert_eq!(cpu.architectural(), &before);
             }
             let operands = vec![Operand::Control(lazalith_isa::ControlRegister::Tvec), r(0)];
             let mut cpu = cpu(config, 0, 256, status, &[(0, 0)]);
             if status == 32 {
                 assert!(matches!(
-                    cpu.execute(
-                        &instruction(config, Opcode::Csrw, &operands),
-                        &mut Ram::default()
-                    )
-                    .unwrap_err()
-                    .cause,
+                    ReferenceInterpreter::new()
+                        .execute(
+                            &mut cpu,
+                            &instruction(config, Opcode::Csrw, &operands),
+                            &mut Ram::default()
+                        )
+                        .unwrap_err()
+                        .cause,
                     Cause::PrivilegeViolation
                 ));
             } else {
                 assert_eq!(
-                    cpu.execute(
+                    ReferenceInterpreter::new().execute(
+                        &mut cpu,
                         &instruction(config, Opcode::Csrw, &operands),
                         &mut Ram::default()
                     ),
                     Ok(OutcomeApplication::Continue)
                 );
-                assert_eq!(cpu.trap_controller().tvec().unwrap().as_u64(), 0);
+                assert_eq!(cpu.traps().tvec().unwrap().as_u64(), 0);
             }
         }
     }

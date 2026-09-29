@@ -1,3 +1,4 @@
+use lazalith_cpu::{ExecutionEngine, Processor, ReferenceInterpreter};
 use lazalith_memory::{
     AddressSpace, Bus, DataAccessKind as K, DataSize as S, MemoryFaultKind as F, MemoryRegion,
     Privilege as U, RegionKind, RegionPermissions as RP, RegisterIndex,
@@ -49,16 +50,18 @@ fn a_tiny_program_executes_through_the_bus_in_both_modes() {
         code.extend_from_slice(&mem(0x30, 4, 1, 2, 4));
         code.extend_from_slice(&imm(0x52, 0, 0));
         bus.initialize(P::new(0), &code).unwrap();
-        let mut cpu = lazalith_cpu::ReferenceInterpreter::new(state(config, 0, 48));
+        let mut cpu = Processor::new(state(config, 0, 48));
         let mut steps = 0;
-        while cpu.execution_state() == lazalith_cpu::ExecutionState::Running {
-            cpu.step(&mut bus).unwrap();
+        while cpu.execution() == lazalith_cpu::ExecutionState::Running {
+            ReferenceInterpreter::new()
+                .step(&mut cpu, &mut bus)
+                .unwrap();
             steps += 1;
             assert!(steps <= 6, "cpu did not halt within six steps");
         }
         assert_eq!(steps, 6);
-        assert_eq!(cpu.execution_state(), lazalith_cpu::ExecutionState::Halted);
-        let registers = cpu.architectural_state().registers();
+        assert_eq!(cpu.execution(), lazalith_cpu::ExecutionState::Halted);
+        let registers = cpu.architectural().registers();
         assert_eq!(registers.read(RegisterIndex::try_from(3).unwrap()), 47);
         assert_eq!(registers.read(RegisterIndex::try_from(4).unwrap()), 47);
         let size = usize::from(config.word_bytes());

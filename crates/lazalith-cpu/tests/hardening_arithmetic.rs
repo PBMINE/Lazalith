@@ -16,6 +16,7 @@
 
 mod support;
 
+use lazalith_cpu::ExecutionEngine;
 use lazalith_isa::{Instruction, Opcode};
 use lazalith_types::{ArchitectureConfig as C, WordWidth};
 use support::{MODES, cpu, instruction, r};
@@ -163,9 +164,9 @@ fn run(config: C, opcode: Opcode, a: u64, b: u64) -> Result<u64, String> {
     let instruction = instruction(config, opcode, &[r(3), r(1), r(2)]);
     let bytes = lazalith_isa::encode(config, &instruction).expect("the instruction encodes");
     let mut memory = support::Ram::default();
-    match cpu.step_bytes(&bytes, &mut memory) {
+    match lazalith_cpu::ReferenceInterpreter::new().step_bytes(&mut cpu, &bytes, &mut memory) {
         Ok(_) => Ok(cpu
-            .architectural_state()
+            .architectural()
             .registers()
             .read(RegisterIndex::try_from(3).unwrap())),
         Err(error) => Err(format!("{error:?}")),

@@ -1,0 +1,68 @@
+name: Beyond Lazalith
+description: A proposal for the next phase of the platform.
+labels: ['beyond']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `binstruction.md` is the Beyond-Lazalith specification and the `B1`–`B29`
+        roadmap. This form is for work that is not in it, or for a disagreement
+        with how it is written.
+
+        A proposal here is a proposal. It does not change `docs/`, and nothing
+        should be described as implemented because of it.
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: The proposal
+      description: What should exist, and what it would be for.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of the roadmap it touches
+      options:
+        - LZA architecture / naming
+        - VM core and execution engines (interpreter, JIT, engine switching)
+        - Machine profiles and device models
+        - Toolchain (C, assembly, Lazen, assembler, linker, sysroot)
+        - Target-side LazOS
+        - VM manager and host frontends
+        - Compatibility hardware and the Linux 0.01 port
+        - CI/CD and repository automation
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: depends
+    attributes:
+      label: What it depends on
+      description: |
+        Which earlier roadmap stage has to be true first, and why it cannot be
+        done before that.
+    validations:
+      required: true
+
+  - type: textarea
+    id: identity
+    attributes:
+      label: Why it is still Lazalith
+      description: |
+        What keeps the guest-visible foundation — the LZA ISA, the ABI, the
+        object model, the VM contract, the device contracts — unchanged.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: research
+    attributes:
+      label: External research
+      options:
+        - label: >
+            I read the upstream documentation or primary source rather than
+            working from memory, and I can say which source and what it said.
+        - label: This is Lazalith-specific design with no external precedent.

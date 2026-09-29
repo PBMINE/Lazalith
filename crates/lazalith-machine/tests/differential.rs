@@ -48,7 +48,7 @@
 
 use lazalith_cpu::{
     ArchitecturalState, CpuFault, CpuFaultCause, CpuMemory, DataAccess, DataAccessKind,
-    OutcomeApplication, Privilege, ReferenceInterpreter, TrapCause,
+    ExecutionEngine, OutcomeApplication, Privilege, Processor, ReferenceInterpreter, TrapCause,
 };
 use lazalith_devices::{ConsoleDevice, DeviceId, DeviceManager};
 use lazalith_isa::{DataSize, Instruction, Opcode, Operand, encode};
@@ -302,13 +302,13 @@ fn run_bare(program: &Program, steps: u64) -> (Vec<Observation>, Vec<Vec<u8>>) {
         0,
     )
     .expect("a fresh architectural state is valid");
-    let mut cpu = ReferenceInterpreter::new(state);
+    let mut cpu = Processor::new(state);
     let mut memory = Flat::of(program);
 
     let mut observations = Vec::new();
     let mut memory_watch = Vec::new();
     for _ in 0..steps {
-        let outcome = cpu.step(&mut memory);
+        let outcome = ReferenceInterpreter::new().step(&mut cpu, &mut memory);
         observations.push(observe_bare(&cpu, &outcome));
         memory_watch.push(memory.bytes.clone());
         // A stopped processor is not stepped again. The bare path keeps going and
@@ -439,10 +439,10 @@ fn program_bytes(program: &Program) -> Vec<u8> {
 }
 
 fn observe_bare(
-    cpu: &ReferenceInterpreter,
+    cpu: &Processor,
     outcome: &Result<OutcomeApplication, CpuFault<MemoryFault>>,
 ) -> Observation {
-    let state = cpu.architectural_state();
+    let state = cpu.architectural();
     // The same three-way question the machine's observer asks, in the same words.
     // A trap *request* is not a fault: the processor is asking the machine for
     // something, and the machine's answer to the same request is a trap with a cause.

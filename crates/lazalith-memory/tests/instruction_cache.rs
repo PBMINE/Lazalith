@@ -14,7 +14,8 @@
 //!   expected value was written down before the cache existed.
 
 use lazalith_cpu::{
-    CpuMemory, DataAccess, DataAccessKind, FetchedInstruction, Privilege, ReferenceInterpreter,
+    CpuMemory, DataAccess, DataAccessKind, ExecutionEngine, FetchedInstruction, Privilege,
+    Processor, ReferenceInterpreter,
 };
 use lazalith_isa::{Instruction, Opcode, Operand, decode, encode};
 use lazalith_memory::{
@@ -155,20 +156,24 @@ fn writing_an_instruction_makes_the_cached_copy_be_ignored() {
         // the same one, so a stale entry would be visible in a register.
         bus.initialize(P::new(0), &li(1, 7)).unwrap();
         bus.initialize(P::new(8), &li(2, 99)).unwrap();
-        let mut cpu = ReferenceInterpreter::new(
+        let mut cpu = Processor::new(
             lazalith_cpu::ArchitecturalState::new(config, I::new(0), V::new(200), 0).unwrap(),
         );
-        cpu.step(&mut bus).unwrap();
+        ReferenceInterpreter::new()
+            .step(&mut cpu, &mut bus)
+            .unwrap();
         assert_eq!(
-            cpu.architectural_state()
+            cpu.architectural()
                 .registers()
                 .read(RegisterIndex::try_from(1).unwrap()),
             7
         );
         // The second instruction has been decoded by now, and cached.
-        cpu.step(&mut bus).unwrap();
+        ReferenceInterpreter::new()
+            .step(&mut cpu, &mut bus)
+            .unwrap();
         assert_eq!(
-            cpu.architectural_state()
+            cpu.architectural()
                 .registers()
                 .read(RegisterIndex::try_from(2).unwrap()),
             99
@@ -183,12 +188,14 @@ fn writing_an_instruction_makes_the_cached_copy_be_ignored() {
             "a store into a cached instruction must forget it"
         );
         // And the program must now do the new thing.
-        let mut cpu = ReferenceInterpreter::new(
+        let mut cpu = Processor::new(
             lazalith_cpu::ArchitecturalState::new(config, I::new(0), V::new(200), 0).unwrap(),
         );
-        cpu.step(&mut bus).unwrap();
+        ReferenceInterpreter::new()
+            .step(&mut cpu, &mut bus)
+            .unwrap();
         assert_eq!(
-            cpu.architectural_state()
+            cpu.architectural()
                 .registers()
                 .read(RegisterIndex::try_from(1).unwrap()),
             0,
@@ -333,11 +340,13 @@ fn the_cache_is_bounded_and_a_long_run_does_not_grow_it() {
             .unwrap();
     }
     for _ in 0..62 {
-        let mut cpu = ReferenceInterpreter::new(
+        let mut cpu = Processor::new(
             lazalith_cpu::ArchitecturalState::new(config, I::new(0), V::new(200), 0).unwrap(),
         );
         for _ in 0..32 {
-            cpu.step(&mut bus).unwrap();
+            ReferenceInterpreter::new()
+                .step(&mut cpu, &mut bus)
+                .unwrap();
         }
     }
     assert_eq!(
@@ -359,19 +368,21 @@ fn run(config: C, program: &[[u8; 8]], steps: usize, reference: bool) -> Vec<u64
     for (index, bytes) in program.iter().enumerate() {
         bus.initialize(P::new(index as u64 * 8), bytes).unwrap();
     }
-    let mut cpu = ReferenceInterpreter::new(
+    let mut cpu = Processor::new(
         lazalith_cpu::ArchitecturalState::new(config, I::new(0), V::new(896), 0).unwrap(),
     );
     let mut trace = Vec::new();
     for _ in 0..steps {
-        if cpu.execution_state() != lazalith_cpu::ExecutionState::Running {
+        if cpu.execution() != lazalith_cpu::ExecutionState::Running {
             break;
         }
-        cpu.step(&mut bus).unwrap();
-        trace.push(cpu.architectural_state().pc().as_u64());
+        ReferenceInterpreter::new()
+            .step(&mut cpu, &mut bus)
+            .unwrap();
+        trace.push(cpu.architectural().pc().as_u64());
         for index in 0..8u8 {
             trace.push(
-                cpu.architectural_state()
+                cpu.architectural()
                     .registers()
                     .read(RegisterIndex::try_from(index).unwrap()),
             );

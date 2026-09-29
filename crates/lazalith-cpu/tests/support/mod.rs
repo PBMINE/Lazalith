@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use lazalith_cpu::{
-    ArchitecturalState, CpuMemory, DataAccess, DataAccessKind, Privilege, ReferenceInterpreter,
+    ArchitecturalState, CpuMemory, DataAccess, DataAccessKind, Privilege, Processor,
 };
 use lazalith_isa::{Instruction, Opcode, Operand, encode};
 use lazalith_types::{ArchitectureConfig, InstructionAddress, RegisterIndex, VirtualAddress};
@@ -32,7 +32,7 @@ pub fn cpu(
     sp: u64,
     status: u64,
     registers: &[(u8, u64)],
-) -> ReferenceInterpreter {
+) -> Processor {
     let mut state = ArchitecturalState::new(
         config,
         InstructionAddress::new(pc),
@@ -43,7 +43,7 @@ pub fn cpu(
     for &(index, value) in registers {
         state.write_register_raw(index, value).unwrap();
     }
-    ReferenceInterpreter::new(state)
+    Processor::new(state)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

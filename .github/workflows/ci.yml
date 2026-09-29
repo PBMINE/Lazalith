@@ -1,0 +1,223 @@
+# Pull-request and push validation.
+#
+# This workflow is Tier 1, Tier 2 and Tier 3 of the tiering in `docs/ci-cd.md`. It
+# exists to answer one question: would this commit still be a working Lazalith?
+#
+# # Layering
+#
+# Jobs are layered with `needs` rather than all running at once, so an expensive
+# job only starts once the cheap job that usually catches the problem has passed:
+#
+#   fmt ─┐
+#   clippy ─┼─→ test ──→ nix ──→ smoke
+#   architecture ─┘
+#
+# `nix flake check` is the single most expensive job here — it builds the whole
+# workspace, lints it with warnings as errors, and instantiates the development
+# shell — so it runs last, behind the tests. The measured runtimes that motivated
+# this ordering are recorded in `docs/ci-cd.md`.
+#
+# # Why Nix and not a hand-installed toolchain
+#
+# `lazalith-sdl3` compiles a C probe against real SDL3 headers at build time and
+# asserts the measured layout against the Rust side at compile time. A CI job that
+# installed Rust by hand and no SDL3 would either fail at the pkg-config lookup or,
+# worse, be green because it never built the frontend. Using the project's own
+# flake means CI runs the same environment `nix develop` gives a developer, which
+# is the only way "works locally" and "works in CI" can mean the same thing.
+#
+# # What is deliberately not here
+#
+# No fuzzing, no long property campaigns, and no release work. Those are
+# `campaign.yml` and `release.yml`. Putting an expensive campaign on the
+# pull-request path would make it get skipped, and a check that gets skipped is
+# not a check.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch supersedes the first. The superseded run is
+# cancelled rather than left to finish, because its result describes a commit
+# nobody is going to merge.
+#
+# This is a top-level key, not part of `on:` — it is the concurrency *policy* for
+# the whole workflow, and putting it inside the trigger block would silently do
+# nothing at all.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# `contents: read` is all any job in this workflow needs: it clones the repository
+# and does not otherwise talk to the API. Jobs that need more say so themselves —
+# see `release.yml`, which is the only workflow that writes. Per GitHub's
+# documented rule, any permission not named here is `none`.
+permissions:
+  contents: read
+
+jobs:
+  # Tier 1. Seconds. Catches the two failures a reviewer should never have to see.
+  fmt:
+    name: formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            accept-flake-config = true
+      - name: cargo fmt --check
+        run: nix develop --command cargo fmt --all --check
+
+  # Tier 1. Minutes. Warnings are errors, and `--all-targets` is what makes the
+  # tests and examples linted too rather than only the libraries.
+  clippy:
+    name: lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Restore cargo target directory
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-${{ hashFiles('Cargo.lock', 'flake.lock') }}
+          restore-keys: cargo-target-
+      - name: cargo clippy
+        run: nix develop --command cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # Tier 2. The workspace test suite: 1279 tests over the interpreter, the
+  # machine, the OS, both compiler front ends, the toolchain, the debugger and the
+  # guest libraries. This is the long pole, which is why everything expensive
+  # waits for it.
+  test:
+    name: workspace tests
+    needs: [fmt, clippy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Restore cargo target directory
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-${{ hashFiles('Cargo.lock', 'flake.lock') }}
+          restore-keys: cargo-target-
+      - name: cargo test --workspace
+        run: nix develop --command cargo test --workspace --all-features
+        env:
+          # Several suites run the interpreter over frame-heavy generated code in
+          # a debug build. Without this they take tens of minutes; with it they
+          # take minutes. The budget is the host's, not the code's — no test
+          # changes because CI is slower than a workstation.
+          CARGO_BUILD_JOBS: 2
+
+  # Tier 2, run separately so that a failure reads as an architecture failure
+  # rather than as "a test failed somewhere in 1279 of them".
+  #
+  # These are the suites that check the contracts ordinary compilation cannot see:
+  # the dependency graph (SDL3 stays host-only, the machine does not know the
+  # compiler, the ISA and ABI and syscall table each exist exactly once), and the
+  # step-for-step differential between a bare Reference Interpreter and a full
+  # machine over the same program, on both widths.
+  architecture:
+    name: architecture invariants
+    needs: [fmt, clippy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Restore cargo target directory
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-${{ hashFiles('Cargo.lock', 'flake.lock') }}
+          restore-keys: cargo-target-
+      - name: dependency graph and layering invariants
+        run: nix develop --command cargo test -p lazalith-cli --test architecture -- --nocapture
+      - name: interpreter/machine differential
+        run: nix develop --command cargo test -p lazalith-machine --test differential -- --nocapture
+      - name: boot, linker and object-format suites
+        run: nix develop --command cargo test -p lazalith-boot -p lazalith-toolchain --all-features
+
+  # Tier 3. Reproducibility: the same five checks the flake publishes, in the
+  # same sandbox, on the same pinned nixpkgs that a developer's `nix flake check`
+  # would use. This is the job that fails when a package builds in `nix develop`
+  # and not in `nix build`.
+  nix:
+    name: nix flake check
+    needs: [test, architecture]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: nix flake check
+        run: nix flake check --print-build-logs
+      - name: nix build
+        run: nix build --print-build-logs
+
+  # Tier 3. The installed program, run.
+  #
+  # Everything above builds Lazalith. This uses it: the binary the package
+  # installs, on the programs the repository actually ships, through the commands
+  # a user types. `examples/hello` and `examples/window` are read from this
+  # checkout, not from a fixture, so a test cannot pass against a program the
+  # repository does not contain.
+  smoke:
+    name: installed program
+    needs: [nix]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Build the package
+        run: nix build --print-build-logs
+      - name: The toolchain is the one this build produced
+        run: |
+          export PATH="$PWD/result/bin:$PATH"
+          test "$(command -v lazen)" = "$PWD/result/bin/lazen" \
+            || { echo "the wrong lazen would be tested: $(command -v lazen)" >&2; exit 1; }
+          lazen --version
+      - name: Type-check the shipped examples
+        run: |
+          export PATH="$PWD/result/bin:$PATH"
+          lazen check examples/hello/main.lz
+          lazen check examples/window/main.lz
+      - name: Format check on the shipped examples
+        run: |
+          export PATH="$PWD/result/bin:$PATH"
+          lazen fmt --check examples/hello/main.lz
+          lazen fmt --check examples/window/main.lz
+      - name: Run the shipped examples
+        run: |
+          export PATH="$PWD/result/bin:$PATH"
+          output="$(lazen run examples/hello/main.lz)"
+          printf '%s\n' "$output"
+          case "$output" in
+            *"Hello, Lazalith"*) ;;
+            *) echo "hello did not greet" >&2; exit 1 ;;
+          esac
+          lazen run examples/window/main.lz
+      - name: The fuzzer binary is installed and lists its targets
+        run: |
+          export PATH="$PWD/result/bin:$PATH"
+          test -x result/bin/lazalith-fuzz
+          result/bin/lazalith-fuzz --list
+      - name: Keep the built artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lazalith-binaries
+          path: |
+            result/bin/lazen
+            result/bin/lazalith-fuzz
+          retention-days: 14
+          if-no-files-found: error

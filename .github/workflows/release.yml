@@ -1,0 +1,135 @@
+# Tier 5: release.
+#
+# # Status
+#
+# This workflow is written and has been validated locally, but **no tag has been
+# cut** and therefore **no GitHub Release has been produced by it**. `docs/ci-cd.md`
+# records that in the same terms. Nothing here claims an artifact exists that this
+# pipeline has not actually built.
+#
+# # What triggers it
+#
+# A tag matching `v*`, and only then. Nothing on a branch or a pull request runs
+# this file, so the ordinary validation path cannot be slowed down by it and a
+# merge cannot accidentally create a release.
+#
+# # What a release is
+#
+# The Nix build of an exact commit, plus the checksums of what came out of it. The
+# commit is not a parameter: the workflow checks out the tag's own commit, so the
+# artifact and the source revision cannot disagree. `sha256sum` output is uploaded
+# next to the binaries, so a downloader can verify what they got.
+#
+# Tags are never moved by this workflow and never force-pushed by a person; if a
+# release is wrong, the tag is deleted and a new one cut from a fixed commit. A
+# moved tag would make two different artifacts claim the same version.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+# The only workflow in this repository that writes. It creates a GitHub Release
+# and uploads files to it, which needs `contents: write`; everything else stays
+# at the implicit `none`, so a compromised step cannot open issues, publish
+# packages, or push anything.
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      # A release is not cut from a tree that has not been validated. Rather than
+      # re-running the whole of `ci.yml` — which would be slow and would duplicate
+      # what the branch it was merged from already ran — the tag is required to sit
+      # on a commit `main` already contains, and the tag is required to look like a
+      # version rather than anything else. Both checks fail the job.
+      - name: The tag is a version, and main contains it
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "$tag is not a vMAJOR.MINOR.PATCH tag" >&2; exit 1 ;;
+          esac
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "$GITHUB_SHA is not on main; refusing to release an unmerged commit" >&2
+            exit 1
+          fi
+          echo "releasing $tag from $GITHUB_SHA, which is on main"
+
+      # The build itself. `nix build .#default` is the same derivation a developer
+      # gets from `nix build`, on the flake.lock this commit pins, so the artifact
+      # is reproducible from the source revision and the lock file alone.
+      - name: Build
+        run: nix build --print-build-logs .#default
+
+      - name: Record the provenance of what was built
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          {
+            echo "name:        lazalith"
+            echo "version:     ${GITHUB_REF_NAME#v}"
+            echo "revision:    $(git rev-parse HEAD)"
+            echo "nixpkgs:     $(nix flake metadata --json | grep -o '"rev": *"[0-9a-f]*"' | head -1 | cut -d'"' -f4)"
+            echo "built-by:    GitHub Actions, workflow release.yml"
+            echo "runner:      ${RUNNER_OS}"
+            echo "profile:     release (nix build)"
+          } > dist/BUILDINFO
+          cat dist/BUILDINFO
+
+      - name: Assemble the artifacts
+        run: |
+          set -euo pipefail
+          install -m755 result/bin/lazen          dist/lazen
+          install -m755 result/bin/lazalith-fuzz  dist/lazalith-fuzz
+          ( cd dist && sha256sum lazen lazalith-fuzz > SHA256SUMS )
+          cat dist/SHA256SUMS
+
+      # The artifacts are checked before they are published, not after. A release
+      # whose binary cannot print its own version, or whose fuzzer cannot list its
+      # targets, is a broken release, and the only moment it can be stopped is
+      # before it is named.
+      - name: Verify the artifacts before publishing them
+        run: |
+          set -euo pipefail
+          ./dist/lazen --version
+          ./dist/lazalith-fuzz --list
+          ( cd dist && sha256sum --check SHA256SUMS )
+
+      - name: Publish
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          {
+            echo "Lazalith \`${GITHUB_REF_NAME#v}\`, built from \`$(git rev-parse --short HEAD)\`."
+            echo
+            echo "Artifacts were produced by this workflow from that exact commit."
+            echo "Verify a download with:"
+            echo
+            echo '```'
+            echo "sha256sum --check SHA256SUMS"
+            echo '```'
+            echo
+            echo "See \`docs/ci-cd.md\` for what is and is not covered by a release."
+          } > "$notes"
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "Lazalith ${GITHUB_REF_NAME#v}" \
+            --notes-file "$notes" \
+            dist/lazen dist/lazalith-fuzz dist/SHA256SUMS dist/BUILDINFO
+        env:
+          # `gh` is preinstalled on GitHub-hosted runners; it authenticates as the
+          # job's GITHUB_TOKEN, whose scope is the `contents: write` above and
+          # nothing else.
+          GH_TOKEN: ${{ github.token }}

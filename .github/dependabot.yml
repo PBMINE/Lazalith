@@ -1,0 +1,67 @@
+# What keeps this repository's dependencies current.
+#
+# Two ecosystems are tracked, and the reasoning for what is *absent* is as much a
+# part of this file as what is in it.
+#
+# # `cargo`
+#
+# The workspace has exactly one third-party Rust dependency: `pkg-config`, used by
+# `lazalith-sdl3`'s build script to locate SDL3. Everything else — the property
+# generator, the fuzz harness, the diagnostics renderer — is in-tree, deliberately.
+# Dependabot opens a pull request when `pkg-config` moves; that is the whole
+# surface, and a pull request for it is still worth reviewing because the
+# dependency is a *build* dependency that decides whether the SDL3 layout probe
+# compiles at all.
+#
+# # `github-actions`
+#
+# Every action in `.github/workflows/` is pinned to a full commit SHA with the
+# version in a trailing comment. Dependabot can update those pins, and it is the
+# only automated thing that touches them, so the supply-chain surface is small and
+# every change to it arrives as a reviewable diff.
+#
+# # `nix` is absent, and that is a real gap
+#
+# Dependabot has no Nix ecosystem. `flake.lock` pins nixpkgs, and the pinned
+# revision is the reproducibility guarantee that `nix flake check` in CI depends
+# on. Today it is updated by hand. That is recorded in `docs/ci-cd.md` as a known
+# limitation with the manual procedure, because an unrecorded gap in a dependency
+# policy is a gap that gets forgotten.
+
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    commit-message:
+      prefix: 'cargo'
+    groups:
+      cargo-dependencies:
+        patterns:
+          - '*'
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: 'ci'
+    groups:
+      github-actions:
+        patterns:
+          - '*'

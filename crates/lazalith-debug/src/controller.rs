@@ -806,7 +806,7 @@ impl<D: Device> DebugController<D> {
         if let Some(context) = self.machine.active_execution_context() {
             self.machine
                 .processor_mut()
-                .trap_controller_mut()
+                .traps_mut()
                 .clear_execution_context(context);
         }
         // The sessions follow the processes. Without this a program that had

@@ -1,0 +1,92 @@
+# Tier 4: the campaigns that are too expensive for a pull request.
+#
+# # What runs here
+#
+# - a long deterministic fuzz campaign over all eleven targets, seeded and
+#   replayable, which is the only way `lazalith-fuzz` ever explores more than the
+#   ~200 inputs per target that `cargo test` gives it;
+# - a widened property and differential sweep, which re-runs the existing suites
+#   with a far larger seed corpus than the tests use.
+#
+# # Why not on the pull request
+#
+# Measured on the runner, a full campaign is tens of minutes against a pull-request
+# test suite of a few minutes. A check that is routinely skipped is not a check, so
+# this runs nightly and on demand, and a pull request that changes a byte parser,
+# the decoder, or the machine asks for it explicitly with `workflow_dispatch`.
+#
+# # Determinism is the point
+#
+# The fuzzer is a seeded generator, not a coverage-guided one: the same `--seed`
+# and the same `--iterations` produce the same inputs on any machine. A failure
+# found here is therefore reproducible by a person with the printed seed, without
+# needing the original CI run. That is why the seed is pinned in the workflow
+# rather than left to the runner's clock.
+
+name: Campaign
+
+on:
+  schedule:
+    # 04:17 UTC nightly. An off-the-hour minute is deliberate: it keeps the run
+    # out of the top-of-hour window where every other scheduled workflow on the
+    # platform is queued.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'Fuzz inputs per target'
+        required: false
+        default: '20000'
+      seed:
+        description: 'Campaign seed (quote this to reproduce a failure)'
+        required: false
+        default: '1'
+
+# Read-only. This workflow observes and reports; it never writes to the repository.
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz campaign
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: List the targets this build will campaign over
+        run: nix develop --command cargo run --quiet -p lazalith-fuzz -- --list
+      - name: Run the campaign
+        run: |
+          nix develop --command cargo run --quiet --release -p lazalith-fuzz -- \
+            --iterations "${{ inputs.iterations || 20000 }}" \
+            --seed "${{ inputs.seed || 1 }}"
+      - name: Narrow any failure to a single target
+        if: failure()
+        run: |
+          echo "The campaign above printed the target name and the failing input."
+          echo "Reproduce one with:"
+          echo "  cargo run -p lazalith-fuzz -- --target '<name>' --seed <seed> --iterations <n>"
+
+  properties:
+    name: property and differential sweep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Restore cargo target directory
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-${{ hashFiles('Cargo.lock', 'flake.lock') }}
+          restore-keys: cargo-target-
+      # The same suites CI already runs, in a release profile. The property tests
+      # and the differential iterate a fixed seed corpus whose size is a constant
+      # in the source, so this is the same work done three times faster rather
+      # than more work — it is here as an independent confirmation on a different
+      # build, and as the first thing to fail if a debug-only assumption exists.
+      - name: property suites
+        run: nix develop --command cargo test --release --workspace --all-features -- properties
+      - name: differential suite
+        run: nix develop --command cargo test --release -p lazalith-machine --test differential -- --nocapture

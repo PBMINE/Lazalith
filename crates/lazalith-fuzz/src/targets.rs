@@ -439,10 +439,9 @@ pub fn snapshot_reader(input: &[u8]) -> Result<(), String> {
         }
     }
     let snapshot = CpuSnapshot::of(machine.processor());
-    let mut restored =
-        lazalith_cpu::ReferenceInterpreter::new(machine.processor().architectural_state().clone());
+    let mut restored = lazalith_cpu::Processor::new(machine.processor().architectural().clone());
     snapshot.restore(&mut restored)?;
-    if restored.architectural_state() != machine.processor().architectural_state() {
+    if restored.architectural() != machine.processor().architectural() {
         return Err(String::from(
             "a restored processor is not in the state it was captured in",
         ));

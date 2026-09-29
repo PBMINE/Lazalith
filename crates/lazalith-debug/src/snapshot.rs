@@ -35,7 +35,7 @@
 
 use alloc::vec::Vec;
 
-use lazalith_cpu::{ArchitecturalState, ExecutionState as CpuExecution, ReferenceInterpreter};
+use lazalith_cpu::{ArchitecturalState, ExecutionState as CpuExecution, Processor};
 use lazalith_devices::{DeviceId, DeviceManager};
 use lazalith_os::{Process, ProcessId, ProcessState};
 use lazalith_types::RegisterIndex;
@@ -55,12 +55,11 @@ pub struct CpuSnapshot {
 
 impl CpuSnapshot {
     /// Captures `processor`.
-    pub fn of(processor: &ReferenceInterpreter) -> Self {
-        let (architectural, execution, traps) = processor.capture();
+    pub fn of(processor: &Processor) -> Self {
         Self {
-            architectural,
-            execution,
-            traps,
+            architectural: processor.architectural().clone(),
+            execution: processor.execution(),
+            traps: processor.traps().clone(),
         }
     }
 
@@ -91,13 +90,16 @@ impl CpuSnapshot {
     /// The architectural state goes in first, through the same validation a normal
     /// step uses, so a restore is not a way to smuggle an inconsistent processor
     /// past the checks the machine makes every step.
-    pub fn restore(&self, processor: &mut ReferenceInterpreter) -> Result<(), String> {
+    pub fn restore(&self, processor: &mut Processor) -> Result<(), String> {
+        let restored = Processor::from_parts(
+            self.architectural.clone(),
+            self.execution,
+            self.traps.clone(),
+        );
         processor
-            .restore(
-                self.architectural.clone(),
-                self.execution,
-                self.traps.clone(),
-            )
+            .restore(restored.map_err(|error| {
+                format!("the processor would not take the state back: {error:?}")
+            })?)
             .map_err(|error| format!("the processor would not take the state back: {error:?}"))
     }
 }
@@ -187,7 +189,7 @@ pub struct MachineSnapshot {
 impl MachineSnapshot {
     /// Captures a machine and the processes on it.
     pub fn of<D: lazalith_devices::Device>(
-        processor: &ReferenceInterpreter,
+        processor: &Processor,
         devices: &DeviceManager<D>,
         processes: impl IntoIterator<Item = Process>,
     ) -> Self {

@@ -8,9 +8,10 @@ pub use interrupts::InterruptController;
 use alloc::{boxed::Box, collections::TryReserveError, vec::Vec};
 use core::{error::Error, fmt};
 use lazalith_cpu::{
-    ArchitecturalState, ControlStateError, CpuFault, CpuFaultCause, DataAccessError,
-    ExecutionContextId, FaultOrigin, OutcomeApplication, OutcomeErrorKind, ReferenceInterpreter,
-    SyscallCompletion, TrapAttempt, TrapCause, TrapController, TrapRequest,
+    ArchitecturalState, ControlStateError, CpuFault, CpuFaultCause, DataAccessError, EngineError,
+    EngineKind, ExecutionContextId, ExecutionEngine, FaultOrigin, OutcomeApplication,
+    OutcomeErrorKind, Processor, ReferenceInterpreter, SyscallCompletion, TrapAttempt, TrapCause,
+    TrapController, TrapRequest,
 };
 use lazalith_devices::{Device, DeviceId, DeviceManager};
 use lazalith_diagnostics::bug::{EmulatorBug, Subsystem};
@@ -100,6 +101,10 @@ pub enum MachineError {
     Memory(lazalith_memory::MemoryFault),
     AddressSpaceSwap(AddressSpaceSwapError),
     Cpu(lazalith_cpu::ControlStateError),
+    /// The execution-engine boundary refused: an engine this build does not have,
+    /// or a switch at a moment when changing engines is not a thing a machine may
+    /// do. See [`LazalithMachine::switch_execution_engine`].
+    Engine(EngineError),
     Decode(DecodeError),
     InvalidSyscallReturn,
     InvalidUserContext {
@@ -146,6 +151,7 @@ impl fmt::Display for MachineError {
             Self::Device(source) => write!(f, "device rejected the operation: {source}"),
             Self::Memory(source) => write!(f, "memory rejected the operation: {source}"),
             Self::Cpu(source) => write!(f, "CPU rejected the operation: {source}"),
+            Self::Engine(source) => write!(f, "execution engine: {source}"),
             Self::InstructionCountOverflow => f.write_str("executed instruction count overflowed"),
             Self::InitialClock { devices, requested } => write!(
                 f,
@@ -167,6 +173,7 @@ impl Error for MachineError {
             Self::Memory(source) => Some(source),
             Self::AddressSpaceSwap(source) => Some(source),
             Self::Cpu(source) => Some(source),
+            Self::Engine(source) => Some(source),
             Self::Decode(source) => Some(source),
             Self::InvalidTransition { .. }
             | Self::TrapEntryContextMissing
@@ -192,7 +199,20 @@ pub struct MachineSetup<D: Device> {
 
 #[derive(Debug)]
 pub struct LazalithMachine<D: Device> {
-    cpu: ReferenceInterpreter,
+    /// The canonical guest-visible processor state.
+    ///
+    /// The machine owns it, not an engine, and that ownership is the whole reason
+    /// an engine can be changed without the guest seeing a machine reset: there is
+    /// one copy of the program counter, the registers, the status register and the
+    /// trap frames, and an engine that goes away takes nothing of it with it.
+    processor: Processor,
+    /// The engine that is currently executing LZA instructions.
+    ///
+    /// Whatever this holds beyond the instruction semantics — a translation cache,
+    /// host register state — is private and discardable. The machine drops it on a
+    /// switch through [`ExecutionEngine::discard_private_state`], and a guest must
+    /// not be able to tell that it was dropped.
+    engine: Box<dyn ExecutionEngine<Bus<D>>>,
     bus: Bus<D>,
     config: ArchitectureConfig,
     clock: VirtualClock,
@@ -245,12 +265,13 @@ impl<D: Device> LazalithMachine<D> {
             })?;
         let initial_state =
             ArchitecturalState::new(config, pc, sp, status).map_err(MachineError::Cpu)?;
-        let cpu = ReferenceInterpreter::new(initial_state.clone());
+        let processor = Processor::new(initial_state.clone());
         let mut bus = Bus::with_devices(space, devices);
         bus.tick_devices(delta).map_err(MachineError::Device)?;
         let clock = VirtualClock::at(initial_time);
         Ok(Self {
-            cpu,
+            processor,
+            engine: Box::new(ReferenceInterpreter::new()),
             bus,
             config,
             clock,
@@ -268,6 +289,79 @@ impl<D: Device> LazalithMachine<D> {
     pub const fn config(&self) -> ArchitectureConfig {
         self.config
     }
+
+    /// Which execution engine this machine is running LZA instructions on.
+    ///
+    /// The machine does not care which; a caller can ask, and the answer is a
+    /// stable name rather than a type, so a debugger can report it and a profile
+    /// can bucket by it.
+    pub fn execution_engine(&self) -> EngineKind {
+        self.engine.kind()
+    }
+
+    /// Changes which execution engine runs this machine, without resetting it.
+    ///
+    /// # What this is for
+    ///
+    /// The two directions a future JIT needs, and neither of them is a restart:
+    ///
+    /// ```text
+    /// Interpreter ──▶ JIT   hot code identified
+    /// JIT ──▶ Interpreter   breakpoint, fault, debug event, or an unsupported block
+    /// ```
+    ///
+    /// Both are the same operation, because both are the same fact: the machine has
+    /// one canonical architectural state and the engine is how that state is being
+    /// advanced.
+    ///
+    /// # What it guarantees
+    ///
+    /// The [`Processor`] is the machine's, so it is not touched. Program counter,
+    /// stack pointer, registers, status, the trap frame stack, memory, the device
+    /// state, the virtual clock and the machine's own lifecycle are all exactly
+    /// what they were. What *is* dropped is the outgoing engine's private state,
+    /// through [`ExecutionEngine::discard_private_state`], because a translation
+    /// cache describes compiled code and not a program.
+    ///
+    /// # When it is refused
+    ///
+    /// In two cases, both named in the error rather than implied:
+    ///
+    /// - while a user execution context is active, because the scheduler is
+    ///   between two steps of a guest process and would not observe the change;
+    /// - while the machine is [`MachineState::Faulted`], because a terminal machine
+    ///   is over and reviving it through an engine switch is a reset wearing a
+    ///   disguise.
+    ///
+    /// A switch **is** allowed while a trap frame is active, which is the case
+    /// that matters: a fault in compiled code has to be able to hand the program
+    /// back to the interpreter with the frame intact, or the program could never
+    /// return from it.
+    ///
+    /// # Today
+    ///
+    /// One engine exists — [`EngineKind::Reference`] — so this currently replaces an
+    /// engine with the same semantics and discards its private state. It is the
+    /// operation, not the second engine, that this stage establishes; there is no
+    /// JIT in this repository and this does not pretend otherwise.
+    pub fn switch_execution_engine(&mut self, kind: EngineKind) -> Result<(), MachineError> {
+        if !EngineKind::ALL.contains(&kind) {
+            return Err(MachineError::Engine(EngineError::UnknownEngine(kind)));
+        }
+        if self.active_execution_context().is_some() {
+            return Err(MachineError::Engine(EngineError::SwitchRefused {
+                reason: "a user execution context is active, and the scheduler would not see the change",
+            }));
+        }
+        if self.state == MachineState::Faulted {
+            return Err(MachineError::Engine(EngineError::SwitchRefused {
+                reason: "the machine is faulted, and an engine switch is not a reset",
+            }));
+        }
+        self.engine.discard_private_state();
+        self.engine = Box::new(engine_for(kind));
+        Ok(())
+    }
     pub const fn clock(&self) -> &VirtualClock {
         &self.clock
     }
@@ -278,22 +372,20 @@ impl<D: Device> LazalithMachine<D> {
         matches!(self.state, MachineState::Halted)
     }
     pub fn architectural_state(&self) -> &ArchitecturalState {
-        self.cpu.architectural_state()
+        self.processor.architectural()
     }
     pub fn write_register(&mut self, index: RegisterIndex, value: u64) -> Result<(), MachineError> {
-        if self.active_execution_context().is_some()
-            || self.cpu.trap_controller().has_active_frame()
-        {
+        if self.active_execution_context().is_some() || self.processor.traps().has_active_frame() {
             return Err(MachineError::InvalidUserContext {
                 reason: "direct register mutation is not allowed during an active context",
             });
         }
-        self.cpu.write_register(index, value);
+        self.processor.write_register(index, value);
         Ok(())
     }
 
     fn write_register_unrestricted(&mut self, index: RegisterIndex, value: u64) {
-        self.cpu.write_register(index, value);
+        self.processor.write_register(index, value);
     }
     pub fn return_from_syscall(
         &mut self,
@@ -301,12 +393,12 @@ impl<D: Device> LazalithMachine<D> {
     ) -> Result<MachineEvent, MachineError> {
         self.ensure_executable(MachineOperation::Step)?;
         let frame = self
-            .cpu
-            .trap_controller()
+            .processor
+            .traps()
             .frame()
             .ok_or(MachineError::InvalidSyscallReturn)?;
         if frame.cause() != TrapCause::Syscall
-            || !self.cpu.trap_controller().completion_matches(&completion)
+            || !self.processor.traps().completion_matches(&completion)
             || self.architectural_state().privilege() != lazalith_cpu::Privilege::Supervisor
             || self.architectural_state().status().interrupts_enabled()
         {
@@ -323,8 +415,8 @@ impl<D: Device> LazalithMachine<D> {
             return Err(MachineError::InstructionCountOverflow);
         }
         if !self
-            .cpu
-            .trap_controller_mut()
+            .processor
+            .traps_mut()
             .authorize_syscall_return(&completion)
         {
             return Err(MachineError::InvalidSyscallReturn);
@@ -339,8 +431,8 @@ impl<D: Device> LazalithMachine<D> {
         );
         let result = self.step_managed(completion.execution_context());
         if result.is_err() {
-            self.cpu
-                .trap_controller_mut()
+            self.processor
+                .traps_mut()
                 .clear_syscall_return_authorization();
         }
         result
@@ -350,8 +442,8 @@ impl<D: Device> LazalithMachine<D> {
         operation: impl FnOnce(&TrapController, &ArchitecturalState, &mut dyn UserSpace) -> R,
     ) -> R {
         operation(
-            self.cpu.trap_controller(),
-            self.cpu.architectural_state(),
+            self.processor.traps(),
+            self.processor.architectural(),
             self.bus.user_address_space_mut(),
         )
     }
@@ -361,7 +453,7 @@ impl<D: Device> LazalithMachine<D> {
         address_space: &mut AddressSpace,
         execution_context: ExecutionContextId,
     ) -> Result<(), MachineError> {
-        if self.cpu.trap_controller().has_active_frame() {
+        if self.processor.traps().has_active_frame() {
             return Err(MachineError::InvalidUserContext {
                 reason: "cannot release while a trap frame is active",
             });
@@ -380,8 +472,8 @@ impl<D: Device> LazalithMachine<D> {
             .swap_user_address_space(address_space)
             .map_err(MachineError::AddressSpaceSwap)?;
         if !self
-            .cpu
-            .trap_controller_mut()
+            .processor
+            .traps_mut()
             .clear_execution_context(execution_context)
         {
             return Err(MachineError::InvalidUserContext {
@@ -411,8 +503,8 @@ impl<D: Device> LazalithMachine<D> {
             .swap_user_address_space(address_space)
             .map_err(MachineError::AddressSpaceSwap)?;
         if !self
-            .cpu
-            .trap_controller_mut()
+            .processor
+            .traps_mut()
             .clear_execution_context(execution_context)
         {
             return Err(MachineError::InvalidUserContext {
@@ -439,8 +531,8 @@ impl<D: Device> LazalithMachine<D> {
             });
         }
         if !self
-            .cpu
-            .trap_controller_mut()
+            .processor
+            .traps_mut()
             .clear_execution_context(execution_context)
         {
             return Err(MachineError::InvalidUserContext {
@@ -452,7 +544,7 @@ impl<D: Device> LazalithMachine<D> {
     }
 
     pub fn active_execution_context(&self) -> Option<ExecutionContextId> {
-        self.cpu.trap_controller().execution_context()
+        self.processor.traps().execution_context()
     }
 
     pub fn activate_user_context(
@@ -471,8 +563,7 @@ impl<D: Device> LazalithMachine<D> {
                 reason: "CPU context is not a User state for this machine",
             });
         }
-        if self.cpu.trap_controller().has_active_frame() || self.cpu.trap_controller().is_terminal()
-        {
+        if self.processor.traps().has_active_frame() || self.processor.traps().is_terminal() {
             return Err(MachineError::InvalidUserContext {
                 reason: "cannot switch while a trap frame is active",
             });
@@ -498,29 +589,29 @@ impl<D: Device> LazalithMachine<D> {
                 reason: "cannot replace an address space with device mappings",
             });
         }
-        let previous = self.cpu.architectural_state().clone();
-        let previous_execution = self.cpu.execution_state();
-        self.cpu
-            .replace_architectural_state(cpu)
+        let previous = self.processor.architectural().clone();
+        let previous_execution = self.processor.execution();
+        self.processor
+            .replace_architectural(cpu)
             .map_err(MachineError::Cpu)?;
         if let Err(error) = self.bus.swap_user_address_space(address_space) {
             let _ = self
-                .cpu
-                .restore_architectural_state_with_execution(previous, previous_execution);
+                .processor
+                .restore_architectural_with_execution(previous, previous_execution);
             return Err(MachineError::AddressSpaceSwap(error));
         }
         self.last_trap_fault = None;
         self.last_trap_resume_pc = None;
         self.last_emulator_bug = None;
-        self.cpu
-            .trap_controller_mut()
+        self.processor
+            .traps_mut()
             .set_execution_context(execution_context);
         self.state = MachineState::Running;
         Ok(())
     }
 
     pub fn abort_trap(&mut self) -> Result<(), MachineError> {
-        if !self.cpu.trap_controller_mut().abort_frame() {
+        if !self.processor.traps_mut().abort_frame() {
             return Err(MachineError::InvalidUserContext {
                 reason: "no active trap frame to abort",
             });
@@ -559,19 +650,19 @@ impl<D: Device> LazalithMachine<D> {
     /// offer — so nothing outside the workspace's own machine-level code uses it,
     /// and `lazalith-debug` reaches the CPU only through the machine's
     /// snapshot methods.
-    pub fn processor(&self) -> &ReferenceInterpreter {
-        &self.cpu
+    pub fn processor(&self) -> &Processor {
+        &self.processor
     }
 
     /// The processor, mutably. See [`Self::processor`].
-    pub fn processor_mut(&mut self) -> &mut ReferenceInterpreter {
-        &mut self.cpu
+    pub fn processor_mut(&mut self) -> &mut Processor {
+        &mut self.processor
     }
     pub const fn memory(&self) -> &AddressSpace {
         self.bus.address_space()
     }
     pub const fn trap_controller(&self) -> &TrapController {
-        self.cpu.trap_controller()
+        self.processor.traps()
     }
     pub fn with_trap_controller_mut<R>(
         &mut self,
@@ -583,7 +674,7 @@ impl<D: Device> LazalithMachine<D> {
                 reason: "trap-controller access does not match the active execution context",
             });
         }
-        Ok(operation(self.cpu.trap_controller_mut()))
+        Ok(operation(self.processor.traps_mut()))
     }
     pub const fn interrupts(&self) -> &InterruptController {
         &self.interrupts
@@ -614,7 +705,9 @@ impl<D: Device> LazalithMachine<D> {
     }
     pub fn set_trap_vector(&mut self, target: InstructionAddress) -> Result<(), MachineError> {
         self.ensure_host_mutation_allowed()?;
-        self.cpu.set_trap_vector(target).map_err(MachineError::Cpu)
+        self.processor
+            .set_trap_vector(target)
+            .map_err(MachineError::Cpu)
     }
 
     pub fn peek_memory(
@@ -631,9 +724,7 @@ impl<D: Device> LazalithMachine<D> {
     }
 
     fn ensure_host_mutation_allowed(&self) -> Result<(), MachineError> {
-        if self.active_execution_context().is_some()
-            || self.cpu.trap_controller().has_active_frame()
-        {
+        if self.active_execution_context().is_some() || self.processor.traps().has_active_frame() {
             return Err(MachineError::InvalidUserContext {
                 reason: "host memory mutation is not allowed during an active execution context",
             });
@@ -671,7 +762,8 @@ impl<D: Device> LazalithMachine<D> {
 
     pub fn reset(&mut self) {
         self.bus.reset_devices(self.initial_time);
-        self.cpu = ReferenceInterpreter::new(self.initial_state.clone());
+        self.processor = Processor::new(self.initial_state.clone());
+        self.engine.discard_private_state();
         self.clock = VirtualClock::at(self.initial_time);
         self.interrupts.reset();
         self.last_trap_fault = None;
@@ -725,17 +817,12 @@ impl<D: Device> LazalithMachine<D> {
                         .at(failure.pc.as_u64()),
                     ));
                 }
-                let attempt = self
-                    .cpu
-                    .trap_controller()
-                    .failed_entry()
-                    .cloned()
-                    .or_else(|| {
-                        self.cpu
-                            .trap_controller()
-                            .double_trap()
-                            .map(|double| double.attempt())
-                    });
+                let attempt = self.processor.traps().failed_entry().cloned().or_else(|| {
+                    self.processor
+                        .traps()
+                        .double_trap()
+                        .map(|double| double.attempt())
+                });
                 let Some(attempt) = attempt else {
                     return Err(MachineError::TrapEntryContextMissing);
                 };
@@ -755,15 +842,17 @@ impl<D: Device> LazalithMachine<D> {
                 resume_pc,
                 original,
             } => {
-                let result = self.cpu.enter_fault(&mut self.bus, cause, resume_pc);
+                let result = self.processor.enter_fault(&mut self.bus, cause, resume_pc);
                 self.finish_trap(result, cause, 0, resume_pc, None, Some(original))
             }
             PendingTrap::Syscall { resume_pc } => {
-                let result = self.cpu.enter_syscall(&mut self.bus, resume_pc);
+                let result = self.processor.enter_syscall(&mut self.bus, resume_pc);
                 self.finish_trap(result, TrapCause::Syscall, 0, resume_pc, None, None)
             }
             PendingTrap::Software { payload, resume_pc } => {
-                let result = self.cpu.enter_software(&mut self.bus, payload, resume_pc);
+                let result = self
+                    .processor
+                    .enter_software(&mut self.bus, payload, resume_pc);
                 let extended = sign_extended_payload(self.config, payload);
                 self.finish_trap(
                     result,
@@ -776,7 +865,7 @@ impl<D: Device> LazalithMachine<D> {
             }
             PendingTrap::External { id, resume_pc } => {
                 let result = self
-                    .cpu
+                    .processor
                     .enter_external(&mut self.bus, id.as_u16(), resume_pc);
                 self.finish_trap(
                     result,
@@ -793,7 +882,7 @@ impl<D: Device> LazalithMachine<D> {
     fn try_external_interrupt(&mut self) -> Result<Option<TrapEvent>, MachineError> {
         if !is_executable_state(self.state)
             || !self.architectural_state().status().interrupts_enabled()
-            || self.cpu.trap_controller().has_active_frame()
+            || self.processor.traps().has_active_frame()
         {
             return Ok(None);
         }
@@ -839,8 +928,8 @@ impl<D: Device> LazalithMachine<D> {
             .executed
             .checked_add(1)
             .ok_or(MachineError::InstructionCountOverflow)?;
-        let had_frame = self.cpu.trap_controller().has_active_frame();
-        let application = match self.cpu.step(&mut self.bus) {
+        let had_frame = self.processor.traps().has_active_frame();
+        let application = match self.engine.step(&mut self.processor, &mut self.bus) {
             Ok(application) => application,
             Err(fault) => {
                 let cause = trap_cause(&fault);
@@ -854,7 +943,7 @@ impl<D: Device> LazalithMachine<D> {
             }
         };
         self.executed = executed;
-        if had_frame && !self.cpu.trap_controller().has_active_frame() {
+        if had_frame && !self.processor.traps().has_active_frame() {
             self.last_trap_fault = None;
         }
         match application {
@@ -1041,6 +1130,19 @@ fn sign_extended_payload(config: ArchitectureConfig, payload: i32) -> u64 {
     match config.word_width() {
         lazalith_types::WordWidth::W32 => u64::from(payload as u32),
         lazalith_types::WordWidth::W64 => payload as i64 as u64,
+    }
+}
+
+/// The engine a name refers to.
+///
+/// This is the only place an [`EngineKind`] becomes an engine. It is deliberately a
+/// closed `match` rather than a registry: when a JIT arrives this gains an arm and
+/// nothing else has to change, and until then there is exactly one thing a name can
+/// mean — which is why a machine can be asked to switch to an engine that does not
+/// exist and be told so rather than silently continuing.
+fn engine_for(kind: EngineKind) -> ReferenceInterpreter {
+    match kind {
+        EngineKind::Reference => ReferenceInterpreter::new(),
     }
 }
 

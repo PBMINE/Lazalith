@@ -1,0 +1,37 @@
+# Who reviews what.
+#
+# This file is the repository-file half of code review automation. It is read by
+# GitHub when it routes a review request. It is *not* a substitute for branch
+# protection: required status checks, required reviews, and whether `main` refuses
+# a direct push are repository settings, set in the repository's settings, and are
+# listed in `docs/ci-cd.md` under "settings that live outside the repository".
+#
+# The reason this file is a single owner rather than a team is that the repository
+# is a single maintainer's work. A CODEOWNERS file that invents a team the
+# maintainer has not created would be a file that looks like governance and does
+# nothing.
+
+# Default owner for everything not matched more specifically below.
+* @PBMINE
+
+# The architectural core. Every change here can change guest-visible behaviour,
+# so it is called out separately even though the default already covers it: a
+# reviewer skimming `crates/` should be able to see which directories the ISA, the
+# interpreter and the memory model live in.
+crates/lazalith-isa/      @PBMINE
+crates/lazalith-cpu/      @PBMINE
+crates/lazalith-memory/   @PBMINE
+crates/lazalith-machine/  @PBMINE
+crates/lazalith-devices/  @PBMINE
+crates/lazalith-types/    @PBMINE
+
+# The specification. `instruction.md` is the Phase-I roadmap and `binstruction.md`
+# is the Beyond-Lazalith specification; a change to either is a change to what
+# the project is, and should not be made as a side effect of a code change.
+instruction.md             @PBMINE
+binstruction.md            @PBMINE
+
+# The reproducible build and the CI that depends on it.
+flake.nix                  @PBMINE
+flake.lock                 @PBMINE
+.github/                   @PBMINE

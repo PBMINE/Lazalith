@@ -1,7 +1,8 @@
 mod support;
 
 use lazalith_cpu::{
-    CpuFaultCause as Cause, ExecutionState, OutcomeApplication, ReferenceInterpreter,
+    CpuFaultCause as Cause, ExecutionEngine, ExecutionState, OutcomeApplication, Processor,
+    ReferenceInterpreter,
 };
 use lazalith_isa::{Condition, ControlRegister, DataSize, Opcode, Operand};
 use lazalith_types::{ArchitectureConfig, RegisterIndex, WidthError};
@@ -15,30 +16,30 @@ fn mem(base: u8, displacement: i32) -> Operand {
     }
 }
 
-fn run(cpu: &mut ReferenceInterpreter, ram: &mut Ram, opcode: Opcode, operands: &[Operand]) {
-    let config = cpu.architectural_state().config();
+fn run(cpu: &mut Processor, ram: &mut Ram, opcode: Opcode, operands: &[Operand]) {
+    let config = cpu.architectural().config();
     assert_eq!(
-        cpu.execute(&instruction(config, opcode, operands), ram),
+        ReferenceInterpreter::new().execute(cpu, &instruction(config, opcode, operands), ram),
         Ok(OutcomeApplication::Continue)
     );
 }
 
 fn unchanged(
-    cpu: &mut ReferenceInterpreter,
+    cpu: &mut Processor,
     ram: &mut Ram,
     opcode: Opcode,
     operands: &[Operand],
 ) -> Cause<MemoryError> {
-    let before = cpu.architectural_state().clone();
-    let execution = cpu.execution_state();
+    let before = cpu.architectural().clone();
+    let execution = cpu.execution();
     let memory = ram.clone();
-    let error = cpu
-        .execute(&instruction(before.config(), opcode, operands), ram)
+    let error = ReferenceInterpreter::new()
+        .execute(cpu, &instruction(before.config(), opcode, operands), ram)
         .unwrap_err();
     assert_eq!(error.pc, before.pc());
     assert_eq!(error.opcode, Some(opcode.as_u8()));
-    assert_eq!(cpu.architectural_state(), &before);
-    assert_eq!(cpu.execution_state(), execution);
+    assert_eq!(cpu.architectural(), &before);
+    assert_eq!(cpu.execution(), execution);
     assert_eq!(*ram, memory);
     error.cause
 }
@@ -127,7 +128,7 @@ fn arithmetic_opcodes_match_independent_wide_oracle_with_aliases() {
                     for d in [0, 1, 2, 15] {
                         let mut machine =
                             cpu(config, 0x100, 256, 63, &[(0, 99), (1, a), (2, b), (15, 55)]);
-                        let mut expected = machine.architectural_state().clone();
+                        let mut expected = machine.architectural().clone();
                         expected.write_register_raw(d, value).unwrap();
                         expected
                             .restore_control(
@@ -139,7 +140,7 @@ fn arithmetic_opcodes_match_independent_wide_oracle_with_aliases() {
                         let mut ram = Ram::default();
                         run(&mut machine, &mut ram, opcode, &[r(d), r(1), r(2)]);
                         assert_eq!(
-                            machine.architectural_state(),
+                            machine.architectural(),
                             &expected,
                             "{config:?} {opcode:?} {a:#x} {b:#x} d={d}"
                         );
@@ -171,25 +172,22 @@ fn immediate_arithmetic_compare_and_not_have_exact_flags() {
                 opcode,
                 &[r(15), r(15), Operand::Immediate(immediate)],
             );
-            assert_eq!(
-                machine.architectural_state().registers().read_raw(15),
-                Ok(value)
-            );
-            assert_eq!(machine.architectural_state().status().bits(), 48 | flags);
-            assert_eq!(machine.architectural_state().pc().as_u64(), 24);
+            assert_eq!(machine.architectural().registers().read_raw(15), Ok(value));
+            assert_eq!(machine.architectural().status().bits(), 48 | flags);
+            assert_eq!(machine.architectural().pc().as_u64(), 24);
         }
         for (a, b, flags) in [(0, 1, 5), (1, 1, 2), (sign, 1, 8), (1, 0, 0)] {
             let mut machine = cpu(config, 0, 256, 63, &[(1, a), (2, b)]);
-            let registers = machine.architectural_state().registers().clone();
+            let registers = machine.architectural().registers().clone();
             run(
                 &mut machine,
                 &mut Ram::default(),
                 Opcode::Cmp,
                 &[r(1), r(2)],
             );
-            assert_eq!(machine.architectural_state().registers(), &registers);
-            assert_eq!(machine.architectural_state().status().bits(), 48 | flags);
-            assert_eq!(machine.architectural_state().pc().as_u64(), 8);
+            assert_eq!(machine.architectural().registers(), &registers);
+            assert_eq!(machine.architectural().status().bits(), 48 | flags);
+            assert_eq!(machine.architectural().pc().as_u64(), 8);
         }
         for (a, value, flags) in [(0, mask, 1), (mask, 0, 2), (sign, sign - 1, 0)] {
             let mut machine = cpu(config, 0, 256, 63, &[(0, a)]);
@@ -199,12 +197,9 @@ fn immediate_arithmetic_compare_and_not_have_exact_flags() {
                 Opcode::Not,
                 &[r(0), r(0)],
             );
-            assert_eq!(
-                machine.architectural_state().registers().read_raw(0),
-                Ok(value)
-            );
-            assert_eq!(machine.architectural_state().status().bits(), 48 | flags);
-            assert_eq!(machine.architectural_state().pc().as_u64(), 8);
+            assert_eq!(machine.architectural().registers().read_raw(0), Ok(value));
+            assert_eq!(machine.architectural().status().bits(), 48 | flags);
+            assert_eq!(machine.architectural().pc().as_u64(), 8);
         }
     }
 }
@@ -264,39 +259,30 @@ fn moves_immediates_and_special_registers_preserve_status() {
                     &[r(index), Operand::Immediate(immediate)],
                 );
                 assert_eq!(
-                    machine.architectural_state().registers().read_raw(index),
+                    machine.architectural().registers().read_raw(index),
                     Ok((i64::from(immediate) as u64) & mask)
                 );
-                assert_eq!(machine.architectural_state().status().bits(), 63);
-                assert_eq!(machine.architectural_state().pc().as_u64(), 12);
+                assert_eq!(machine.architectural().status().bits(), 63);
+                assert_eq!(machine.architectural().pc().as_u64(), 12);
             }
             let mut machine = cpu(config, 4, 256, 63, &[(index, mask)]);
             let mut ram = Ram::default();
             run(&mut machine, &mut ram, Opcode::Mov, &[r(index), r(index)]);
             assert_eq!(
-                machine.architectural_state().registers().read_raw(index),
+                machine.architectural().registers().read_raw(index),
                 Ok(mask)
             );
             run(&mut machine, &mut ram, Opcode::Getpc, &[r(index)]);
-            assert_eq!(
-                machine.architectural_state().registers().read_raw(index),
-                Ok(12)
-            );
+            assert_eq!(machine.architectural().registers().read_raw(index), Ok(12));
             run(&mut machine, &mut ram, Opcode::Getsp, &[r(index)]);
-            assert_eq!(
-                machine.architectural_state().registers().read_raw(index),
-                Ok(256)
-            );
+            assert_eq!(machine.architectural().registers().read_raw(index), Ok(256));
             run(&mut machine, &mut ram, Opcode::Setsp, &[r(index)]);
-            assert_eq!(machine.architectural_state().sp().as_u64(), 256);
+            assert_eq!(machine.architectural().sp().as_u64(), 256);
             run(&mut machine, &mut ram, Opcode::Getstatus, &[r(index)]);
-            assert_eq!(
-                machine.architectural_state().registers().read_raw(index),
-                Ok(63)
-            );
+            assert_eq!(machine.architectural().registers().read_raw(index), Ok(63));
             run(&mut machine, &mut ram, Opcode::Nop, &[]);
-            assert_eq!(machine.architectural_state().pc().as_u64(), 52);
-            assert_eq!(machine.architectural_state().status().bits(), 63);
+            assert_eq!(machine.architectural().pc().as_u64(), 52);
+            assert_eq!(machine.architectural().status().bits(), 63);
         }
         let mut machine = cpu(
             config,
@@ -307,7 +293,7 @@ fn moves_immediates_and_special_registers_preserve_status() {
         );
         run(&mut machine, &mut Ram::default(), Opcode::Setsp, &[r(1)]);
         assert_eq!(
-            machine.architectural_state().sp().as_u64(),
+            machine.architectural().sp().as_u64(),
             mask & !(u64::from(config.word_bytes()) - 1)
         );
         let mut machine = cpu(config, 0, 256, 63, &[(1, 3)]);
@@ -348,7 +334,8 @@ fn every_branch_condition_exhausts_all_flag_patterns() {
             for (&condition, taken) in Condition::ALL.iter().zip(expected) {
                 for displacement in [-3, -2, -1, 0, 2, i32::MAX] {
                     let mut machine = cpu(config, 0x100, 256, 48 | flags, &[]);
-                    let result = machine.execute(
+                    let result = ReferenceInterpreter::new().execute(
+                        &mut machine,
                         &instruction(
                             config,
                             Opcode::Br,
@@ -362,15 +349,15 @@ fn every_branch_condition_exhausts_all_flag_patterns() {
                     let target = 0x108i128 + i128::from(displacement) * 4;
                     if taken && target > i128::from(config.word_width().mask()) {
                         assert!(matches!(result.unwrap_err().cause, Cause::Outcome(_)));
-                        assert_eq!(machine.architectural_state().pc().as_u64(), 0x100);
+                        assert_eq!(machine.architectural().pc().as_u64(), 0x100);
                     } else {
                         assert_eq!(result, Ok(OutcomeApplication::Continue));
                         assert_eq!(
-                            machine.architectural_state().pc().as_u64(),
+                            machine.architectural().pc().as_u64(),
                             if taken { target as u64 } else { 0x108 }
                         );
                     }
-                    assert_eq!(machine.architectural_state().status().bits(), 48 | flags);
+                    assert_eq!(machine.architectural().status().bits(), 48 | flags);
                 }
             }
         }
@@ -384,7 +371,7 @@ fn every_branch_condition_exhausts_all_flag_patterns() {
                 Operand::Immediate(i32::MIN),
             ],
         );
-        assert_eq!(machine.architectural_state().pc().as_u64(), 8);
+        assert_eq!(machine.architectural().pc().as_u64(), 8);
         let mut machine = cpu(config, 0, 256, 2, &[]);
         assert!(matches!(
             unchanged(
@@ -435,10 +422,7 @@ fn every_load_store_width_extends_truncates_and_handles_aliases() {
                     Opcode::Ldz,
                     &[r(0), mem(1, -8), Operand::DataSize(size)],
                 );
-                assert_eq!(
-                    machine.architectural_state().registers().read_raw(0),
-                    Ok(value)
-                );
+                assert_eq!(machine.architectural().registers().read_raw(0), Ok(value));
                 run(
                     &mut machine,
                     &mut ram,
@@ -450,12 +434,9 @@ fn every_load_store_width_extends_truncates_and_handles_aliases() {
                 } else {
                     value | !data_mask
                 } & config.word_width().mask();
-                assert_eq!(
-                    machine.architectural_state().registers().read_raw(1),
-                    Ok(signed)
-                );
-                assert_eq!(machine.architectural_state().status().bits(), 63);
-                assert_eq!(machine.architectural_state().pc().as_u64(), 24);
+                assert_eq!(machine.architectural().registers().read_raw(1), Ok(signed));
+                assert_eq!(machine.architectural().status().bits(), 63);
+                assert_eq!(machine.architectural().pc().as_u64(), 24);
                 assert_eq!((ram.reads, ram.writes), (2, 1));
             }
             let mut ram = Ram::default();
@@ -524,10 +505,7 @@ fn data_faults_validate_ranges_permissions_and_transactions_without_effects() {
             Opcode::Ldz,
             &[r(0), mem(0, 0), Operand::DataSize(DataSize::Word)],
         );
-        assert_eq!(
-            (ram.reads, machine.architectural_state().pc().as_u64()),
-            (1, 8)
-        );
+        assert_eq!((ram.reads, machine.architectural().pc().as_u64()), (1, 8));
         let mut machine = cpu(config, config.word_width().mask() - 7, 256, 31, &[(0, 128)]);
         assert!(matches!(
             unchanged(
@@ -555,14 +533,14 @@ fn calls_returns_and_jumps_obey_stack_and_subsequent_fetch_policy() {
                 };
                 run(&mut machine, &mut ram, opcode, &operands);
                 let slot = 256 - usize::from(config.word_bytes());
-                assert_eq!(machine.architectural_state().pc().as_u64(), 0x110);
-                assert_eq!(machine.architectural_state().sp().as_u64(), slot as u64);
+                assert_eq!(machine.architectural().pc().as_u64(), 0x110);
+                assert_eq!(machine.architectural().sp().as_u64(), slot as u64);
                 assert_eq!(ram.word(slot, usize::from(config.word_bytes())), 0x108);
                 let pushed = ram.clone();
                 run(&mut machine, &mut ram, Opcode::Ret, &[]);
-                assert_eq!(machine.architectural_state().pc().as_u64(), 0x108);
-                assert_eq!(machine.architectural_state().sp().as_u64(), 256);
-                assert_eq!(machine.architectural_state().status().bits(), status);
+                assert_eq!(machine.architectural().pc().as_u64(), 0x108);
+                assert_eq!(machine.architectural().sp().as_u64(), 256);
+                assert_eq!(machine.architectural().status().bits(), status);
                 assert_eq!(ram, pushed);
             }
         }
@@ -571,23 +549,28 @@ fn calls_returns_and_jumps_obey_stack_and_subsequent_fetch_policy() {
             let mut machine = cpu(config, 0, 256, 31, &[(1, config.word_width().mask() - 3)]);
             run(&mut machine, &mut ram, opcode, &[r(1)]);
             assert_eq!(
-                machine.architectural_state().pc().as_u64(),
+                machine.architectural().pc().as_u64(),
                 config.word_width().mask() - 3
             );
             assert_eq!(ram.writes, usize::from(opcode == Opcode::Callr));
-            let before = machine.architectural_state().clone();
+            let before = machine.architectural().clone();
             assert!(matches!(
-                machine.step(&mut ram).unwrap_err().cause,
+                ReferenceInterpreter::new()
+                    .step(&mut machine, &mut ram)
+                    .unwrap_err()
+                    .cause,
                 Cause::Width(_)
             ));
-            assert_eq!(machine.architectural_state(), &before);
+            assert_eq!(machine.architectural(), &before);
         }
         let mut ram = Ram::default();
         ram.code(4, config, Opcode::Getpc, &[r(0)]);
         let mut machine = cpu(config, 0, 256, 31, &[(1, 4)]);
         run(&mut machine, &mut ram, Opcode::Jmp, &[r(1)]);
-        machine.step(&mut ram).unwrap();
-        assert_eq!(machine.architectural_state().registers().read_raw(0), Ok(4));
+        ReferenceInterpreter::new()
+            .step(&mut machine, &mut ram)
+            .unwrap();
+        assert_eq!(machine.architectural().registers().read_raw(0), Ok(4));
     }
 }
 
@@ -705,15 +688,19 @@ fn privilege_halt_and_all_control_selectors_are_explicit() {
         let mut machine = cpu(config, 0, 256, 15, &[]);
         let mut ram = Ram::default();
         run(&mut machine, &mut ram, Opcode::Ei, &[]);
-        assert_eq!(machine.architectural_state().status().bits(), 31);
+        assert_eq!(machine.architectural().status().bits(), 31);
         run(&mut machine, &mut ram, Opcode::Di, &[]);
-        assert_eq!(machine.architectural_state().status().bits(), 15);
+        assert_eq!(machine.architectural().status().bits(), 15);
         assert_eq!(
-            machine.execute(&instruction(config, Opcode::Halt, &[]), &mut ram),
+            ReferenceInterpreter::new().execute(
+                &mut machine,
+                &instruction(config, Opcode::Halt, &[]),
+                &mut ram
+            ),
             Ok(OutcomeApplication::Halted)
         );
-        assert_eq!(machine.architectural_state().pc().as_u64(), 24);
-        assert_eq!(machine.execution_state(), ExecutionState::Halted);
+        assert_eq!(machine.architectural().pc().as_u64(), 24);
+        assert_eq!(machine.execution(), ExecutionState::Halted);
         for opcode in [
             Opcode::Nop,
             Opcode::Ei,
@@ -726,16 +713,22 @@ fn privilege_halt_and_all_control_selectors_are_explicit() {
                 Cause::Halted
             );
         }
-        let before = machine.architectural_state().clone();
+        let before = machine.architectural().clone();
         assert!(matches!(
-            machine.step_bytes(&[], &mut ram).unwrap_err().cause,
+            ReferenceInterpreter::new()
+                .step_bytes(&mut machine, &[], &mut ram)
+                .unwrap_err()
+                .cause,
             Cause::Halted
         ));
         assert!(matches!(
-            machine.step(&mut ram).unwrap_err().cause,
+            ReferenceInterpreter::new()
+                .step(&mut machine, &mut ram)
+                .unwrap_err()
+                .cause,
             Cause::Halted
         ));
-        assert_eq!(machine.architectural_state(), &before);
+        assert_eq!(machine.architectural(), &before);
     }
 }
 
@@ -752,14 +745,16 @@ fn decode_mode_fetch_errors_retain_context_and_typed_sources() {
         ] {
             let mut ram = Ram::default();
             let mut machine = cpu(config, 0, 256, 63, &[]);
-            let before = machine.architectural_state().clone();
-            let error = machine.step_bytes(&bytes, &mut ram).unwrap_err();
+            let before = machine.architectural().clone();
+            let error = ReferenceInterpreter::new()
+                .step_bytes(&mut machine, &bytes, &mut ram)
+                .unwrap_err();
             assert!(matches!(error.cause, Cause::Decode(_)));
             assert_eq!(error.opcode, bytes.first().copied());
             assert_eq!(error.pc.as_u64(), 0);
             assert!(error.source().unwrap().source().is_some());
             assert!(error.to_string().contains("PC"));
-            assert_eq!(machine.architectural_state(), &before);
+            assert_eq!(machine.architectural(), &before);
         }
         for failure in 0..4 {
             let mut ram = Ram::default();
@@ -770,20 +765,25 @@ fn decode_mode_fetch_errors_retain_context_and_typed_sources() {
                 _ => {}
             }
             let mut machine = cpu(config, if failure == 3 { 508 } else { 0 }, 256, 63, &[]);
-            let before = machine.architectural_state().clone();
+            let before = machine.architectural().clone();
             let memory = ram.clone();
-            let error = machine.step(&mut ram).unwrap_err();
+            let error = ReferenceInterpreter::new()
+                .step(&mut machine, &mut ram)
+                .unwrap_err();
             assert!(matches!(error.cause, Cause::Fetch(_)));
             assert_eq!(error.opcode, None);
             assert!(error.source().unwrap().source().is_some());
-            assert_eq!(machine.architectural_state(), &before);
+            assert_eq!(machine.architectural(), &before);
             assert_eq!(ram, memory);
         }
         let mut ram = Ram::default();
         ram.readable = false;
         ram.code(4, config, Opcode::Nop, &[]);
         let mut machine = cpu(config, 4, 256, 63, &[]);
-        assert_eq!(machine.step(&mut ram), Ok(OutcomeApplication::Continue));
+        assert_eq!(
+            ReferenceInterpreter::new().step(&mut machine, &mut ram),
+            Ok(OutcomeApplication::Continue)
+        );
     }
     let wide = instruction(
         ArchitectureConfig::lz64(),
@@ -791,15 +791,19 @@ fn decode_mode_fetch_errors_retain_context_and_typed_sources() {
         &[r(0), mem(1, 0), Operand::DataSize(DataSize::Double)],
     );
     let mut machine = cpu(ArchitectureConfig::lz32(), 0, 256, 31, &[]);
-    let before = machine.architectural_state().clone();
+    let before = machine.architectural().clone();
     let mut ram = Ram::default();
     assert!(matches!(
-        machine.execute(&wide, &mut ram).unwrap_err().cause,
+        ReferenceInterpreter::new()
+            .execute(&mut machine, &wide, &mut ram)
+            .unwrap_err()
+            .cause,
         Cause::Instruction(_)
     ));
     assert!(matches!(
-        machine
+        ReferenceInterpreter::new()
             .step_bytes(
+                &mut machine,
                 &lazalith_isa::encode(ArchitectureConfig::lz64(), &wide).unwrap(),
                 &mut ram
             )
@@ -807,6 +811,6 @@ fn decode_mode_fetch_errors_retain_context_and_typed_sources() {
             .cause,
         Cause::Decode(_)
     ));
-    assert_eq!(machine.architectural_state(), &before);
+    assert_eq!(machine.architectural(), &before);
     assert_eq!(ram.reads + ram.writes, 0);
 }

@@ -1,4 +1,4 @@
-use lazalith_cpu::{ArchitecturalState, OutcomeApplication, ReferenceInterpreter};
+use lazalith_cpu::{ArchitecturalState, ExecutionEngine, OutcomeApplication, Processor};
 use lazalith_devices::{ConsoleDevice, DeviceId, DeviceManager};
 use lazalith_memory::{AddressSpace, Bus, MemoryRegion, RegionPermissions as RP};
 use lazalith_types::{
@@ -22,7 +22,7 @@ fn program(text: &[u8]) -> Vec<u8> {
     code
 }
 
-fn setup(config: C, capacity: usize, text: &[u8]) -> (ReferenceInterpreter, Bus<ConsoleDevice>) {
+fn setup(config: C, capacity: usize, text: &[u8]) -> (Processor, Bus<ConsoleDevice>) {
     let mut devices = DeviceManager::new();
     devices
         .insert(DeviceId::new(1), ConsoleDevice::new(capacity).unwrap())
@@ -48,9 +48,7 @@ fn setup(config: C, capacity: usize, text: &[u8]) -> (ReferenceInterpreter, Bus<
         RP::new(false, true, false, true),
     )
     .unwrap();
-    let cpu = ReferenceInterpreter::new(
-        ArchitecturalState::new(config, I::new(0), V::new(0x900), 0).unwrap(),
-    );
+    let cpu = Processor::new(ArchitecturalState::new(config, I::new(0), V::new(0x900), 0).unwrap());
     (cpu, bus)
 }
 
@@ -60,7 +58,9 @@ fn encoded_guest_hello_runs_through_interpreter_rom_and_mmio_both_modes() {
         let text = b"Hello, Lazalith";
         let (mut cpu, mut bus) = setup(config, text.len(), text);
         for step in 0..(2 * text.len() + 2) {
-            let event = cpu.step(&mut bus).unwrap();
+            let event = lazalith_cpu::ReferenceInterpreter::new()
+                .step(&mut cpu, &mut bus)
+                .unwrap();
             assert_eq!(
                 event,
                 if step == 2 * text.len() + 1 {
@@ -74,7 +74,11 @@ fn encoded_guest_hello_runs_through_interpreter_rom_and_mmio_both_modes() {
             bus.devices().device(DeviceId::new(1)).unwrap().output(),
             text
         );
-        assert!(cpu.step(&mut bus).is_err());
+        assert!(
+            lazalith_cpu::ReferenceInterpreter::new()
+                .step(&mut cpu, &mut bus)
+                .is_err()
+        );
         assert_eq!(
             bus.devices().device(DeviceId::new(1)).unwrap().output(),
             text
@@ -87,10 +91,14 @@ fn console_full_fault_preserves_cpu_ram_and_prior_output() {
     for config in [C::lz32(), C::lz64()] {
         let (mut cpu, mut bus) = setup(config, 1, b"AB");
         for _ in 0..4 {
-            cpu.step(&mut bus).unwrap();
+            lazalith_cpu::ReferenceInterpreter::new()
+                .step(&mut cpu, &mut bus)
+                .unwrap();
         }
-        let before = cpu.architectural_state().clone();
-        let error = cpu.step(&mut bus).unwrap_err();
+        let before = cpu.architectural().clone();
+        let error = lazalith_cpu::ReferenceInterpreter::new()
+            .step(&mut cpu, &mut bus)
+            .unwrap_err();
         assert!(matches!(
             error.cause,
             lazalith_cpu::CpuFaultCause::Memory {
@@ -103,7 +111,7 @@ fn console_full_fault_preserves_cpu_ram_and_prior_output() {
                 ..
             }
         ));
-        assert_eq!(cpu.architectural_state(), &before);
+        assert_eq!(cpu.architectural(), &before);
         assert_eq!(
             bus.devices().device(DeviceId::new(1)).unwrap().output(),
             b"A"

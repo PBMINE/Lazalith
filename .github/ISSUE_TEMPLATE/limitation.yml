@@ -1,0 +1,36 @@
+name: Limitation
+description: Something Lazalith cannot do yet.
+labels: ['limitation']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Most of what this platform does not do is deliberate and recorded, and
+        `docs/project-state.md` and the subsystem documents under `docs/` say so
+        for most of it. This form is for a limitation that is **not** recorded —
+        which is a documentation defect, and this is how it gets found.
+
+  - type: textarea
+    id: cannot
+    attributes:
+      label: What cannot be done
+      description: The capability that is missing, stated as a capability.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What is used instead today
+      description: |
+        And whether it is a real substitute or a placeholder that happens to pass
+        its test.
+    validations:
+      required: true
+
+  - type: textarea
+    id: where
+    attributes:
+      label: Where it should be recorded
+      description: |
+        Which `docs/*.md` file, if any, already mentions this — or should.

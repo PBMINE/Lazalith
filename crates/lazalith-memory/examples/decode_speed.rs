@@ -15,7 +15,7 @@
 
 use std::time::Instant;
 
-use lazalith_cpu::{ArchitecturalState, ReferenceInterpreter};
+use lazalith_cpu::{ArchitecturalState, ExecutionEngine, Processor, ReferenceInterpreter};
 use lazalith_memory::{AddressSpace, Bus, MemoryRegion, RegionPermissions};
 use lazalith_types::{ArchitectureConfig, InstructionAddress, PhysicalAddress, VirtualAddress};
 
@@ -75,7 +75,8 @@ fn run(config: ArchitectureConfig, steps: usize, reference: bool) -> f64 {
         bus.initialize(PhysicalAddress::new(index as u64 * 8), bytes)
             .unwrap();
     }
-    let mut cpu = ReferenceInterpreter::new(
+    let mut engine = ReferenceInterpreter::new();
+    let mut cpu = Processor::new(
         ArchitecturalState::new(
             config,
             InstructionAddress::new(0),
@@ -92,8 +93,8 @@ fn run(config: ArchitectureConfig, steps: usize, reference: bool) -> f64 {
         // survives, which is the point: a real loop hits the same addresses again
         // and again, and the loop-back is the one cost this example does not
         // measure.
-        if cpu.architectural_state().pc().as_u64() >= end {
-            cpu = ReferenceInterpreter::new(
+        if cpu.architectural().pc().as_u64() >= end {
+            cpu = Processor::new(
                 ArchitecturalState::new(
                     config,
                     InstructionAddress::new(0),
@@ -103,7 +104,7 @@ fn run(config: ArchitectureConfig, steps: usize, reference: bool) -> f64 {
                 .unwrap(),
             );
         }
-        cpu.step(&mut bus).unwrap();
+        engine.step(&mut cpu, &mut bus).unwrap();
         executed += 1;
     }
     let elapsed = start.elapsed();

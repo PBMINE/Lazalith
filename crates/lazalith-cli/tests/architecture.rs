@@ -473,6 +473,79 @@ fn grep_crates(wanted: &dyn Fn(&Path, &str) -> bool) -> Vec<PathBuf> {
     hits
 }
 
+/// B3: no *execution engine* may own the architectural state.
+///
+/// `binstruction.md` requires the eventual JIT and the Reference Interpreter to be
+/// two modes of one virtual machine, and says a mode switch "must not reset, clone,
+/// reinterpret, or silently alter guest state". A switch that cannot clone the
+/// state is a switch that cannot fork it, and that is only true if no engine type
+/// has a copy to give.
+///
+/// The rule is checked as a fact about the source rather than as a convention,
+/// because the failure mode is invisible: an engine that stores a `Processor` and
+/// a machine that adopts it would compile, would pass every test in the suite that
+/// only ever ran one engine, and would be the second architectural truth the whole
+/// design exists to prevent.
+///
+/// Two holders are allowed, and both are copies that are not a running machine:
+///
+/// - `lazalith-cpu`, where `Processor` is the state and `ArchitecturalState` is
+///   what it is made of;
+/// - `lazalith-debug`, where `CpuSnapshot` is a saved copy taken on purpose, and
+///   restoring one is the only way a copy ever becomes live again.
+///
+/// A snapshot is not an engine. It executes nothing, so a machine that is holding
+/// one is holding a *record* of a state, and a record is not a second truth about
+/// the state currently running.
+#[test]
+fn no_execution_engine_owns_the_architectural_state() {
+    let mut holders = grep_crates(&|_, text| {
+        // A field declaration, not any mention: a type that merely reads the state
+        // is doing exactly what it should.
+        text.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("architectural:") || line.starts_with("pub architectural:")
+        })
+    });
+    holders.sort();
+    holders.dedup();
+    assert_eq!(
+        holders,
+        vec![
+            PathBuf::from("lazalith-cpu"),
+            PathBuf::from("lazalith-debug")
+        ],
+        "the architectural state may be held by the processor and by a snapshot and \
+         by nothing else, because a machine that owns its state cannot fork it; \
+         {holders:?} also holds one"
+    );
+}
+
+/// B3: the machine holds the processor and the engine as separate things.
+///
+/// The switch exists because those are two fields rather than one. A machine that
+/// merged them back would still compile and still run, and would have quietly
+/// given up the property the whole extraction was for.
+#[test]
+fn a_machine_holds_the_processor_and_the_engine_apart() {
+    let machine = workspace().join("crates/lazalith-machine/src/lib.rs");
+    let text = std::fs::read_to_string(&machine).expect("the machine crate reads");
+    assert!(
+        text.contains("processor: Processor"),
+        "the machine must own the canonical processor state"
+    );
+    assert!(
+        text.contains("engine: Box<dyn ExecutionEngine<Bus<D>>>"),
+        "the machine must hold an engine as something it can replace, not a concrete \
+         type it cannot"
+    );
+    assert!(
+        text.contains("pub fn switch_execution_engine("),
+        "the switch has to exist as one checked operation, or a caller will reach in \
+         and swap an implementation by hand"
+    );
+}
+
 /// Every `.rs` file under a directory.
 fn walk(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
