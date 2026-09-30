@@ -809,3 +809,101 @@ impl std::fmt::Display for MemoryError {
 }
 
 impl std::error::Error for MemoryError {}
+
+/// A block that has been translated is run again, not translated again.
+///
+/// **B24's measurement found that the JIT was *slower than the interpreter* on the code it
+/// translates perfectly**, and the reason was here: the executable page held one block at a
+/// time, so every step translated a fresh block over the previous one and no block was ever
+/// run twice. The assembler ran on every step.
+///
+/// A performance number is a poor regression guard — it depends on the host and is deleted
+/// the first time it is inconvenient. **This is the guard instead**: it counts
+/// *translations*, which is a property of the engine's logic and not of the clock. The JIT
+/// exposes a translation count for exactly this reason.
+#[test]
+fn a_block_is_translated_once_and_run_again() {
+    let code = arithmetic();
+    let start = cpu();
+    let mut memory = Memory::of(&code);
+
+    let mut jit = Jit::new();
+    let first = jit
+        .compile(&start, &mut memory)
+        .expect("the first block translates");
+    assert_eq!(
+        jit.translations(),
+        1,
+        "the first compile is one translation"
+    );
+
+    // Running the block does not translate it again. The processor is a fresh one at the
+    // same start, because running the block moved the first one on — and a second
+    // `compile` from *that* processor would be looking for a different block, which is a
+    // cache miss for a real reason and would prove nothing about cache behaviour.
+    let mut running = start.clone();
+    jit.run_block_for_test(&mut running)
+        .expect("the block runs");
+    assert_eq!(
+        jit.translations(),
+        1,
+        "running a block must not translate anything: a second translation here is what \
+         made the JIT slower than the interpreter"
+    );
+
+    // And asking for the same block again is a cache hit.
+    let again = jit
+        .compile(&start, &mut memory)
+        .expect("the cache hit still yields a block");
+    assert_eq!(
+        again.offset, first.offset,
+        "the same guest address and boundary maps to the same code in the page, at the \
+         same place"
+    );
+    assert_eq!(
+        jit.translations(),
+        1,
+        "and it was served from the cache rather than translated again"
+    );
+    assert_eq!(jit.cached_blocks(), 1, "and only one block is in the cache");
+}
+
+/// Distinct blocks coexist in the page rather than overwriting one another.
+///
+/// **The other half of the same fix.** Several translated blocks sharing one page is what
+/// makes a cache possible at all, and a bug here would be silent: every block would still
+/// run, and every block would run *someone else's* code.
+#[test]
+fn several_blocks_share_the_page() {
+    let mut jit = Jit::new();
+
+    // Three programs, each at a different start address, so each is a distinct block.
+    let mut offsets = Vec::new();
+    for index in 0..3u8 {
+        let code = arithmetic();
+        let mut processor = cpu();
+        processor
+            .architectural_mut()
+            .set_pc(InstructionAddress::new(u64::from(index) * 8))
+            .expect("a valid program counter");
+        let mut memory = Memory::of(&code);
+        let compiled = jit.compile(&processor, &mut memory).expect("translates");
+        offsets.push(compiled.offset);
+    }
+    assert_eq!(offsets.len(), 3, "three blocks were compiled");
+    let mut sorted = offsets.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        3,
+        "and they occupy three distinct places in the page: {offsets:?}. Two blocks at \
+         one offset would mean the second overwrote the first, and running either would \
+         silently execute the other's code."
+    );
+    assert_eq!(jit.translations(), 3, "and each was translated once");
+    assert!(
+        jit.cached_blocks() >= 3,
+        "all three are still cached, which is the property the arena exists for"
+    );
+}

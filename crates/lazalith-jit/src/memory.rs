@@ -80,22 +80,49 @@ impl ExecutablePage {
     /// exists and it is bracketed by two `mprotect` calls on the same line of reasoning
     /// as above.
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), Decline> {
-        if bytes.len() > PAGE {
+        self.write_at(0, bytes)
+    }
+
+    /// Copies `bytes` into the page at `offset`, and makes the page executable.
+    ///
+    /// **An offset rather than always the start, because a page that holds one block at a
+    /// time is a cache that never hits.** B24's measurement found this the hard way: the
+    /// JIT was *six times slower than the interpreter* on straight-line register
+    /// arithmetic — the code it translates perfectly — because every step translated a
+    /// fresh block over the previous one and no block was ever run twice. The fix is not
+    /// clever, it is a bump allocator over a page, and it is what makes the cache
+    /// described in `Jit::compile` real.
+    pub fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Decline> {
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or(Decline::NoExecutablePage)?;
+        if end > PAGE {
             return Err(Decline::NoExecutablePage);
         }
         if !self.writable {
             self.set_protection(PROT_READ | PROT_WRITE)?;
             self.writable = true;
         }
-        // SAFETY: `bytes` is a caller-owned slice and the copy is bounded by its length;
-        // the destination is this page and `bytes.len() <= PAGE` was just checked.
+        // SAFETY: `bytes` is a caller-owned slice; the copy is bounded by its length, the
+        // destination is inside this page, and `offset + len <= PAGE` was just checked.
+        // `base.add(offset)` stays inside the single mapped page, so it cannot wrap.
         unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), self.base, bytes.len());
+            ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(offset), bytes.len());
         }
-        self.filled = self.filled.max(bytes.len());
+        self.filled = self.filled.max(end);
         self.set_protection(PROT_READ | PROT_EXEC)?;
         self.writable = false;
         Ok(())
+    }
+
+    /// How many bytes of the page are in use.
+    pub const fn filled(&self) -> usize {
+        self.filled
+    }
+
+    /// How many bytes the page holds.
+    pub const fn capacity(&self) -> usize {
+        PAGE
     }
 
     /// The page's start address, as a function pointer.
@@ -110,15 +137,43 @@ impl ExecutablePage {
     /// rather than an obviously wrong number, which is why it read as a mystery segfault
     /// rather than a cast error.
     pub fn entry(&self) -> Entry {
+        self.entry_at(0)
+    }
+
+    /// The address of the code at `offset`, as a function pointer.
+    ///
+    /// **The address is *converted* to a function pointer; it is not read from the page.**
+    /// Those are different operations and the first version of this method conflated them:
+    /// `ptr::read(base as *const Entry)` reads eight bytes *at* the page and reinterprets
+    /// them as a pointer, which here are the first eight bytes of the emitted code — `48 b9
+    /// 14 00 00 00 00 00`, a `MOV RCX, 20` — so the JIT called `0x0000_0000_0014_b948` and
+    /// died. The address and the thing at the address came out transposed, and the
+    /// resulting jump target looked like a plausible heap pointer rather than an obviously
+    /// wrong number, which is why it read as a mystery segfault rather than a cast error.
+    pub fn entry_at(&self, offset: usize) -> Entry {
         debug_assert!(
             !self.writable,
             "the page is writable, so calling it would be calling whatever is in it"
         );
-        // SAFETY: the address is the start of a page this crate mapped, filled with code
-        // it emitted, and `write` ends by making that page `PROT_READ | PROT_EXEC`, so
-        // the memory there is executable and the transmute is to the signature the
-        // translator generates for. The result is used before `Drop` can unmap.
-        unsafe { core::mem::transmute(self.base) }
+        debug_assert!(
+            offset < self.filled,
+            "entry_at past what has been written would call whatever the page holds"
+        );
+        // SAFETY: the address is inside a page this crate mapped and filled with code it
+        // emitted, and `write_at` ends by making that page `PROT_READ | PROT_EXEC`, so the
+        // memory there is executable and the transmute is to the signature the translator
+        // generates for. The result is used before `Drop` can unmap.
+        unsafe { core::mem::transmute(self.base.add(offset)) }
+    }
+
+    /// Empties the page, keeping the mapping.
+    ///
+    /// **Used when the arena fills.** The translation is dropped and the bump pointer
+    /// resets, so the next block starts at the beginning again. The page stays mapped
+    /// because unmapping and mapping it again would be a syscall pair on a path that is
+    /// already rare, and the memory is ours either way.
+    pub fn reset(&mut self) {
+        self.filled = 0;
     }
 
     fn set_protection(&self, protection: i32) -> Result<(), Decline> {

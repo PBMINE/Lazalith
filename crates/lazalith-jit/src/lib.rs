@@ -184,6 +184,17 @@ pub struct Jit {
     /// invalidate the cache when it changes, which is not a decision a per-call argument
     /// could make.
     yield_boundary: Option<InstructionAddress>,
+    /// Where the next block.s bytes go in the page.
+    ///
+    /// **A bump pointer, because the page is an arena rather than a slot.** B22 made it a
+    /// slot {2014} one block, overwritten by the next {2014} which is a code cache that can never
+    /// hit, and B24 measured the consequence: a JIT six times slower than the interpreter
+    /// on the very code it translates. When the arena fills, the page is dropped and a new
+    /// epoch begins, because every block in it is derivable from the guest.s bytes and a
+    /// fresh `mmap` is cheaper than an eviction policy.
+    next_offset: usize,
+    /// How many times the translator has run since the last `discard_private_state`.
+    translations: u64,
     /// How many blocks were executed natively, and how many instructions they retired.
     ///
     /// **Reported rather than assumed.** A JIT that quietly fell back to the
@@ -206,6 +217,8 @@ impl Jit {
             blocks: Vec::new(),
             page: None,
             yield_boundary: None,
+            next_offset: 0,
+            translations: 0,
             executed_blocks: 0,
             executed_instructions: 0,
         }
@@ -222,6 +235,7 @@ impl Jit {
     fn discard_code(&mut self) {
         self.blocks.clear();
         self.page = None;
+        self.next_offset = 0;
     }
 
     /// How many translated blocks have run natively.
@@ -235,6 +249,45 @@ impl Jit {
     /// How many blocks are translated and cached.
     pub fn cached_blocks(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// How many times the translator has run.
+    ///
+    /// **A count of *translations*, and it is the only performance number in this crate that
+    /// is a regression guard.** Wall-clock figures depend on the host, on the page fault
+    /// that did or did not happen, and on whatever else the machine is doing, and a test
+    /// that asserts one gets deleted the first time it is inconvenient. This is a property
+    /// of the engine.s logic: a block that is already translated must not be translated
+    /// again, and when it was not, this number must have gone up.
+    ///
+    /// B24 measured the consequence of getting it wrong. The page held one block at a time,
+    /// so every step translated a fresh block over the previous one, and the JIT came out
+    /// *six times slower than the interpreter* on straight-line register arithmetic {2014} the
+    /// code it translates perfectly. The number was 1 per step where it should have been 1
+    /// per block, and it is public now so that it can be asserted on rather than inferred
+    /// from a clock.
+    pub const fn translations(&self) -> u64 {
+        self.translations
+    }
+
+    /// The cached blocks, for a test that wants to look at them.
+    ///
+    /// **Read-only, and named for the test rather than for a use.** Nothing in the crate
+    /// consults a block after compiling it except `run_block`, which looks it up by guest
+    /// address; exposing the list is so that a test can check offsets and starts without
+    /// reaching into private fields.
+    pub fn blocks(&self) -> &[Compiled] {
+        &self.blocks
+    }
+
+    /// Runs one already-compiled block, for a test that has compiled one itself.
+    ///
+    /// **The single step of `step` with no translation in front of it.** `step` translates
+    /// and then runs; a test that has already translated wants the run, and going through
+    /// `step` would translate again {2014} which is the thing such a test exists to avoid. It
+    /// cannot be wrong about the cache because it does not consult it.
+    pub fn run_block_for_test(&mut self, processor: &mut Processor) -> Result<StepResult, Decline> {
+        self.run_block(processor)
     }
     /// Translates the run of instructions starting at the processor's PC, if it can.
     ///
@@ -271,6 +324,35 @@ impl Jit {
             return Ok(found);
         }
         let block = translation_of(processor, memory, self.yield_boundary)?;
+        self.translations += 1;
+        // The code goes into the page, and the metadata into the cache. **The offset is
+        // where in the page this block's bytes went**, and it is not always zero: the page
+        // is an arena that several blocks share.
+        //
+        // **A page that held one block at a time was a cache that never hit**, and B24's
+        // measurement found it: the JIT was six times *slower* than the interpreter on
+        // straight-line register arithmetic — the code it translates perfectly — because
+        // every step translated a fresh block over the previous one, so no block was ever
+        // run twice and the assembler ran on every step. That is not a performance
+        // limitation of a JIT, it is a cache wired to never be read.
+        if self.page.is_none() {
+            self.page = Some(ExecutablePage::new()?);
+            self.next_offset = 0;
+        }
+        let page = self.page.as_mut().ok_or(Decline::NoExecutablePage)?;
+        let code = block.code.bytes();
+        if self.next_offset + code.len() > page.capacity() {
+            // The arena is full. **Throw it away and start a new epoch** rather than
+            // evicting one block: this page is a cache, every entry in it is derivable from
+            // the guest's bytes, and replacing the whole thing is one `mmap` instead of a
+            // per-block bookkeeping scheme that would still be a cache with a bad policy.
+            page.reset();
+            self.blocks.clear();
+            self.next_offset = 0;
+        }
+        let offset = self.next_offset;
+        page.write_at(offset, code)?;
+        self.next_offset = offset + code.len();
         let compiled = Compiled {
             start: block.start,
             end: block.end,
@@ -278,19 +360,8 @@ impl Jit {
             cycles: block.cycles,
             flags: block.flags,
             boundary: self.yield_boundary,
-            offset: 0,
+            offset,
         };
-        // The code goes into the page, and the metadata into the cache. **The offset is
-        // zero for every block, because the page holds one block at a time** — see
-        // `the_page_holds_one_block_at_a_time`, which is what keeps that from being a
-        // silent bug: a second translation replaces the first, and the cache entry for
-        // the first becomes stale, so the cache is cleared with the page.
-        if self.page.is_none() {
-            self.page = Some(ExecutablePage::new()?);
-        }
-        let page = self.page.as_mut().ok_or(Decline::NoExecutablePage)?;
-        page.write(block.code.bytes())?;
-        self.blocks.clear();
         self.blocks.push(compiled);
         Ok(compiled)
     }
@@ -306,7 +377,9 @@ impl Jit {
             return Err(Decline::NoCode);
         };
         let page = self.page.as_ref().ok_or(Decline::NoExecutablePage)?;
-        let entry = page.entry();
+        // The entry is the block.s own offset, not the page start: several blocks share
+        // the page, and calling the first one for all of them would run the wrong code.
+        let entry = page.entry_at(block.offset);
         // **The block is handed a copy of the register file and a pointer to the PC**,
         // and nothing else. It cannot reach the machine's memory, its devices or its
         // clock, so the worst a mistranslated block can do is compute a wrong register
@@ -626,6 +699,7 @@ impl<M: CpuMemory> ExecutionEngine<M> for Jit {
         self.yield_boundary = None;
         self.executed_blocks = 0;
         self.executed_instructions = 0;
+        self.translations = 0;
     }
 }
 /// The operand kinds the translator accepts.

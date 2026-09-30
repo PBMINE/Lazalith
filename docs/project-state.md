@@ -9651,3 +9651,136 @@ the reason this is opt-in.
 **B24, differential JIT verification and measurement** — a corpus that runs equivalent
 programs on the interpreter and the JIT and compares registers, PC, SP, status, memory,
 faults, device-visible state and virtual time, with a real performance number behind it.
+
+# B24 — Differential JIT verification and measurement
+
+Two questions, answered with evidence rather than argument: **are the two engines the same
+machine?** and **is the JIT actually faster?**
+
+## The differential corpus
+
+`crates/lazalith-machine/tests/jit_differential.rs` holds 22 programs — 11 for `lz64` and 11
+for `lz32` — covering straight-line arithmetic, flag-setting, branches, calls and returns,
+memory stores and loads, console output, permission faults, unmapped accesses, divide by
+zero, software traps, and long runs that exceed one block.
+
+Four tests run over all of them:
+
+- `every_engine_produces_the_reference_trajectory`
+- `the_jit_runs_natively_and_hands_off_on_this_corpus`
+- `switching_engine_every_instruction_matches_the_reference`
+- `a_breakpoint_on_every_instruction_matches_the_reference`
+
+**A trajectory is a list of frames, one per distinct retired-instruction count, plus an
+ordered list of trap causes.** One frame per count rather than one per `step()` call,
+because the JIT retires many instructions per call and the interpreter retires one: comparing
+per-`step()` would compare two different things and would "fail" for the right reason.
+Faults are compared as a sequence rather than folded into the frames, because a fault is not
+a state — it happens at a count and leaves the machine where the last frame says it is.
+
+The two engine-schedule tests are the ones that earn their keep. Switching on **every**
+instruction, and putting a breakpoint on **every** instruction, force the JIT to hand off
+at every single boundary. A JIT that only agrees with the interpreter on straight-line runs
+agrees by accident. A JIT that agrees when it hands off at every instruction has been asked
+to be right thousands of times in a row and has been.
+
+Non-vacuity is asserted rather than assumed. The corpus reports:
+
+```
+81 natively retired instructions, 149 handoffs, 11 of 22 programs ran native
+```
+
+If the JIT declined everything, the trajectory tests would still pass and prove nothing, so
+the count of native instructions is a test failure when it is zero.
+
+## Measurement, and the bug it found
+
+`crates/lazalith-machine/tests/performance.rs` times three workloads — `register-only`,
+`memory-bound`, `mixed` — each run on the reference interpreter, on a cold JIT, and on a
+warm JIT. Cold is a fresh engine every repetition; warm restores the architectural state
+between repetitions and **keeps the translated code**, which is the only way to separate
+translation cost from execution cost.
+
+**The first version of this measurement reported that the JIT was six times slower than
+the interpreter on straight-line register arithmetic** — the code it translates perfectly,
+with 96 instructions and zero handoffs. The `the_jit_is_ahead` assertion failed, which is
+the assertion doing its job.
+
+The cause was in B22 and had been written down as a limitation: *"a translated block is
+never run twice and the cache currently earns nothing."* The executable page held **one
+block at a time**. Every `step` translated a fresh block over the previous one, so the
+cache was wired to never be read and the assembler ran on every single step. A cache that
+cannot hit is not a design limitation, it is a defect, and the measurement is what said so.
+
+The fix is not clever. `ExecutablePage::write_at` places a block at an offset rather than at
+the start, and `Jit` keeps a bump pointer, so several blocks share the page as an arena.
+`entry_at(offset)` converts the address of a block to a function pointer instead of
+reading a pointer out of the page — the *address* is converted, not the *contents read*,
+which is the transposition that produced a mystery segfault in B22. When the arena fills,
+the page is reset and a new epoch begins: every block in it is derivable from the guest's
+bytes, so dropping the lot is one cheap operation and beats an eviction policy that would
+still be a cache with a bad one.
+
+The same measurement now reads, on this host:
+
+| workload | instrs | reference | jit cold | jit warm | cold/ref | warm/ref | detail |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| register-only | 96 | 32040 ns | 56554 ns | 617 ns | 1.77x | 0.02x | native 96, handoffs 0 |
+| memory-bound | 49 | 20868 ns | 40447 ns | 16575 ns | 1.94x | 0.79x | native 1, handoffs 48 |
+| mixed | 72 | 21457 ns | 81453 ns | 11808 ns | 3.80x | 0.55x | native 37, handoffs 35 |
+
+Read honestly, that is three different stories and only the first is flattering:
+
+- **register-only: 65x faster warm, and 1.8x *slower* cold.** A 96-instruction program is
+  short enough that translation is most of the work. The crossover is somewhere above a
+  hundred instructions of straight-line code, and B22's 31-instruction block limit means a
+  program that loops pays translation once and then never again — which the warm column is
+  measuring and the cold column cannot.
+- **memory-bound: parity, because the JIT declines all of it.** 48 handoffs against 49
+  instructions: one native instruction and the rest handed off. The JIT is not slow here, it
+  is absent, and the interpreter is doing every instruction. Reporting this as a JIT result
+  would be dishonest; the number belongs to the Reference Interpreter.
+- **mixed: 1.8x faster warm, 3.8x slower cold.** The handoff cost is real and the JIT still
+  wins when roughly half the instructions are native. That is the workload shape that
+  matters for LazOS, and it is not yet a good enough win to call the JIT a success.
+
+**No workload was made to look better by raising a limit.** The 31-instruction block cap and
+the conservative decode set stayed exactly as B22 left them, because a benchmark improved by
+loosening the thing under test is a benchmark of the limit rather than of the code.
+
+### Why the regression guard is not a clock
+
+`Jit::translations` counts calls to the translator, and `a_block_is_translated_once_and_run_again`
+and `several_blocks_share_the_page` assert on it. **A wall-clock assertion depends on the
+host, on the page fault that did or did not happen, and on whatever else the machine is
+doing, and it gets deleted the first time it is inconvenient.** A translation count is a
+property of the engine's logic. The performance test exists to *find* the six-times-slower
+bug; these two exist to make sure it cannot come back quietly.
+
+## Limitations at the end of this stage
+
+1. **The JIT still declines every memory operation**, so `memory-bound` measures the
+   interpreter, and `mixed` pays a handoff on roughly every other instruction. Both improve
+   only when the translate set grows, which is a stage of its own.
+2. **The cache is a bump-allocated arena with no eviction policy.** It resets when full.
+   That is correct and it is not sophisticated, and a working set larger than one page will
+   thrash.
+3. **The measurement is three synthetic workloads on one host.** They were chosen to
+   bracket the JIT's competence, not to represent LazOS. A real LazOS boot is the number
+   that would matter, and it is not measured yet.
+4. **An engine switch is still refused during an active user execution context**, unchanged
+   from B3, and 32-bit guests are still declined by the JIT.
+5. **aarch64-linux unchecked.**
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets -- -D warnings` ✅
+- `cargo test --workspace`: **1697 passed, 0 failed** (8 new)
+- `nix flake check`, `nix build` ✅
+
+## Next stage
+
+**B25, the target-side transition** — the freestanding C environment, the LazOS ABI, and
+the first LazOS in C and LZA assembly running on the target side of the boundary, with the
+host-Rust LazOS kept as the reference and migration oracle.
