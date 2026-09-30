@@ -52,7 +52,9 @@
 //! **The `unsafe` audit is the part that must be re-done after the swap, not now.** All
 //! thirty-nine `unsafe` sites are in this one crate today, which is the property the
 //! workspace lints exist to protect. After the swap they will be in `sdl3` instead, and
-//! `unsafe_audit_is_one_crate` is the test that will confirm it.
+//! `unsafe_audit_is_two_known_crates` is the test that will confirm it — with
+//! `lazalith-jit` now also on the list, since a JIT has to `mprotect` a page executable
+//! and call a function pointer into it, and there is no safe form of either.
 
 use std::collections::BTreeMap;
 
@@ -370,15 +372,30 @@ mod tests {
         );
     }
 
-    /// The unsafe surface is one crate, and this is still it.
+    /// The unsafe surface is two crates, and this is what they are.
     ///
     /// **The property the workspace lints exist to protect, checked as a fact.** The
-    /// workspace `forbid`s `unsafe_code`; `lazalith-sdl3` opts out, which is the only
-    /// opt-out. After the migration to the `sdl3` crate, the `unsafe` will be in
-    /// `sdl3` instead and this crate will be gone — and *this test is what will confirm
-    /// it*, so it is written to be read again then.
+    /// workspace `forbid`s `unsafe_code`; exactly two crates opt out, and this test names
+    /// them.
+    ///
+    /// `lazalith-sdl3` is the windowing and input layer, and holds the `unsafe` until the
+    /// migration to the `sdl3` crate lands — at which point the `unsafe` moves into
+    /// `sdl3` and this crate disappears, and this test is what will confirm it.
+    ///
+    /// `lazalith-jit` is the execution engine, and holds it because two operations have
+    /// no safe form: making a page executable, and calling a function pointer into it.
+    /// There is no way to write a JIT without both, so the crate that does it is the
+    /// crate that has to be trusted, and the workspace's answer is to make that trust
+    /// explicit — one allowlist of two names, asserted here — rather than to
+    /// `forbid(unsafe_code)` on the engine and leave the question open.
+    ///
+    /// The list is a literal, not a pattern, on purpose: a crate joins it by being added
+    /// to this list in the same commit that adds its `unsafe`, which is a reviewable
+    /// event. A glob or a "crates with a feature flag" rule would let a new crate acquire
+    /// `unsafe` without this file changing at all.
     #[test]
-    fn unsafe_audit_is_one_crate() {
+    fn unsafe_audit_is_two_known_crates() {
+        const ALLOWED: [&str; 2] = ["lazalith-jit", "lazalith-sdl3"];
         let offenders: Vec<String> = std::fs::read_dir(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
@@ -389,7 +406,7 @@ mod tests {
         .filter(|entry| entry.path().is_dir())
         .filter(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            name != "lazalith-sdl3"
+            !ALLOWED.contains(&name.as_str())
         })
         .filter(|entry| {
             let source = entry.path().join("src");
@@ -403,8 +420,7 @@ mod tests {
         .collect();
         assert!(
             offenders.is_empty(),
-            "unsafe is allowed in lazalith-sdl3 and nowhere else; {offenders:?} also \
-             contains it"
+            "unsafe is allowed only in {ALLOWED:?}; {offenders:?} also contains it"
         );
     }
 

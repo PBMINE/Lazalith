@@ -69,16 +69,45 @@ pub enum OutcomeApplication {
 pub struct StepResult {
     /// What the instruction did.
     pub application: OutcomeApplication,
-    /// What it cost, from [`lazalith_isa::Opcode::cycles`].
+    /// What it cost, from [`lazalith_isa::Opcode::cycles`], for the instructions retired.
     pub cycles: u8,
+    /// How many guest instructions retired.
+    ///
+    /// **One for every engine except a JIT, and this field is why.** The machine charges
+    /// virtual time per retired instruction and counts instructions, and an engine that
+    /// executes a *block* natively retires several in one `step`. Without this the
+    /// machine would under-count instructions and under-charge time for every block the
+    /// JIT ran, and the two engines would disagree about virtual time for the same
+    /// program, which is the thing B24 exists to catch.
+    ///
+    /// A `u16` rather than a `u64` because a block is bounded by how much code the JIT
+    /// will translate at once, and a `u16` makes that bound structural: a block retiring
+    /// more than 65,535 instructions cannot be described, so the translation loop has to
+    /// stop. A `u64` would leave the bound as a comment.
+    pub instructions: u16,
 }
 
 impl StepResult {
-    /// An instruction that retired with this outcome at this cost.
-    pub const fn new(application: OutcomeApplication, cycles: u8) -> Self {
+    /// One instruction, retired at this cost. What every interpreter step is.
+    pub const fn one(application: OutcomeApplication, cycles: u8) -> Self {
         Self {
             application,
             cycles,
+            instructions: 1,
+        }
+    }
+
+    /// An instruction that retired with this outcome at this cost.
+    pub const fn new(application: OutcomeApplication, cycles: u8) -> Self {
+        Self::one(application, cycles)
+    }
+
+    /// A *block*: `instructions` instructions retired, costing `cycles` in total.
+    pub const fn block(application: OutcomeApplication, cycles: u8, instructions: u16) -> Self {
+        Self {
+            application,
+            cycles,
+            instructions,
         }
     }
 
@@ -108,6 +137,7 @@ impl From<OutcomeApplication> for StepResult {
         Self {
             application,
             cycles: 0,
+            instructions: 1,
         }
     }
 }

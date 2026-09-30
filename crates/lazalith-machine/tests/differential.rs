@@ -341,12 +341,14 @@ fn run_machine(program: &Program, steps: u64) -> (Vec<Observation>, Vec<Vec<u8>>
     run_machine_on_engine(program, steps, EngineKind::Reference)
 }
 
-/// Runs `program` on a machine whose engine is `kind`, switched on every step.
-fn run_machine_on_engine(
-    program: &Program,
-    steps: u64,
-    kind: EngineKind,
-) -> (Vec<Observation>, Vec<Vec<u8>>) {
+/// A reset machine with `program` loaded, ready to step.
+///
+/// **One builder for every machine in this file**, so a test that only wants a machine and
+/// a test that wants to *run* a program on it cannot disagree about how one is built. A
+/// second copy of this setup would be a second answer to "what does a machine start
+/// with", and the difference between the two copies would surface as a differential
+/// failure that is really a fixture bug.
+fn build_machine(program: &Program) -> LazalithMachine<ConsoleDevice> {
     let mut devices = DeviceManager::new();
     devices
         .insert(
@@ -411,6 +413,16 @@ fn run_machine_on_engine(
     machine
         .set_trap_vector(InstructionAddress::new(CODE))
         .expect("a trap vector inside the code region");
+    machine
+}
+
+/// Runs `program` on a machine whose engine is `kind`, switched on every step.
+fn run_machine_on_engine(
+    program: &Program,
+    steps: u64,
+    kind: EngineKind,
+) -> (Vec<Observation>, Vec<Vec<u8>>) {
+    let mut machine = build_machine(program);
     let mut observations = Vec::new();
     let mut memory_watch = Vec::new();
     for step in 0..steps {
@@ -1231,6 +1243,55 @@ fn the_machine_runs_identically_on_either_engine() {
                 optimized_memory,
                 "and the two engines left memory differently for {}",
                 describe(&program)
+            );
+        }
+    }
+}
+
+/// The machine can be built with a JIT, and switching to it loses nothing.
+///
+/// **This is the B22 part of §10's engine-independence claim, and it stops short of
+/// running a program on it.** The JIT is reachable from the machine — the engine factory
+/// builds one, and switching to it is a normal machine operation — but the machine has
+/// no *fallback* path yet: when the JIT declines an instruction it reports
+/// `CpuFaultCause::JitDeclined`, and the machine's only response to a fault is to enter a
+/// trap. A real program is memory traffic and control flow, so a real program would trap
+/// on its first memory access rather than continuing on the interpreter.
+///
+/// That is B23's work — deciding what a decline means and where the machine goes next —
+/// and it is recorded as such in `docs/project-state.md`. Writing the test as though the
+/// JIT could already run the corpus would either fail or, worse, be written to pass by
+/// not stepping at all.
+///
+/// So what is checked here is the part that is true and that a later stage depends on:
+/// the engine exists, the factory produces it, and switching back and forth across it
+/// leaves the architectural state exactly as it found it.
+#[test]
+fn the_machine_can_be_built_with_a_jit() {
+    for config in MODES {
+        for program in curated(config).into_iter().take(4) {
+            let mut machine = build_machine(&program);
+            assert_eq!(
+                machine.execution_engine(),
+                EngineKind::Reference,
+                "a machine starts on the reference interpreter, which is the engine \
+                 §10 makes authoritative"
+            );
+            machine
+                .switch_execution_engine(EngineKind::Jit)
+                .expect("the machine builds a JIT");
+            assert_eq!(
+                machine.execution_engine(),
+                EngineKind::Jit,
+                "and reports it, so a caller can tell which engine is installed"
+            );
+            machine
+                .switch_execution_engine(EngineKind::Reference)
+                .expect("and switches back");
+            assert_eq!(
+                machine.execution_engine(),
+                EngineKind::Reference,
+                "so the boundary is navigable in both directions"
             );
         }
     }

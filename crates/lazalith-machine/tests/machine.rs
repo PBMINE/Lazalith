@@ -487,6 +487,7 @@ fn created_requires_reset_and_zero_length_runs_honor_lifecycle() {
             machine.step().unwrap(),
             lazalith_machine::MachineEvent::Stepped {
                 application: lazalith_cpu::OutcomeApplication::Continue,
+                ..
             }
         ));
         assert_eq!(machine.state(), MachineState::Reset);
@@ -530,6 +531,7 @@ fn running_pause_and_step_transitions_reach_halt_then_reject_execution() {
             machine.step().unwrap(),
             lazalith_machine::MachineEvent::Stepped {
                 application: lazalith_cpu::OutcomeApplication::Continue,
+                ..
             }
         ));
         assert_eq!(machine.state(), MachineState::Running);
@@ -540,6 +542,7 @@ fn running_pause_and_step_transitions_reach_halt_then_reject_execution() {
             machine.step().unwrap(),
             lazalith_machine::MachineEvent::Stepped {
                 application: lazalith_cpu::OutcomeApplication::Continue,
+                ..
             }
         ));
         assert_eq!(machine.state(), MachineState::Paused);

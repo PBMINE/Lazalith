@@ -60,6 +60,16 @@ pub enum EngineKind {
     /// `crates/lazalith-cpu/tests/speed.rs` compares it against the reference after
     /// every instruction.
     Optimized,
+    /// A just-in-time compiler: LZA instructions translated to host machine code.
+    ///
+    /// **Present since B22 and the first engine that is not an interpreter.** §10's
+    /// diagram puts it beside the reference as another way to execute LZA code, and §11
+    /// is explicit that it is an execution engine and not a compiler, an assembler,
+    /// another ISA, or a language frontend. It translates a *conservative* subset —
+    /// straight-line runs of register-only instructions — and everything else runs
+    /// through the reference; which subset is `lazalith_jit::TRANSLATABLE`'s business
+    /// and not this enum's.
+    Jit,
 }
 
 impl EngineKind {
@@ -68,11 +78,12 @@ impl EngineKind {
         match self {
             Self::Reference => "reference",
             Self::Optimized => "optimized",
+            Self::Jit => "jit",
         }
     }
 
     /// Every engine this build has, in the order the machine reports them.
-    pub const ALL: &'static [EngineKind] = &[Self::Reference, Self::Optimized];
+    pub const ALL: &'static [EngineKind] = &[Self::Reference, Self::Optimized, Self::Jit];
 }
 
 impl fmt::Display for EngineKind {

@@ -72,8 +72,17 @@ pub struct TrapEvent {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MachineEvent {
-    Stepped { application: OutcomeApplication },
-    Trapped { event: TrapEvent },
+    /// A step that retired normally. `instructions` is how many guest instructions
+    /// retired, which is one for an interpreter and more for a JIT that executed a
+    /// block; the caller needs it because the machine's own instruction count and the
+    /// virtual time it charges both come from it.
+    Stepped {
+        application: OutcomeApplication,
+        instructions: u16,
+    },
+    Trapped {
+        event: TrapEvent,
+    },
     Halted,
 }
 
@@ -1055,6 +1064,7 @@ impl<D: Device> LazalithMachine<D> {
             }
             OutcomeApplication::Continue => Ok(MachineEvent::Stepped {
                 application: result.application,
+                instructions: result.instructions,
             }),
         }
     }
@@ -1095,8 +1105,8 @@ impl<D: Device> LazalithMachine<D> {
                     trap = Some(event);
                     break None;
                 }
-                MachineEvent::Stepped { .. } => {
-                    executed += 1;
+                MachineEvent::Stepped { instructions, .. } => {
+                    executed += u64::from(instructions);
                 }
             }
         };
@@ -1194,7 +1204,18 @@ fn trap_cause(fault: &CpuFault<MemoryFault>) -> TrapCause {
         CpuFaultCause::DoubleTrap
         | CpuFaultCause::DeferredInterrupt
         | CpuFaultCause::TerminalTrap
-        | CpuFaultCause::TrapEntry(_) => TrapCause::InvalidControlState,
+        | CpuFaultCause::TrapEntry(_)
+        // **A decline is not a guest fault, and mapping it to one would be a bug.**
+        // `trap_cause` is only reached for faults the *guest* caused, and a JIT saying
+        // "I will not run this" is the engine's limitation. The machine must not enter a
+        // trap for it, because a trap is a thing the guest observes — it changes the
+        // program counter, the trap frame and the privilege — and a program would be
+        // trapped for using an instruction the JIT has not taught itself yet.
+        //
+        // The mapping below is unreachable in the right design and is here so that a
+        // decline which *did* reach the trap path is reported as an invalid control
+        // state — an emulator bug, visibly — rather than as a plausible guest fault.
+        | CpuFaultCause::JitDeclined => TrapCause::InvalidControlState,
     }
 }
 
@@ -1301,6 +1322,7 @@ fn engine_for<M: lazalith_memory::CpuMemory>(kind: EngineKind) -> Box<dyn Execut
     match kind {
         EngineKind::Reference => Box::new(ReferenceInterpreter::new()),
         EngineKind::Optimized => Box::new(lazalith_cpu::FastInterpreter::new()),
+        EngineKind::Jit => Box::new(lazalith_jit::Jit::new()),
     }
 }
 

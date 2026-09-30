@@ -290,6 +290,21 @@ fn every_named_engine_is_one_a_machine_accepts() {
 #[test]
 fn a_switch_preserves_everything_the_guest_can_see() {
     for config in MODES {
+        for kind in EngineKind::ALL {
+            a_switch_preserves_everything(config, *kind);
+        }
+    }
+}
+
+/// The same, for one destination engine.
+///
+/// **A parameter rather than a loop body, so the failure names the engine.** The JIT is
+/// the reason this is a function: it is the one engine that *builds* a code cache on
+/// first use, and a switch to it is the one switch that does more than install a trait
+/// object. A loop that switched only to `Reference` would still pass after a JIT landed,
+/// because the test never went near the interesting boundary.
+fn a_switch_preserves_everything(config: ArchitectureConfig, to: EngineKind) {
+    {
         let mut machine = machine(config);
         // Four steps in: the registers and the flags are non-trivial and there is
         // still a next instruction.
@@ -311,9 +326,8 @@ fn a_switch_preserves_everything_the_guest_can_see() {
         let registers = all_registers(&machine);
         let device = console(&machine);
 
-        machine
-            .switch_execution_engine(EngineKind::Reference)
-            .unwrap();
+        machine.switch_execution_engine(to).unwrap();
+        assert_eq!(machine.execution_engine(), to, "the switch took effect");
 
         assert_eq!(machine.processor().architectural().pc(), pc, "pc changed");
         assert_eq!(machine.processor().architectural().sp(), sp, "sp changed");

@@ -226,6 +226,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazalith-jit"
+version = "0.1.0"
+dependencies = [
+ "lazalith-cpu",
+ "lazalith-isa",
+ "lazalith-memory",
+ "lazalith-types",
+]
+
+[[package]]
 name = "lazalith-machine"
 version = "0.1.0"
 dependencies = [
@@ -233,6 +243,7 @@ dependencies = [
  "lazalith-devices",
  "lazalith-diagnostics",
  "lazalith-isa",
+ "lazalith-jit",
  "lazalith-memory",
  "lazalith-properties",
  "lazalith-types",

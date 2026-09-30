@@ -9026,10 +9026,16 @@ nobody checked.
 
 ### The unsafe surface
 
-`unsafe_audit_is_one_crate` asserts no crate other than `lazalith-sdl3` contains
+`unsafe_audit_is_one_crate` asserted no crate other than `lazalith-sdl3` contained
 `unsafe`, which is the property the workspace's `forbid` exists to protect. **This is the
 test to re-read after the swap**, when the `unsafe` will be in `sdl3` instead and this
 crate will be gone.
+
+B22 adds the second crate to that list and renames the test to
+`unsafe_audit_is_two_known_crates`, because a JIT has to make a page executable and call a
+function pointer into it and there is no safe form of either. The allowlist is a literal
+of two names rather than a pattern, so a third crate has to be added to it in the same
+commit that adds its `unsafe` — which is a reviewable event, where a glob would not be.
 
 ## Validation
 
@@ -9240,3 +9246,192 @@ correctness bug, and that is the one checked.
 
 **B22, a real JIT** (§11) — host-native code that actually executes LZA instructions,
 with the canonical VM state staying where B3 put it.
+
+---
+
+# B22 — a real JIT (§11)
+
+## The result, first
+
+**`lazalith-jit` translates straight-line runs of LZA register instructions into x86-64
+machine code, writes them into an executable page, and calls them.** Guest instructions
+retire as host instructions, not as interpreter iterations, and
+`the_jit_actually_executed_host_code` fails if the engine's own instruction counter is
+zero — because a `Jit` that quietly delegated to the interpreter would pass every
+differential test in the repository, and only that counter can tell the two apart.
+
+The subset is deliberately small and the boundary is exact: `Li`, `Mov`, `Add`, `Sub`,
+`Addi`, `Subi`, `Mul`, `And`, `Or`, `Xor`, in straight-line runs of up to 31
+instructions. Memory, control transfers, privileged operations, divides, shifts and
+everything else are declined, and the machine runs those through the reference.
+
+## What is in the crate
+
+| file | what it is |
+|---|---|
+| `x86.rs` | the encoder: one method per instruction form, with a hand-written byte table in a test |
+| `translate.rs` | the translator: LZA instruction → host instructions, and the `Translatable` rule |
+| `memory.rs` | `mmap` / `mprotect` / `munmap`, the W^X boundary, and the entry-point signature |
+| `lib.rs` | the `ExecutionEngine` impl, the block cache, and the flags derivation |
+| `block.rs` | the `Translated` re-export |
+
+## The architecture, and the boundary it draws
+
+The canonical VM state is unchanged and stays in the `Processor`. The JIT reads it through
+the same accessors the interpreter uses and holds **no architectural state of its own** —
+its only private state is translated code, which is a cache of "what host code computes
+these guest instructions" and is discarded on a switch.
+
+The generated code is handed a stack array the caller owns, not a pointer into the
+machine's register file. That is what makes "the JIT owns no architectural state" a
+structural property rather than a promise: there is no pointer to fork, because the only
+memory a block can reach is `execute`'s own frame.
+
+A block ends in a `RET`. At that instant every guest register is written back, the PC is
+committed, and the machine's state is complete and consistent — so there is no sync point,
+no shadow state to flush, and no way for a block to be half-way through an update. That is
+also what makes §11's handoff requirements satisfiable without a second mechanism: a
+breakpoint, a fault, or an instruction the translator refused all have the same shape.
+
+## The flags are computed by the interpreter's own code, and that is the design
+
+**LZA's ALU instructions set N, Z, C and V, and a JIT that drops them is not faster, it is
+wrong.** The obvious implementation builds the guest's status out of x86's own flags with
+`SETcc`. This one does not: the block spills the *last* flag-setting instruction's two
+operands and its result into a three-word scratch, and `apply_flags` derives the flags
+with `lazalith_types::WordWidth` — **the same `width.add` / `width.sub` / `width.mul` calls
+the Reference Interpreter uses.**
+
+The reason is that x86's flags are *almost* the guest's, and "almost" is the problem. They
+agree for `ADD` and `SUB` and are explicitly *undefined* for `IMUL`, so a `SETcc`-based
+status would have to clear carry and overflow by hand for multiply and would have to be
+argued rather than checked. Deriving the flags from the same functions means there is no
+second definition of the guest's condition codes anywhere in the system, so the two
+engines **cannot** disagree about them — they run the same code. `every_flag_matches_the_
+reference` checks ten flag-producing cases against the interpreter to confirm it.
+
+**This is a real limitation, recorded as one.** The flags are recomputed after the block
+rather than by it, so a guest reading the status register *between* two translated
+instructions would see stale values. That cannot happen in this stage, because every
+instruction the translator emits either sets the flags or leaves them alone, and a block
+runs to its `RET` before the guest can observe anything. Moving the flags into host
+registers belongs with translating memory and branches — the step where the block needs to
+branch anyway.
+
+## Six bugs the tests found, and why none of them was visible
+
+Every one of these compiled, assembled, ran, and produced plausible values. That is the
+argument for the shape of the tests rather than a list of complaints.
+
+1. **The translator overwrote its own first argument.** The generated code began by
+   loading the guest PC into `RDI`, which is where the C ABI puts the register block
+   pointer — so the block read its inputs from the PC's address and wrote its results over
+   the machine's own code. No fault; the page was writable and the address was mapped. The
+   fix was an agreement rather than a patch: the signature, the register assignment and the
+   argument order are now one decision written next to itself in `memory.rs`.
+
+2. **`entry()` read the code instead of converting the address.** `ptr::read(base as
+   *const Entry)` reads eight bytes *at* the page and reinterprets them as a pointer — which
+   are the first eight bytes of the emitted code, a `MOV RCX, 20`. The JIT called
+   `0x0000_0000_0014_b948` and died. The address and the thing at the address came out
+   transposed, and the resulting jump target looked like a plausible heap pointer rather
+   than an obviously wrong number, so it read as a mystery segfault.
+
+3. **`mmap`'s FFI declaration was missing its first parameter.** Five declared arguments
+   passed to a six-argument C function, so `length` went into the `addr` slot and a
+   stack-slot garbage value into `offset`; the kernel returned `EINVAL` and every block
+   declined for a reason that pointed nowhere near the declaration. A wrong arity in a
+   hand-written FFI signature is silent by construction. It was also checked against
+   `MAP_FAILED` rather than null on the way past — `mmap` never returns null, and the
+   earlier null check let a failed mapping through to be written to, which is a second
+   segfault that would have followed had the first not hidden it.
+
+4. **Arithmetic was 8-bit.** Every `alu_reg` used the 8-bit opcode (`SUB` `0x28`) where the
+   64-bit one is `0x29`; REX.W does not select between them, the opcode byte alone does.
+   **Four of the five operations in the differential corpus agreed with the interpreter
+   anyway**, because `20 + 22`, `20 ^ 22`, `20 & 22` and `20 | 22` have the same answers at
+   either width. Only `20 - 22` distinguished them. One operation in five was wrong and a
+   test that only checked addition would never have found it — which is why
+   `the_jit_computes_at_sixty_four_bits` exists as a separate corpus with values where
+   *every* operation is wrong at the wrong width.
+
+5. **The guest's condition codes were missing entirely.** The JIT computed registers and
+   never wrote the status register, so `Br` on a flag would have taken the wrong path.
+   Found by a whole-state comparison in which **every register matched and only `status`
+   differed** — the nearest kind of miss there is.
+
+6. **The emitted bytes were wrong in a way the comment described correctly.** The first
+   `/r` encoders' doc comments said `REX.W 01 /r` and the code passed `0x00`; and the
+   `81 /n` group was passed *opcode offsets* where `/digit`s belong, so `0x28 << 3`
+   truncated to `0x40`, `0xC0 | 0x40` was still `0xC0`, and **every "subtract" in the block
+   was an add**. The comments were right and the code was wrong, which is the strongest
+   possible argument for a hand-written byte table: the test compares the encoder against
+   a table written from the manual, not against the comment above it.
+
+Two more were caught by the tests rather than by a program: a `LI` that sign-extended
+correctly while the test's own hand-computed expectation did not, and a `MAX_BLOCK` of 64
+whose worst-case cost (64 × 8 = 512) does not fit the `u8` cycle total `StepResult`
+carries. The second one is why `MAX_BLOCK` is **31** — a bound derived from the clock
+rather than chosen for roundness, with `MAX_BLOCK_CYCLES` proving it. A round number would
+have overflowed the virtual clock, and a guest can read that clock.
+
+## Where the `unsafe` is
+
+`lazalith-jit` is **the second and last crate allowed to contain `unsafe`**, after
+`lazalith-sdl3`, and `unsafe_audit_is_two_known_crates` in
+`crates/lazalith-sdl3/tests/migration.rs` asserts the list is exactly those two. A JIT has
+to do two things no safe Rust can: make a page executable and call a function pointer into
+it. The workspace's `forbid` is overridden *in that crate's manifest* rather than removed,
+so a future crate cannot opt in by accident without writing the section and saying so in
+review — and the allowlist in the test is a literal, not a pattern, for the same reason.
+
+## The JIT is reachable from the machine, and the machine cannot yet run on it
+
+`EngineKind::Jit` exists, `engine_for` builds one, and the machine's engine-switch tests
+now run over `EngineKind::ALL` rather than only to the reference — because the switch *to*
+a JIT is the one switch that does more than install a trait object, since it is the one
+that builds a code cache.
+
+**But a program cannot be run through `LazalithMachine` on a JIT yet.** A decline is
+`CpuFaultCause::JitDeclined`, and the machine's only response to a fault is to enter a
+trap. A real program is memory traffic and control flow, so it would trap on its first
+memory access instead of continuing on the interpreter. **That is B23's question** —
+what a decline means, and where the machine goes next — and the machine-level test says so
+rather than being written to pass by not stepping. B23 also inherits the `Faulted`-machine
+switch rule from B21, which is still a prerequisite.
+
+## Limitations at the end of this stage
+
+1. **Straight-line register operations only.** Memory is the next thing, and it is the
+   thing that would make this worth having: most real guest code is memory traffic, so
+   this accelerates the register-bound parts of a program and leaves the rest to the
+   interpreter.
+2. **Flags are recomputed after the block, not by it** — correct, and derived from the
+   interpreter's own code, but not yet in host registers. See above for why that cannot
+   produce a wrong answer in this stage.
+3. **One block per page.** A second translation replaces the first's bytes and the cache is
+   cleared with it, so a translated block is never run twice. The cache is real but
+   currently earns nothing; this is a limitation, not a design, and it is asserted rather
+   than left to be forgotten.
+4. **32-bit guests are declined.** The generated code is 64-bit and a 32-bit machine
+   truncates every register write; `Decline::UnsupportedWordWidth` rather than a mask after
+   every instruction.
+5. **No measurement.** B21's null result argued for this stage; this stage does not yet
+   measure the JIT against the interpreter, so "faster" is still unclaimed. B24 is where
+   that belongs, with a corpus big enough to mean something.
+6. **aarch64-linux unchecked**, no cold `nix flake check` timing. The emitter emits x86-64
+   and `compile` declines on any other host, so the JIT is a no-op there rather than wrong.
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets -- -D warnings` ✅
+- `cargo test --workspace`: **1674 passed, 0 failed** (13 new)
+- `nix flake check`, `nix build` ✅
+
+## Next stage
+
+**B23, live engine handoff** (§11) — the machine runs a program on the JIT, hands a
+declined instruction, a fault, and a debug event back to the interpreter, and the guest
+cannot tell. This stage's single-block page and its `JitDeclined` signal are what it
+builds on, and the `Faulted`-machine switch rule is its first question.
