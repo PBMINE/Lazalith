@@ -138,6 +138,28 @@ impl BuildTarget {
         })
     }
 
+    /// Every header this target has, read from its sysroot's `include/` directory.
+    ///
+    /// **Read once, at the start of a build, and carried in [`Headers`] from then on.**
+    /// A resolver that opened a file on every `#include` would be a build whose output
+    /// could change under it: a header edited halfway through a long build would be read
+    /// twice and seen two ways. Reading the set up front costs a directory walk and makes
+    /// the build's inputs its inputs.
+    ///
+    /// A built-in target has no directory, so it has no headers. That is a fact rather
+    /// than a gap: the built-in C library carries its own declarations, exactly as a
+    /// hosted libc does, and a program including `<stdint.h>` from a built-in target is
+    /// told the header is missing rather than being given a header from somewhere else.
+    pub fn headers(&self) -> Result<crate::Headers, DriverError> {
+        let Self::Sysroot(sysroot) = self else {
+            return Ok(crate::Headers::new());
+        };
+        let root = sysroot.root().join("include");
+        let mut headers = crate::Headers::new();
+        collect_headers(&root, &root, &mut headers)?;
+        Ok(headers)
+    }
+
     /// `CBuildOptions` that read the C library from this target.
     pub fn c_build_options(
         &self,
@@ -149,8 +171,68 @@ impl BuildTarget {
             source_path,
             runtime: self.c_library()?,
             library: false,
+            headers: self.headers()?,
         })
     }
+}
+
+/// Reads every file under `root` into `headers`, naming each by its path from `root`.
+///
+/// **Recurses, and names by relative path with `/` separators, because that is what a
+/// `#include` writes.** A header at `include/lazos/abi.h` is included as
+/// `#include <lazos/abi.h>`, and a sysroot whose nested headers were named by file name
+/// alone would put `abi.h` at the root of the include path — which compiles, and then
+/// picks up a *different* `abi.h` from somewhere else in the include path, which is the
+/// kind of bug that is found a week later.
+///
+/// Non-header files are skipped rather than refused. A sysroot's `include/` directory is
+/// a place a person might keep a note, and a build that refused to start because of a
+/// `README` would be a build whose failure has nothing to do with the program.
+fn collect_headers(
+    root: &Path,
+    directory: &Path,
+    headers: &mut crate::Headers,
+) -> Result<(), DriverError> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return Err(DriverError::Sysroot {
+                error: SysrootError::Io {
+                    path: directory.to_path_buf(),
+                    message: error.to_string(),
+                },
+            })
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| DriverError::Sysroot {
+            error: SysrootError::Io {
+                path: directory.to_path_buf(),
+                message: error.to_string(),
+            },
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_headers(root, &path, headers)?;
+            continue;
+        }
+        if path.extension().is_none_or(|extension| extension != "h") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).map_err(|error| DriverError::Sysroot {
+            error: SysrootError::Io {
+                path: path.clone(),
+                message: error.to_string(),
+            },
+        })?;
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        headers.insert(&relative, &text);
+    }
+    Ok(())
 }
 
 impl From<SysrootError> for DriverError {

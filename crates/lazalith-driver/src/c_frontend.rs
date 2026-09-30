@@ -131,6 +131,78 @@ pub struct CBuildOptions {
     /// linked into; demanding an entry point of it is asking a library to be a program.
     /// With this set, a missing `main` is the fact being stated rather than an error.
     pub library: bool,
+    /// The headers `#include` may find.
+    ///
+    /// **A list of texts, not a directory and not a trait object.** A build that knows
+    /// where its headers are has already read them, and handing the front end a map means
+    /// three things at once: the preprocessor's `IncludeResolver` stays a trait the caller
+    /// implements, `CBuildOptions` stays `Clone + Debug` with no lifetime and no `Box`,
+    /// and a build is *reproducible* — the headers a build used are the ones in this
+    /// struct, so a sysroot changing under a running build cannot change its output.
+    ///
+    /// Empty means "no headers", which is a fact and not a gap: a program with no
+    /// `#include` behaves identically with headers and without, and one *with* an
+    /// `#include` gets a diagnostic naming the header it could not find.
+    pub headers: Headers,
+}
+
+/// The headers a C build may include, as `(name, text)`.
+///
+/// **A newtype rather than a bare `Vec`,** because a `Vec<(String, String)>` in a build
+/// options struct is a field whose units are unclear, and the compiler turns that into a
+/// diagnostic about a tuple. The name is the one C spells: `lazos/syscall.h`, with the
+/// directory, and without the `<>` or `""` a program wrote around it.
+#[derive(Clone, Debug, Default)]
+pub struct Headers {
+    entries: Vec<(String, String)>,
+}
+
+impl Headers {
+    /// No headers.
+    pub fn new() -> Self {
+        Headers::default()
+    }
+
+    /// Adds a header, replacing any header of the same name.
+    pub fn insert(&mut self, name: &str, text: &str) {
+        self.entries
+            .retain(|(existing, _)| existing != name);
+        self.entries.push((name.to_string(), text.to_string()));
+    }
+
+    /// How many headers there are.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether there are none.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The names, sorted, which is what a diagnostic about a missing one should offer.
+    pub fn names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .entries
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// A resolver over these headers.
+    ///
+    /// The map the preprocessor takes, built from this list. Returning a resolver rather
+    /// than exposing the entries is what keeps the preprocessor's trait the only thing
+    /// that has to know how headers are stored.
+    pub fn resolver(&self) -> lazalith_c_compiler::MapIncludes {
+        let mut map = lazalith_c_compiler::MapIncludes::new();
+        for (name, text) in &self.entries {
+            map.insert(name, text);
+        }
+        map
+    }
 }
 
 impl CBuildOptions {
@@ -141,6 +213,7 @@ impl CBuildOptions {
             source_path: source_path.into(),
             runtime: String::from(lazalith_c_runtime::C_RUNTIME),
             library: false,
+            headers: Headers::new(),
         }
     }
 
@@ -160,7 +233,14 @@ impl CBuildOptions {
             source_path: source_path.into(),
             runtime: String::new(),
             library: false,
+            headers: Headers::new(),
         }
+    }
+
+    /// This build.s headers.
+    pub fn with_headers(mut self, headers: Headers) -> Self {
+        self.headers = headers;
+        self
     }
 }
 
@@ -206,7 +286,22 @@ pub fn compile_c(text: &str, options: &CBuildOptions) -> Result<ObjectFile, Driv
         unit
     };
     let mut sources = SourceManager::new();
-    let analysis = frontend::analyse(&mut sources, options.source_path.as_str(), &unit);
+    // The preprocessor gets the build's headers and the target's width. **Both, and in
+    // that order, because a header that picks a word size needs to know the target and a
+    // target that is wrong would otherwise be discovered by a link error.**
+    let mut resolver = options.headers.resolver();
+    let architecture = if options.architecture.word_bits() == 32 {
+        "lz32"
+    } else {
+        "lz64"
+    };
+    let mut includes = lazalith_c_compiler::Includes::for_arch(architecture, &mut resolver);
+    let analysis = frontend::analyse_for(
+        &mut sources,
+        options.source_path.as_str(),
+        &unit,
+        &mut includes,
+    );
     if !analysis.diagnostics.is_empty() {
         // Every diagnostic, each *rendered*. A stage boundary is the last place a
         // caller can still reach the source map, so a tool that reports

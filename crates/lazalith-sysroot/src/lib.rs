@@ -65,6 +65,8 @@ use lazalith_c_compiler::ctypes::CType;
 use lazalith_c_compiler::types::abi_signature;
 use lazalith_os_abi::ABI_SYSCALLS;
 use lazalith_toolchain::ObjectFile;
+pub mod freestanding;
+
 use lazalith_types::ArchitectureConfig;
 
 /// The four directories §19 names, in the order it lists them.
@@ -327,12 +329,13 @@ impl Sysroot {
             })?;
         }
         let sysroot = Self { root, flavour };
-        sysroot.write_headers()?;
+        sysroot.write_headers(architecture)?;
         sysroot.write_startup(architecture)?;
         if flavour.has_c_library() {
             sysroot.write_c_library()?;
             sysroot.write_runtime()?;
         }
+        sysroot.write_kernel_library()?;
         Ok(sysroot)
     }
 
@@ -473,25 +476,73 @@ impl Sysroot {
     }
 
     /// Every header this sysroot has, as `(name, text)`.
-    pub fn headers(&self) -> Vec<(String, String)> {
-        [
+    ///
+    /// **The freestanding ones are in both flavours, and that is not a mistake.** C says
+    /// `stddef.h`, `stdint.h` and `stdbool.h` are *freestanding headers*: an implementation
+    /// that cannot compile without them has not implemented freestanding, whatever else it
+    /// has. A hosted program includes them too, and including them from a hosted sysroot
+    /// costs three small files and saves a build that has two definitions of `size_t` in
+    /// it — one from a header and one from the C library.
+    pub fn headers(&self, architecture: ArchitectureConfig) -> Vec<(String, String)> {
+        let mut headers: Vec<(String, String)> = [
             ("lazos/abi.h", abi_header()),
             ("lazos/syscall.h", syscall_header()),
         ]
         .into_iter()
         .map(|(name, text)| (String::from(name), text))
-        .collect()
+        .collect();
+        for (name, text) in freestanding::freestanding_headers(u32::from(architecture.word_bits()))
+        {
+            headers.push((String::from(name), text));
+        }
+        headers
     }
 
-    fn write_headers(&self) -> Result<(), SysrootError> {
+    /// The freestanding library's text, composed in front of a kernel.
+    ///
+    /// **Refused in a hosted sysroot, the same way `c_library` is.** A hosted build gets
+    /// the C library, and a hosted build that also got `libk.c` would have two
+    /// `memcpy` definitions and a link error that says nothing about which one is wrong.
+    pub fn kernel_library(&self) -> Result<String, SysrootError> {
+        if self.flavour.has_c_library() {
+            return Err(SysrootError::NotInFlavour {
+                what: "kernel library",
+                flavour: self.flavour,
+            });
+        }
+        Ok(String::from(freestanding::KERNEL_LIBRARY))
+    }
+
+    fn write_kernel_library(&self) -> Result<(), SysrootError> {
+        // The freestanding library, written into `lib/` and named so that it is *not*
+        // `libc.c`. The name is load-bearing in one place: `open` infers the flavour from
+        // whether `lib/libc.c` exists, so a freestanding library that claimed the hosted
+        // name would make every freestanding sysroot look hosted the next time it is
+        // opened.
+        let path = self.lib().join(KERNEL_LIBRARY_FILE);
+        fs::write(&path, freestanding::KERNEL_LIBRARY).map_err(|error| SysrootError::Io {
+            path,
+            message: error.to_string(),
+        })
+    }
+
+    fn write_headers(&self, architecture: ArchitectureConfig) -> Result<(), SysrootError> {
         let include = self.include();
-        let lazos = include.join("lazos");
-        fs::create_dir_all(&lazos).map_err(|error| SysrootError::Io {
-            path: lazos.clone(),
+        let laz_os = include.join("lazos");
+        fs::create_dir_all(&laz_os).map_err(|error| SysrootError::Io {
+            path: laz_os.clone(),
             message: error.to_string(),
         })?;
-        for (name, text) in self.headers() {
-            let path = lazos.join(name.trim_start_matches("lazos/"));
+        for (name, text) in self.headers(architecture) {
+            // `lazos/abi.h` lives in a subdirectory and the rest do not, so the name is
+            // taken apart rather than joined onto a fixed path. A header at the root of
+            // `include/` and one a directory down are both ordinary C header layouts, and a
+            // sysroot that could only write one of them would be a layout rather than a
+            // sysroot.
+            let path = match name.split_once('/') {
+                Some((directory, file)) => include.join(directory).join(file),
+                None => include.join(&name),
+            };
             fs::write(&path, text).map_err(|error| SysrootError::Io {
                 path,
                 message: error.to_string(),
@@ -547,8 +598,15 @@ impl Sysroot {
 /// The Lazen runtime's file name inside `runtime/`.
 pub const RUNTIME_FILE: &str = "lazen-runtime.lz";
 
-/// The C library's file name inside `lib/`.
+/// The C library.s file name inside `lib/`.
+///
+/// **The name `open` infers the flavour from**, which is why the freestanding library
+/// below is called something else: a freestanding library that claimed this name would make
+/// every freestanding sysroot look hosted the moment it was opened again.
 pub const C_LIBRARY_FILE: &str = "libc.c";
+
+/// The freestanding library.s file name inside `lib/`.
+pub const KERNEL_LIBRARY_FILE: &str = "libk.c";
 
 /// The header that says what the ABI is, and that it is generated.
 pub fn abi_header() -> String {

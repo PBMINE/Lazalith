@@ -362,6 +362,7 @@ fn a_c_program_built_against_a_sysroot_runs() {
             source_path: String::from("sysroot.c"),
             runtime: library,
             library: false,
+            headers: sysroot_headers(&sysroot),
         },
     )
     .expect("a C program builds against the sysroot's library");
@@ -547,5 +548,198 @@ fn a_hosted_build_against_a_freestanding_sysroot_is_refused() {
     assert!(
         error.to_string().contains("freestanding") && error.to_string().contains("C library"),
         "and the refusal explains which sysroot it was and what it lacks: {error}"
+    );
+}
+
+/// The headers a sysroot has, as the driver would read them.
+///
+/// **A copy of what `BuildTarget::headers` does, and a copy is a smell** — so this is the
+/// smallest possible one: it exists because `lazalith-sysroot`'s tests must not depend on
+/// `lazalith-driver`'s view of a sysroot, since the whole point of `verify_c_library` is
+/// that the sysroot crate does not know about the driver. The driver reads the same files
+/// off the same disk, and `the_driver_reads_a_sysroots_headers_off_disk` is the test that
+/// says so.
+fn sysroot_headers(sysroot: &Sysroot) -> lazalith_driver::Headers {
+    let mut headers = lazalith_driver::Headers::new();
+    for (name, text) in sysroot.headers(ArchitectureConfig::lz64()) {
+        headers.insert(&name, &text);
+    }
+    headers
+}
+
+/// A freestanding sysroot has the things §22 lists, and they are not empty.
+///
+/// **The test that says "freestanding" is a place, not a refusal.** Until now
+/// `Sysroot::create` with `Freestanding` wrote two headers and a `lib/` with nothing in
+/// it, and `a_freestanding_sysroot_refuses_the_hosted_library` was true for the wrong
+/// reason: it was refusing a library that was never there in the first place. A
+/// freestanding environment with nothing in it cannot build anything, so the claim that
+/// it is a freestanding *environment* was not yet earned.
+#[test]
+fn a_freestanding_sysroot_has_headers_and_a_library() {
+    let scratch = Scratch::new("freestanding-full");
+    let sysroot = Sysroot::create(
+        &scratch.at("sysroot"),
+        SysrootFlavour::Freestanding,
+        ArchitectureConfig::lz64(),
+    )
+    .expect("a freestanding sysroot is created");
+
+    // The three headers C says a freestanding implementation must provide. All three, by
+    // name, because "has some headers" is not the claim.
+    for header in ["stddef.h", "stdint.h", "stdbool.h"] {
+        let path = sysroot.root().join("include").join(header);
+        assert!(
+            path.is_file(),
+            "a freestanding environment must provide <{header}>: C calls these the \
+             freestanding headers, and an implementation without them has not \
+             implemented freestanding"
+        );
+    }
+
+    // The kernel library, under a name that is not the hosted one.
+    let kernel = sysroot
+        .kernel_library()
+        .expect("a freestanding sysroot has a kernel library");
+    assert!(
+        kernel.contains("void *memcpy(") && kernel.contains("void *memset("),
+        "a kernel cannot boot without the byte functions, and this is the low-level \
+         runtime §22 asks for"
+    );
+    assert!(
+        kernel.contains("int laz_puts("),
+        "and a kernel that cannot print is a kernel whose bugs are invisible"
+    );
+    assert!(
+        !kernel.contains("printf") && !kernel.contains("fopen(") && !kernel.contains("malloc"),
+        "and none of the hosted library: a freestanding environment has no heap, no files \
+         and no buffered output, and a library that declared them would be promising what \
+         the environment cannot deliver"
+    );
+
+    // And the hosted library is still refused, which is the distinction §19 and §22 are
+    // about. This is the assertion that means something now that there is a library here.
+    assert!(
+        sysroot.c_library().is_err(),
+        "a freestanding sysroot still has no C library, and now that it has a kernel \
+         library the refusal is about the *right* library"
+    );
+}
+
+/// The freestanding headers are generated from the target, so the two targets differ.
+///
+/// **And they differ in the way that matters.** A 32-bit target gets a 32-bit `size_t` and
+/// a `SIZE_MAX` it can actually represent. If both targets got the same text, the
+/// generated-header argument — that a hand-written copy is a second place for the answer
+/// to live — would be true of these headers too, and the whole reason they are generated
+/// would be missing.
+#[test]
+fn the_freestanding_headers_follow_the_target() {
+    let scratch_wide = Scratch::new("freestanding-lz64");
+    let scratch_narrow = Scratch::new("freestanding-lz32");
+    let wide = Sysroot::create(
+        &scratch_wide.at("sysroot"),
+        SysrootFlavour::Freestanding,
+        ArchitectureConfig::lz64(),
+    )
+    .expect("an lz64 sysroot");
+    let narrow = Sysroot::create(
+        &scratch_narrow.at("sysroot"),
+        SysrootFlavour::Freestanding,
+        ArchitectureConfig::lz32(),
+    )
+    .expect("an lz32 sysroot");
+
+    let stdint_of = |sysroot: &Sysroot| {
+        std::fs::read_to_string(sysroot.root().join("include").join("stdint.h"))
+            .expect("the header is on disk")
+    };
+    let wide_text = stdint_of(&wide);
+    let narrow_text = stdint_of(&narrow);
+    assert_ne!(
+        wide_text, narrow_text,
+        "the two targets get different <stdint.h>, because the widths in it are the \
+         target's and not the header's"
+    );
+    assert!(
+        wide_text.contains("#define SIZE_MAX 0xffffffffffffffffu"),
+        "and lz64 says so"
+    );
+    assert!(
+        narrow_text.contains("#define SIZE_MAX 0xffffffffu"),
+        "and lz32 says so, rather than claiming a size it cannot address"
+    );
+    assert!(
+        narrow_text.contains("typedef unsigned int uint32_t;"),
+        "a 32-bit target's uint32_t is its own word"
+    );
+    assert!(
+        wide_text.contains("typedef unsigned long uint32_t;"),
+        "and a 64-bit target's uint32_t is half its word"
+    );
+}
+
+/// The generated headers go through the C front end, because that is what a kernel does.
+///
+/// **A header that does not compile is not a header.** Both freestanding headers and both
+/// LazOS headers are fed to the front end, and a program that includes them is compiled.
+/// This is the test that would catch a `#define` with a typo in it, which is otherwise
+/// invisible until a kernel is halfway through booting.
+#[test]
+fn the_freestanding_headers_compile_and_are_usable() {
+    let scratch = Scratch::new("freestanding-compile");
+    let sysroot = Sysroot::create(
+        &scratch.at("sysroot"),
+        SysrootFlavour::Freestanding,
+        ArchitectureConfig::lz64(),
+    )
+    .expect("a freestanding sysroot");
+
+    // Every header, on its own, must be includable. A header that needs another one to be
+    // included first is a header that a program will get wrong.
+    for (name, text) in sysroot.headers(ArchitectureConfig::lz64()) {
+        let mut sources = lazalith_types::SourceManager::new();
+        let analysis = lazalith_c_compiler::frontend::analyse(
+            &mut sources,
+            &format!("{name}.probe"),
+            &text,
+        );
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "the generated header {name} is not valid C on its own: {}",
+            analysis
+                .diagnostics
+                .first()
+                .map(|error| error.render())
+                .unwrap_or_default()
+        );
+    }
+
+    // And a program that uses them the way a kernel would.
+    let program = "#include <stdint.h>\n\
+                   #include <stddef.h>\n\
+                   #include <stdbool.h>\n\
+                   #include <lazos/syscall.h>\n\
+                   unsigned long main(void) {\n\
+                     uint32_t small = 7u;\n\
+                     size_t width = sizeof(uint64_t);\n\
+                     bool set = true;\n\
+                     if (!set) { return 1; }\n\
+                     return small + width;\n\
+                   }";
+    let object = lazalith_driver::compile_c(
+        program,
+        &lazalith_driver::CBuildOptions {
+            architecture: ArchitectureConfig::lz64(),
+            source_path: String::from("kernel.c"),
+            runtime: sysroot.kernel_library().expect("the kernel library"),
+            library: false,
+            headers: sysroot_headers(&sysroot),
+        },
+    );
+    assert!(
+        object.is_ok(),
+        "a freestanding program that includes a sysroot's headers builds: {}",
+        object.err().map(|error| error.to_string()).unwrap_or_default()
     );
 }

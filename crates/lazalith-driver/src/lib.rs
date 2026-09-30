@@ -70,7 +70,7 @@ mod lazen_frontend;
 mod target;
 pub mod tools;
 
-pub use c_frontend::{C_OBJECT_ENTRY, CBuildOptions, CFrontendError, compile_c};
+pub use c_frontend::{C_OBJECT_ENTRY, CBuildOptions, CFrontendError, Headers, compile_c};
 pub use lazen_frontend::{LazenFrontendError, compile_lazen};
 pub use target::BuildTarget;
 
