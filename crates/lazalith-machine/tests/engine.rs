@@ -30,7 +30,7 @@
 //! allow either.
 
 use lazalith_cpu::{
-    ArchitecturalState, CpuFault, CpuMemory, EngineError, EngineKind, ExecutionContextId,
+    ArchitecturalState, CpuMemory, EngineError, EngineFault, EngineKind, ExecutionContextId,
     ExecutionEngine, Privilege, Processor, ReferenceInterpreter, StatusRegister, StepResult,
 };
 use lazalith_devices::{ConsoleDevice, DeviceId, DeviceManager};
@@ -74,7 +74,7 @@ impl<M: CpuMemory> ExecutionEngine<M> for Counting {
         &mut self,
         processor: &mut Processor,
         memory: &mut M,
-    ) -> Result<StepResult, CpuFault<M::Error>> {
+    ) -> Result<StepResult, EngineFault<M::Error>> {
         let result = ReferenceInterpreter::new().step(processor, memory)?;
         self.steps += 1;
         // The cost is forwarded, not recomputed. A wrapper around the reference engine
@@ -89,7 +89,7 @@ impl<M: CpuMemory> ExecutionEngine<M> for Counting {
         processor: &mut Processor,
         instruction: &Instruction,
         memory: &mut M,
-    ) -> Result<StepResult, CpuFault<M::Error>> {
+    ) -> Result<StepResult, EngineFault<M::Error>> {
         self.steps += 1;
         ReferenceInterpreter::new().execute(processor, instruction, memory)
     }

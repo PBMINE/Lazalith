@@ -642,3 +642,109 @@ fn continue_still_reports_the_programs_own_end() {
         outcome.reason
     );
 }
+
+/// A booted controller with `SOURCE` loaded, optionally on a chosen engine.
+///
+/// **The engine is chosen *before* the program is loaded, and that is not incidental.** A
+/// machine refuses an engine switch while a user execution context is active, because the
+/// scheduler is between two steps of a guest process and would not observe the change —
+/// B3.s rule, and a good one. So the only moment a debugger can change engines is before a
+/// program exists, and these tests live with that rather than reaching past it: the
+/// alternative would be for `DebugController` to own a queued engine preference and apply
+/// it at a context boundary, which is a larger feature and not one this stage needs.
+fn debug_on(source: &str, engine: lazalith_cpu::EngineKind) -> DebugController<NoDevice> {
+    let config = ArchitectureConfig::lz64();
+    let mut controller = DebugController::boot(
+        config,
+        &supervisor_kernel(config),
+        8u64,
+        VirtualTerminal::new(b"").expect("a terminal"),
+        VirtualFileSystem::with_defaults().expect("a filesystem"),
+        DeviceManager::<NoDevice>::new(),
+    )
+    .expect("the controller boots");
+    controller
+        .set_execution_engine(engine)
+        .unwrap_or_else(|error| panic!("{engine} could not be selected: {error}"));
+    controller
+        .load_image(build(source), PID, TID)
+        .expect("the program is scheduled");
+    controller
+}
+
+/// The same breakpoint, the same program, on both engines — and the JIT stops too.
+///
+/// **§11's "breakpoint during JIT execution", tested through the debugger's own API and
+/// not through the machine's.** The existing breakpoint test above covers the
+/// single-instruction case, where "stop at the breakpoint" is automatic. This one runs the
+/// identical program with a JIT installed, and the interesting failure is specific: a JIT
+/// block covering the breakpoint would retire past it in one step, every register would be
+/// correct, and the debugger would report a stop at the end of the block instead of at the
+/// address the user asked about. The controller never learns the JIT exists — it calls
+/// `run`, and the engine is the machine's business — which is the layering the test is
+/// here to confirm.
+///
+/// The interpreter run is not decoration: it establishes the *correct* answer, so a JIT
+/// that stopped somewhere else would be caught rather than merely stopping *somewhere*.
+#[test]
+fn a_breakpoint_is_honoured_on_every_engine() {
+    for engine in lazalith_cpu::EngineKind::ALL {
+        let mut controller = debug_on(SOURCE, *engine);
+        let start = after_handoff(&mut controller);
+        assert_eq!(
+            controller.execution_engine(),
+            *engine,
+            "the engine survived the load"
+        );
+
+        let target = start + 5 * 8;
+        assert!(
+            controller
+                .session_mut(PID)
+                .expect("a session")
+                .set_breakpoint(target)
+                .expect("an aligned breakpoint"),
+            "the breakpoint was new"
+        );
+
+        let outcome = controller.run(PID).expect("a run");
+        assert_eq!(
+            outcome.reason,
+            StopReason::Breakpoint { address: target },
+            "{engine} stopped at the breakpoint rather than past it"
+        );
+        assert_eq!(
+            outcome.registers.pc(),
+            target,
+            "{engine} left the program counter on the breakpoint, so the instruction there \
+             has not run"
+        );
+    }
+}
+
+/// Single-stepping on a JIT still advances by one instruction's worth of state.
+///
+/// **The other half of breakpoint fidelity.** A block-executing engine retires several
+/// instructions per `step`, so a debugger that reported "stepped once" while a dozen
+/// instructions retired would make single-stepping useless. This asserts what is actually
+/// guaranteed — that the machine retires at least one instruction and the program counter
+/// moves — rather than that it retires exactly one, because a block is allowed to retire
+/// more and the honest contract is the block's own boundary.
+#[test]
+fn single_stepping_works_on_every_engine() {
+    for engine in lazalith_cpu::EngineKind::ALL {
+        let mut controller = debug_on(SOURCE, *engine);
+        let mut pc = after_handoff(&mut controller);
+
+        for _ in 0..4 {
+            controller.step(PID).expect("a step");
+            let next = controller.registers().pc();
+            assert!(
+                next > pc,
+                "{engine} advanced the program counter from {pc:x} to {next:x}"
+            );
+            pc = next;
+        }
+        assert!(controller.machine().executed_instruction_count() >= 4);
+    }
+}

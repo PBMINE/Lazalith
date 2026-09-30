@@ -53,6 +53,7 @@ use alloc::string::String;
 
 use lazalith_cpu::{CpuMemory, Processor};
 use lazalith_isa::{Instruction, Operand, decode};
+use lazalith_types::InstructionAddress;
 
 use crate::Decline;
 use crate::x86::{Code, Reg};
@@ -247,6 +248,7 @@ pub const fn register_offset(index: u8) -> i32 {
 pub fn translation_of<M: CpuMemory>(
     processor: &Processor,
     memory: &mut M,
+    boundary: Option<InstructionAddress>,
 ) -> Result<Translated, Decline> {
     let config = processor.config();
 
@@ -256,6 +258,13 @@ pub fn translation_of<M: CpuMemory>(
     // worse outcome than a slow one.
     if config.word_bits() != 64 {
         return Err(Decline::UnsupportedWordWidth);
+    }
+
+    // A boundary at or below the current program counter would exclude the instruction
+    // the block was asked to start at, leaving nothing to run and declining forever. The
+    // machine refuses to set such a boundary; this is the translator not trusting that.
+    if boundary.is_some_and(|at| at <= processor.architectural().pc()) {
+        return Err(Decline::NotTranslatable);
     }
 
     let mut pc = processor.architectural().pc();
@@ -279,6 +288,15 @@ pub fn translation_of<M: CpuMemory>(
     // was a bug that produced wrong answers rather than a fault.
     let mut instructions: Vec<Instruction> = Vec::new();
     for _ in 0..MAX_BLOCK {
+        // **The boundary ends the block *before* the instruction it names.** Checked at
+        // the top of the loop, before the instruction is fetched — checking after it was
+        // appended let one instruction too many into the block, and the block then ran
+        // through the breakpoint the debugger had set. That is precisely the bug a
+        // boundary exists to prevent, committed in the boundary's own code, and it is why
+        // the position of this line and not just its presence is load-bearing.
+        if boundary == Some(pc) {
+            break;
+        }
         let Ok(bytes) = memory.fetch_instruction(config, pc, processor.privilege()) else {
             break;
         };

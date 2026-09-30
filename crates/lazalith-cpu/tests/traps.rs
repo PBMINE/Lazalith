@@ -2,8 +2,8 @@
 mod support;
 
 use lazalith_cpu::{
-    ArchitecturalState, CpuFault, CpuFaultCause, ExecutionEngine, OutcomeApplication, Privilege,
-    ReferenceInterpreter, TrapCause, TrapSnapshot,
+    ArchitecturalState, CpuFault, CpuFaultCause, EngineFault, ExecutionEngine, OutcomeApplication,
+    Privilege, ReferenceInterpreter, TrapCause, TrapSnapshot,
 };
 use lazalith_isa::{ControlRegister, Opcode, Operand};
 use support::{MODES, Ram, cpu, instruction, r};
@@ -224,10 +224,10 @@ fn double_trap_retains_first_and_second_contexts_without_nesting() {
                     &instruction(config, opcode, &operands),
                     &mut ram
                 ),
-                Err(CpuFault {
+                Err(EngineFault::Guest(CpuFault {
                     cause: CpuFaultCause::TerminalTrap,
                     ..
-                })
+                }))
             ));
             assert_eq!(cpu.architectural(), &before);
         }
@@ -238,10 +238,10 @@ fn double_trap_retains_first_and_second_contexts_without_nesting() {
                 &instruction(config, Opcode::Rfe, &[]),
                 &mut ram
             ),
-            Err(CpuFault {
+            Err(EngineFault::Guest(CpuFault {
                 cause: CpuFaultCause::TerminalTrap,
                 ..
-            })
+            }))
         ));
         assert_eq!(cpu.architectural(), &before_return);
         assert_eq!(cpu.traps().frame(), Some(&first));

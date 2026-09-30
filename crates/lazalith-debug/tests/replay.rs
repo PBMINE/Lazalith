@@ -293,7 +293,7 @@ fn a_different_binary_replays_differently() {
     let other = session(COUNTER, &log).run(100).expect("the run finishes");
     assert_eq!(
         add.difference(&other).as_deref(),
-        Some("the number of instructions"),
+        Some("the number of steps the replay took"),
         "two different programs produced the same trace"
     );
 }
@@ -434,4 +434,136 @@ fn two_runs_of_a_program_that_halts_agree_on_everything() {
     assert_eq!(run.time, again.time);
     assert_eq!(run.delivered, again.delivered);
     assert_eq!(run.in_trap, again.in_trap);
+}
+
+/// A replay produces the same trace however the execution engine is scheduled.
+///
+/// **§11's "deterministic replay across engine switches", and the strongest claim in this
+/// stage.** A replay is only worth having if it reproduces a run *regardless of how the
+/// machine executed it*; a trace that depended on the engine would mean a bug report
+/// captured on one host could not be reproduced on another, or could not be reproduced at
+/// all after a JIT changed how it chunks blocks.
+///
+/// # What is compared, and what is deliberately not
+///
+/// **Everything except [`Trace::steps`], and the exclusion is the point rather than a
+/// convenience.** `steps` counts how many times the replay loop called the machine, and a
+/// JIT needs fewer calls than an interpreter for the same program — that is the JIT working,
+/// not a determinism failure. The field that *must* match is
+/// [`Trace::instructions`]: the number of guest instructions retired, which a guest can
+/// read through the machine and which must therefore be the same however the machine
+/// executed them.
+///
+/// So this compares the stop reason, the sixteen registers, PC, SP, status, virtual time,
+/// the input events delivered, the open-trap flag, and the retired instruction count. A
+/// JIT whose flags or clock drifted by even one cycle would be caught; one that merely
+/// chunked differently would pass, correctly.
+#[test]
+fn replay_is_engine_independent() {
+    let log = InputLog::new();
+    let plain = session(SOURCE, &log)
+        .run(4_000)
+        .expect("the interpreter-only replay runs");
+
+    // Schedules from "the JIT for the whole run" to "change engine on almost every
+    // boundary", because the interesting failures are at the boundaries.
+    let schedules: [&[(u64, lazalith_cpu::EngineKind)]; 5] = [
+        &[(0, lazalith_cpu::EngineKind::Jit)],
+        &[(0, lazalith_cpu::EngineKind::Optimized)],
+        &[
+            (0, lazalith_cpu::EngineKind::Jit),
+            (1, lazalith_cpu::EngineKind::Reference),
+        ],
+        &[
+            (0, lazalith_cpu::EngineKind::Jit),
+            (1, lazalith_cpu::EngineKind::Optimized),
+        ],
+        &[
+            (0, lazalith_cpu::EngineKind::Jit),
+            (1, lazalith_cpu::EngineKind::Reference),
+            (1, lazalith_cpu::EngineKind::Jit),
+        ],
+    ];
+
+    for schedule in schedules {
+        let trace = ReplaySession::with_engine_schedule(&image(SOURCE), &state(), &log, schedule)
+            .expect("the session starts")
+            .run(4_000)
+            .expect("the scheduled replay runs");
+        assert_engine_independent(&trace, &plain, schedule);
+    }
+}
+
+/// Asserts two traces agree on everything a guest could observe, and names the first
+/// field that differs.
+fn assert_engine_independent(
+    trace: &Trace,
+    plain: &Trace,
+    schedule: &[(u64, lazalith_cpu::EngineKind)],
+) {
+    if trace.instructions != plain.instructions {
+        panic!(
+            "the engine schedule {schedule:?} retired {} instructions against the \
+             interpreter's {}",
+            trace.instructions, plain.instructions
+        );
+    }
+    if trace.stop != plain.stop {
+        panic!("the engine schedule {schedule:?} stopped for a different reason");
+    }
+    if trace.registers != plain.registers {
+        panic!("the engine schedule {schedule:?} left different registers");
+    }
+    if trace.pc != plain.pc {
+        panic!("the engine schedule {schedule:?} stopped at a different address");
+    }
+    if trace.sp != plain.sp {
+        panic!("the engine schedule {schedule:?} left a different stack pointer");
+    }
+    if trace.status != plain.status {
+        panic!(
+            "the engine schedule {schedule:?} left a different status register: {:#b} \
+             against {:#b}",
+            trace.status, plain.status
+        );
+    }
+    if trace.time != plain.time {
+        panic!(
+            "the engine schedule {schedule:?} advanced virtual time differently: {:?} \
+             against {:?}",
+            trace.time, plain.time
+        );
+    }
+    if trace.delivered != plain.delivered {
+        panic!("the engine schedule {schedule:?} delivered different input");
+    }
+    if trace.in_trap != plain.in_trap {
+        panic!("the engine schedule {schedule:?} left a different trap state");
+    }
+}
+
+/// A schedule that switches at the first instruction is honoured, not ignored.
+///
+/// **The reason the test above could pass vacuously.** `with_engine_schedule` applies its
+/// first entry before the first step, and a replay that ran a whole block in one call
+/// would need fewer steps than the interpreter — which is the observable signature of the
+/// schedule having taken effect. So this asserts the step count *did* change, and that the
+/// architectural trace did not.
+#[test]
+fn a_replay_engine_schedule_actually_switches_engines() {
+    let log = InputLog::new();
+    let schedule = &[(0, lazalith_cpu::EngineKind::Jit)];
+    let scheduled = ReplaySession::with_engine_schedule(&image(SOURCE), &state(), &log, schedule)
+        .expect("the session starts")
+        .run(4_000)
+        .expect("the replay runs");
+    let plain = session(SOURCE, &log).run(4_000).expect("the plain one too");
+    assert!(
+        scheduled.steps < plain.steps,
+        "the JIT needed {} calls where the interpreter needed {} — if they are equal the \
+         schedule never took effect and the test above proved nothing",
+        scheduled.steps,
+        plain.steps
+    );
+    assert_engine_independent(&scheduled, &plain, schedule);
 }

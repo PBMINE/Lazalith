@@ -1,9 +1,9 @@
 use crate::outcome::StepResult;
 use crate::{
     ControlStateError, ControlTarget, CpuFault, CpuFaultCause as Cause, CpuMemory, DataAccess,
-    DataAccessKind, EngineKind, ExecutionEngine, ExecutionOutcome as Outcome, ExecutionState,
-    FetchedInstruction, OutcomeApplication, Privilege, Processor, StackEffect, TrapRequest,
-    checked_next_pc, checked_return_sp, prepare_outcome, validate_pc,
+    DataAccessKind, EngineFault, EngineKind, ExecutionEngine, ExecutionOutcome as Outcome,
+    ExecutionState, FetchedInstruction, OutcomeApplication, Privilege, Processor, StackEffect,
+    TrapRequest, checked_next_pc, checked_return_sp, prepare_outcome, validate_pc,
 };
 use lazalith_isa::{ControlRegister, DataSize, Instruction, Opcode, Operand, decode};
 use lazalith_types::{InstructionAddress, VirtualAddress, WordWidth};
@@ -67,6 +67,51 @@ impl<M: CpuMemory> ExecutionEngine<M> for ReferenceInterpreter {
         &mut self,
         processor: &mut Processor,
         memory: &mut M,
+    ) -> Result<StepResult, EngineFault<M::Error>> {
+        self.step_guest(processor, memory)
+            .map_err(EngineFault::Guest)
+    }
+
+    fn step_bytes(
+        &mut self,
+        processor: &mut Processor,
+        bytes: &[u8],
+        memory: &mut M,
+    ) -> Result<StepResult, EngineFault<M::Error>> {
+        self.step_bytes_guest(processor, bytes, memory)
+            .map_err(EngineFault::Guest)
+    }
+
+    fn execute(
+        &mut self,
+        processor: &mut Processor,
+        instruction: &Instruction,
+        memory: &mut M,
+    ) -> Result<StepResult, EngineFault<M::Error>> {
+        self.execute_checked(processor, instruction, memory)
+            .map_err(EngineFault::Guest)
+    }
+}
+
+impl ReferenceInterpreter {
+    /// # The Reference Interpreter never declines
+    ///
+    /// **That is not an accident of this implementation, it is what the engine is.**
+    /// It is the semantic authority and the last line of defence: if it declined an
+    /// instruction, the machine would have nowhere to hand it, and §11's "hand the
+    /// instruction back to the interpreter" would have no destination. So the three
+    /// methods below are the whole implementation and they can only fail with a guest
+    /// fault.
+    ///
+    /// They are kept separate from the trait methods for one further reason: the fifty
+    /// `?` sites in the semantics below all produce `CpuFault`, and leaving the
+    /// bodies in guest-fault shape means none of them had to be rewritten. The trait
+    /// methods are the one place that decides the answer can only ever be a guest
+    /// fault, which is exactly the claim worth making in a single place.
+    fn step_guest<M: CpuMemory>(
+        &mut self,
+        processor: &mut Processor,
+        memory: &mut M,
     ) -> Result<StepResult, CpuFault<M::Error>> {
         Self::validate_fetch(processor)?;
         let config = processor.config();
@@ -92,7 +137,7 @@ impl<M: CpuMemory> ExecutionEngine<M> for ReferenceInterpreter {
         self.execute_checked(processor, &instruction, memory)
     }
 
-    fn step_bytes(
+    fn step_bytes_guest<M: CpuMemory>(
         &mut self,
         processor: &mut Processor,
         bytes: &[u8],
@@ -107,15 +152,6 @@ impl<M: CpuMemory> ExecutionEngine<M> for ReferenceInterpreter {
             )
         })?;
         self.execute_checked(processor, &instruction, memory)
-    }
-
-    fn execute(
-        &mut self,
-        processor: &mut Processor,
-        instruction: &Instruction,
-        memory: &mut M,
-    ) -> Result<StepResult, CpuFault<M::Error>> {
-        self.execute_checked(processor, instruction, memory)
     }
 }
 

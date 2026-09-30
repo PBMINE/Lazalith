@@ -9435,3 +9435,219 @@ switch rule from B21, which is still a prerequisite.
 declined instruction, a fault, and a debug event back to the interpreter, and the guest
 cannot tell. This stage's single-block page and its `JitDeclined` signal are what it
 builds on, and the `Faulted`-machine switch rule is its first question.
+
+---
+
+# B23 — live interpreter ↔ JIT handoff (§11)
+
+## The result, first
+
+**A machine can now execute a program across both engines, in either order, repeatedly, and
+the guest cannot tell.** The JIT runs blocks as host code, declines what it cannot, and the
+Reference Interpreter runs that instruction; the machine charges virtual time from whichever
+engine retired the work; and a debugger's breakpoints are not run over. 1689 tests pass.
+
+## The one decision everything else follows from
+
+**A decline is a different *type* from a fault, and that is what makes the handoff possible.**
+
+B22 signalled "the JIT cannot run this" with `CpuFaultCause::JitDeclined` — a variant inside
+the guest's fault type. The machine treated every engine `Err` as a guest fault and entered a
+trap. So a program was trapped, visibly, for using an instruction the JIT had not learned
+yet; and if the trap could not be entered the machine went terminally `Faulted` over a
+compiler limitation. `trap_cause` had a comment saying that arm was "unreachable in the
+right design" — and the machine reached it on nearly every instruction.
+
+A comment saying *unreachable* is a wish. A type that cannot carry the value is a fact:
+
+| | type | meaning | the machine's answer |
+|---|---|---|---|
+| the guest did something wrong | `CpuFault<E>` | a guest fault | enter a trap |
+| **this engine** cannot run here | `EngineDecline` | an engine limitation | hand the instruction to another engine |
+| either of those | `EngineFault<E>` | the sum the trait returns | `match`, and you must write both arms |
+
+`CpuFaultCause::JitDeclined` is **deleted**. `EngineFault` is a two-variant sum, so
+`step_inner` cannot route a decline into `enter_trap` without an arm that says so, and the
+compiler will not let that arm be forgotten. The Reference Interpreter and
+`FastInterpreter` wrap their existing `CpuFault`-shaped bodies with `.map_err(EngineFault::Guest)`
+and are otherwise untouched, which is why the change is small: the only thing that can ever
+fail in them is a guest fault, and that is now a claim about the type rather than a
+convention.
+
+## Question 1: does `MachineState::Faulted` conflate two things?
+
+**No — and the answer is that the conflation was somewhere else entirely.**
+
+`Faulted` is set in exactly two places, and both are genuinely terminal:
+
+- `finish_trap`, when `Processor::enter_*` **failed** — the machine could not enter the trap
+  a guest fault or an interrupt required. It has lost the ability to continue, and §11's
+  handoff rules do not apply because there is no guest state left to hand over.
+- `try_external_interrupt`, when the interrupt controller refused to acknowledge an
+  interrupt that had just been delivered.
+
+Neither is an engine capability limit. So `Faulted` keeps its meaning unchanged,
+`switch_execution_engine`'s refusal for a `Faulted` machine stays correct (it *is* "a reset
+wearing a disguise"), and **no new machine state was introduced.** The smallest correct
+distinction turned out to be one type in `lazalith-cpu` and a `match` arm in the machine,
+not a lifecycle change.
+
+What *was* wrong is that an engine's inability was being routed into the fault path at all.
+Fixed at the type, not at the call site.
+
+## The handoff, and why it is precise
+
+```
+LazalithMachine
+   engine  ──▶ Box<dyn ExecutionEngine>   ← the active one, switchable
+   fallback ─▶ Box<dyn ExecutionEngine>   ← always the ReferenceInterpreter
+   processor ─▶ Processor                  ← the ONE canonical architectural state
+```
+
+**Two engine *values*, one architectural state.** The fallback borrows the same
+`&mut self.processor` for the length of one step, which is the arrangement B3 built and the
+reason there is nothing to reconcile. The fallback is held rather than constructed per
+decline because constructing one is a `Box` allocation on a path taken by most instructions
+in a register-only JIT.
+
+Precision rests on one obligation, which `ExecutionEngine` now states and the JIT asserts:
+**a decline must leave the `Processor` exactly as it was found.** So
+
+- the program counter still names the declined instruction, and the interpreter runs *that*
+  one — not a re-execution of something the JIT retired, not a skip past something it could
+  not;
+- no register, no flag, no clock tick and no memory byte was written;
+- `executed` and `last_cycles` advance by the *interpreter's* answer, so a run that spends
+  most of its time declining costs what the guest did and not what the engine tried.
+
+`a_faulting_instruction_declined_by_the_jit_still_traps` is the sharpest of these tests: a
+load the JIT cannot even translate, at an address that faults. The handoff must report the
+*fault*, with the interpreter's cause and resume address — not the decline, and not a machine
+error. A guest that installs a fault handler has to work identically on both engines.
+
+## Two counting bugs the handoff exposed
+
+Both are in code that predated B23 and both were only visible once an engine could retire
+more than one instruction per call.
+
+1. **`executed` advanced by one per `step`**, so a machine running a 31-instruction block
+   under-counted by 30 — and `run(limit)`, which counts retired instructions against its
+   limit, would have run roughly thirty times further than asked. It now advances by
+   `StepResult::instructions`, and `executed_instruction_count` is public because B24
+   measures against it.
+2. **`native_instructions` would have read zero the moment a JIT was switched away from**,
+   because the count lives on the engine object and `switch_execution_engine` drops that
+   object. A test that switched `interpreter → JIT → interpreter` and then asked how much the
+   JIT did would have been told "none" about the one segment that used it. The machine now
+   banks the outgoing engine's count at every switch, so a run that used a JIT at any point
+   reports it however many times the engine changed afterwards.
+
+## Breakpoints: a JIT must not run over one
+
+**A block-executing engine can be observably wrong about debugging while computing
+everything correctly.** Without help, a block covering a breakpoint retires past it in one
+call: every register is right and the debugger reports a stop the guest never took.
+
+`ExecutionEngine::set_yield_boundary` is the contract — *do not execute an instruction **at**
+this address* — and `LazalithMachine::set_yield_points` is the debugger's way to set it.
+`DebugController` pushes every live session's breakpoints down before every step, including
+during single-stepping, and a suspended breakpoint is not pushed at all (it would make the
+JIT stop somewhere the debugger will not report, which is worse than not stopping).
+
+**The machine filters addresses at or below the program counter.** A caller that has been
+told to stop has already done so; re-arming that address would exclude the instruction about
+to run, the JIT would have nothing to translate, and the machine would decline every step
+forever. `a_machine_with_no_able_engine_reports_it_rather_than_trapping` pins that.
+
+Two things the boundary got wrong on the way, both caught by the first breakpoint test:
+
+- the check sat *after* the instruction was appended, so one instruction too many went into
+  the block and the block ran through the breakpoint — the boundary's own code committing the
+  bug the boundary exists to prevent;
+- the block cache was keyed on the guest address alone, so a block compiled with no boundary
+  could be returned for a machine that had since set one. The boundary is part of the cache
+  key now, and `Compiled` records it.
+
+`a_breakpoint_is_honoured_on_every_engine` runs the same program with the same breakpoint on
+every engine through the debugger's own API. The controller never learns a JIT exists — it
+calls `run`, and the engine is the machine's business — which is the layering.
+
+## Snapshot, restore, replay
+
+**A snapshot is a statement about guest-visible state, and B23 is the test of that.** A
+snapshot taken with the JIT installed and the JIT having run natively is restored onto a
+machine that has never seen a JIT, and the interpreter finishes the program. The JIT's
+private state is not in the snapshot and is regenerated on demand.
+
+**Replay is engine-independent, and the claim needed a new field to make.** `Trace::steps`
+counts calls into the machine, and a JIT needs fewer of them for the same program — that is
+the JIT working, not a determinism failure. So `Trace` now also carries
+`instructions`: the retired guest-instruction count, which a guest can read through the
+machine and which must be identical however the machine executed. `replay_is_engine_independent`
+runs five engine schedules — including one that changes engine after every single
+instruction — and compares stop reason, all sixteen registers, PC, SP, status, **virtual
+time**, delivered input, trap state, and the instruction count. A JIT whose flags or clock
+drifted by one cycle fails it; one that merely chunked differently passes.
+
+`ReplaySession::with_engine_schedule` takes the schedule as `(retired instructions, engine)`
+— counted in retired instructions rather than steps precisely so a schedule means the same
+guest position on every engine.
+
+## What the tests are, and how they avoid being vacuous
+
+`crates/lazalith-machine/tests/handoff.rs` and two additions to the debugger and replay
+suites. The central problem with handoff testing is that **a JIT that declines everything
+leaves architectural state identical to a correct run**, because the interpreter is the
+oracle and it is correct. So every meaningful test asserts `native_instructions() > 0`
+*before* it asserts on state, and the replay test asserts the schedule changed the step
+count before it asserts the trace did not change.
+
+The second problem is the opposite one: **a JIT legitimately retires a whole block in one
+call, so two runs cannot be compared after the same number of `step()` calls.** An early
+version of these tests did exactly that and reported disagreement at every step count — the
+registers matched, the program counters were four instructions apart, and the "failure" was
+the block size. Comparisons are now made at equal *retired instruction* counts:
+`compare_equivalent` runs the subject, reads what it actually retired, and runs a fresh
+reference to precisely that number.
+
+## Automatic switching, and why it is opt-in
+
+`use_jit_after(n)` implements §11's "interpreter → hot code identified → JIT compiles →
+JIT continues", switching at an instruction boundary with the architectural state untouched.
+**It is not the default, because for most guest code it would make things slower**: the JIT
+translates straight-line register operations, real programs are memory traffic and control
+flow, and a default that pays a failed translation per instruction while running nothing
+natively is not a default. B24 measures that rather than assuming it, and the measurement is
+the reason this is opt-in.
+
+## Limitations at the end of this stage
+
+1. **The JIT still translates only straight-line register operations.** Memory is declined,
+   so the handoff fires on every load and store — which makes it *well exercised* and makes
+   it slow. §10's "memory is part of the real handoff" is answered by declining at the
+   memory operand and letting the canonical `CpuMemory` perform every guest data access: no
+   second guest memory model, no bypassed permissions, no device window inlined. Inlining a
+   memory access would mean reproducing the bus's permission checks, the address
+   translation and the fault-carrying struct in host code, where a divergence is a
+   memory-safety bug rather than a wrong answer. That is the next JIT step, not this one.
+2. **One block per page**, so a translated block is never run twice and the cache currently
+   earns nothing. Unchanged from B22.
+3. **An engine switch is still refused during an active user execution context.** Correct
+   and unchanged (B3), and it is why a debugger chooses the engine before a program is
+   loaded; a queued preference applied at a context boundary is a larger feature.
+4. **The JIT is still x86-64 only** and 32-bit guests are still declined.
+5. **No measurement yet.** B24.
+6. **aarch64-linux unchecked.**
+
+## Validation
+
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace --all-targets -- -D warnings` ✅
+- `cargo test --workspace`: **1689 passed, 0 failed** (15 new)
+- `nix flake check`, `nix build` ✅
+
+## Next stage
+
+**B24, differential JIT verification and measurement** — a corpus that runs equivalent
+programs on the interpreter and the JIT and compares registers, PC, SP, status, memory,
+faults, device-visible state and virtual time, with a real performance number behind it.

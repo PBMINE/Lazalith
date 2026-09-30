@@ -91,8 +91,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use lazalith_cpu::{
-    CpuFault, CpuFaultCause, CpuMemory, EngineKind, ExecutionEngine, OutcomeApplication, Processor,
-    StepResult,
+    CpuMemory, EngineDecline, EngineFault, EngineKind, ExecutionEngine, OutcomeApplication,
+    Processor, StepResult,
 };
 use lazalith_isa::{Instruction, Opcode, Operand};
 use lazalith_types::InstructionAddress;
@@ -101,9 +101,11 @@ use crate::memory::Entry;
 
 /// Why the JIT declined to run something.
 ///
-/// **Separate from a `CpuFault`, because a JIT saying no is not a guest error.** A fault
-/// is something the guest did; this is something this engine cannot do, and the
-/// difference is what lets the machine fall back to the interpreter instead of trapping.
+/// **A JIT-internal reason code, and it becomes an [`EngineDecline`] at the boundary.**
+/// This type is deliberately more specific than the boundary type: it says *which*
+/// translator rule refused, which is what a person debugging a slow program needs, while
+/// the machine only needs to know whether to hand the instruction to another engine. The
+/// conversion is [`Decline::at`], and it is where the specificity is thrown away.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Decline {
     /// The instruction at this address is not one the translator handles.
@@ -121,6 +123,33 @@ pub enum Decline {
     UnsupportedWordWidth,
     /// The translated code could not be made executable.
     NoExecutablePage,
+}
+
+impl Decline {
+    /// The boundary-level form of this reason.
+    ///
+    /// **The classification is what matters and the sentence is a diagnostic.** A 32-bit
+    /// guest and a missing executable page are both `UnsupportedConfiguration` and
+    /// `HostUnavailable` respectively — not `UnsupportedInstruction` — because neither
+    /// becomes true by running a different instruction, and a machine that has only this
+    /// engine must keep interpreting rather than trapping the guest over a property of
+    /// the machine it is running on.
+    pub const fn at(self) -> EngineDecline {
+        match self {
+            Self::NotTranslatable | Self::NoCode => EngineDecline::UnsupportedInstruction {
+                reason: "the translator has no code for this instruction",
+            },
+            Self::UnsupportedHost => EngineDecline::UnsupportedConfiguration {
+                reason: "this crate emits code for x86-64 only",
+            },
+            Self::UnsupportedWordWidth => EngineDecline::UnsupportedConfiguration {
+                reason: "the generated code computes in 64 bits and this guest is 32-bit",
+            },
+            Self::NoExecutablePage => EngineDecline::HostUnavailable {
+                reason: "no page could be mapped executable",
+            },
+        }
+    }
 }
 impl fmt::Display for Decline {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -146,6 +175,15 @@ impl fmt::Display for Decline {
 pub struct Jit {
     blocks: Vec<Compiled>,
     page: Option<ExecutablePage>,
+    /// A guest address the next translated block must not run an instruction at.
+    ///
+    /// **Set by the machine from the debugger's breakpoints, and honoured by the
+    /// translator.** It lives here rather than being passed to `step` because it is a
+    /// property of the *engine* for as long as it holds: a block translated under one
+    /// boundary is a different block from one translated under another, so it has to
+    /// invalidate the cache when it changes, which is not a decision a per-call argument
+    /// could make.
+    yield_boundary: Option<InstructionAddress>,
     /// How many blocks were executed natively, and how many instructions they retired.
     ///
     /// **Reported rather than assumed.** A JIT that quietly fell back to the
@@ -167,10 +205,25 @@ impl Jit {
         Self {
             blocks: Vec::new(),
             page: None,
+            yield_boundary: None,
             executed_blocks: 0,
             executed_instructions: 0,
         }
     }
+
+    /// Forgets the translated code and the executable page, keeping the counters.
+    ///
+    /// **Split out of [`discard_private_state`] because a page that could not be entered
+    /// is a different problem from an engine switch.** A page that failed to run is
+    /// possibly a corrupted mapping, and re-entering it would be worse than translating
+    /// again; the counters, on the other hand, are how the tests show host code really
+    /// executed, and resetting them because a debugger moved a breakpoint would make the
+    /// handoff untestable.
+    fn discard_code(&mut self) {
+        self.blocks.clear();
+        self.page = None;
+    }
+
     /// How many translated blocks have run natively.
     pub const fn executed_blocks(&self) -> u64 {
         self.executed_blocks
@@ -202,21 +255,29 @@ impl Jit {
         if !cfg!(target_arch = "x86_64") {
             return Err(Decline::UnsupportedHost);
         }
+        // **The cache key is the address *and* the boundary.** A block translated with no
+        // boundary runs up to 31 instructions, and one translated under a boundary stops
+        // before it — so they are different code for the same address, and returning the
+        // wrong one would run a block straight through a breakpoint the debugger has
+        // since set. Comparing the boundary here, rather than trusting
+        // `set_yield_boundary` to have cleared the cache, means the invariant holds even
+        // if that method is ever changed to do less.
         if let Some(found) = self
             .blocks
             .iter()
-            .find(|entry| entry.start == start)
-            .cloned()
+            .find(|entry| entry.start == start && entry.boundary == self.yield_boundary)
+            .copied()
         {
             return Ok(found);
         }
-        let block = translation_of(processor, memory)?;
+        let block = translation_of(processor, memory, self.yield_boundary)?;
         let compiled = Compiled {
             start: block.start,
             end: block.end,
             instructions: block.instructions,
             cycles: block.cycles,
             flags: block.flags,
+            boundary: self.yield_boundary,
             offset: 0,
         };
         // The code goes into the page, and the metadata into the cache. **The offset is
@@ -285,6 +346,14 @@ pub struct Compiled {
     pub offset: usize,
     /// The instruction whose result is in the status register afterwards, if any.
     pub flags: Option<Flags>,
+    /// The yield boundary this block was translated under.
+    ///
+    /// **Part of the cache key, and the reason is that a boundary changes the code.**
+    /// Two blocks starting at the same guest address, one bounded and one not, retire
+    /// different numbers of instructions and are therefore different programs as far as
+    /// the debugger is concerned. Keeping it in the metadata is what lets `compile`
+    /// refuse to hand back the wrong one.
+    pub boundary: Option<InstructionAddress>,
 }
 /// Runs one translated block against the processor's architectural state.
 ///
@@ -445,61 +514,116 @@ impl<M: CpuMemory> ExecutionEngine<M> for Jit {
     fn kind(&self) -> EngineKind {
         EngineKind::Jit
     }
+
+    /// Runs one translated block, or declines so another engine can.
+    ///
+    /// **This is B23's JIT → interpreter handoff, and the two things that make it
+    /// correct are both about what has *not* happened when this returns `Err`.**
+    ///
+    /// A decline leaves the [`Processor`] exactly as it was found. Translation writes
+    /// only to this crate's own cache and page; nothing architectural is touched until
+    /// `run_block` has called the generated code, and a block that could not be built
+    /// never got that far. So the program counter still names the instruction that was
+    /// declined, which is what lets the interpreter run *that* instruction rather than
+    /// re-running or skipping one.
+    ///
+    /// Second, a decline is [`EngineFault::Declined`], not a fault. The machine's
+    /// response is to hand the instruction to the reference interpreter, and the guest
+    /// sees an ordinary retired instruction. In B22 this returned
+    /// `CpuFaultCause::JitDeclined`, which the machine — treating every engine `Err` as
+    /// a guest fault — turned into a trap, so a program was trapped for using an
+    /// instruction the JIT had not learned. The type is what prevents that now.
     fn step(
         &mut self,
         processor: &mut Processor,
         memory: &mut M,
-    ) -> Result<StepResult, CpuFault<M::Error>> {
-        // Translate, then run, and decline to a fault-free error the machine can act on
-        // by falling back. The machine calls the reference interpreter for anything the
-        // JIT will not do, so a decline is *not* a guest fault and must not become one.
-        if let Ok(block) = self.compile(processor, memory)
-            && block.instructions > 0
-        {
-            match self.run_block(processor) {
-                Ok(result) => return Ok(result),
-                Err(_) => {
-                    // A page that could not be entered is a host problem, not a guest
-                    // one. Fall through to the interpreter rather than trapping, and
-                    // drop the cache so the next attempt starts clean.
-                    self.blocks.clear();
-                    self.page = None;
+    ) -> Result<StepResult, EngineFault<M::Error>> {
+        let start = processor.architectural().pc().as_u64();
+        match self.compile(processor, memory) {
+            Ok(block) if block.instructions > 0 => match self.run_block(processor) {
+                Ok(result) => Ok(result),
+                Err(decline) => {
+                    // Entering the generated code failed, which is a host problem and not
+                    // a guest one. Forget the cache so the next attempt starts from a
+                    // fresh page rather than re-entering code that did not run, and let
+                    // the interpreter have this instruction.
+                    self.discard_code();
+                    Err(EngineFault::Declined(decline.at()))
                 }
-            }
+            },
+            // Two declines, and the distinction is worth keeping: one means "this
+            // instruction", the other means "this machine". `NoCode` is the second
+            // because a cache hit cannot produce an empty block.
+            Ok(_) => Err(EngineFault::Declined(Decline::NoCode.at())),
+            Err(decline) => Err(EngineFault::Declined(decline.at())),
         }
-        Err(CpuFault::at(
-            processor.architectural().pc(),
-            None,
-            CpuFaultCause::JitDeclined,
-        ))
+        .inspect_err(|_| {
+            debug_assert_eq!(
+                processor.architectural().pc().as_u64(),
+                start,
+                "a decline must leave the program counter on the instruction that was \
+                 declined, or the interpreter will run the wrong one"
+            );
+        })
     }
+
     /// This JIT does not implement `execute`, and that is a decision rather than an
     /// omission.
     ///
     /// **The trait's `execute` is "run this one instruction the caller already
     /// decoded", which is a debugging and testing entry point.** The JIT translates runs
     /// of instructions starting from a program counter and has no way to start halfway
-    /// through one, so honouring `execute` would mean either translating a one-instruction
-    /// block — which is the B21 null result with extra steps — or quietly delegating to
-    /// the interpreter, which is a JIT that claims to be a JIT and is not.
+    /// through one, so honouring `execute` would mean either translating a
+    /// one-instruction block — which is the B21 null result with extra steps — or
+    /// quietly delegating to the interpreter, which is a JIT that claims to be a JIT and
+    /// is not.
     ///
-    /// Declining is therefore the honest answer, and `CpuFaultCause::JitDeclined` is a
-    /// *machine-visible* signal rather than a guest fault: the caller asked for something
-    /// this engine does not do, and the machine's response is to use the other engine.
+    /// Declining is therefore the honest answer, and [`EngineFault::Declined`] is the
+    /// *machine-visible* signal for it: the caller asked for something this engine does
+    /// not do, and the machine's response is to use the other engine.
     fn execute(
         &mut self,
-        processor: &mut Processor,
+        _processor: &mut Processor,
         _instruction: &Instruction,
         _memory: &mut M,
-    ) -> Result<StepResult, CpuFault<M::Error>> {
-        Err(CpuFault::at(
-            processor.architectural().pc(),
-            None,
-            CpuFaultCause::JitDeclined,
-        ))
+    ) -> Result<StepResult, EngineFault<M::Error>> {
+        Err(EngineFault::Declined(Decline::NotTranslatable.at()))
     }
+
+    /// A guest address this engine must not execute an instruction at in its next step.
+    ///
+    /// **This is what stops a block running through a breakpoint.** A translated block
+    /// retires up to 31 instructions in one `step`, so without a boundary a debugger's
+    /// breakpoint at the third instruction would be stepped over silently — the guest's
+    /// arithmetic would be right and the debugger would be lying about where it stopped.
+    ///
+    /// The boundary is stored and applied by the *translator*, not here, because it has
+    /// to shorten the block during translation; by the time there is code to run, the
+    /// decision has been made. The cache is invalidated when the boundary moves, since a
+    /// block built for one boundary is wrong for another — a block compiled without a
+    /// boundary would run straight past a breakpoint the debugger has since set.
+    fn set_yield_boundary(&mut self, boundary: Option<InstructionAddress>) {
+        if boundary != self.yield_boundary {
+            // Only the *code* goes. The execution counters are how B23's tests show that
+            // host code actually ran, and forgetting those on a debugger's whim would
+            // make the handoff untestable.
+            self.blocks.clear();
+            self.yield_boundary = boundary;
+        }
+    }
+
+    /// **Reported through the trait object, which is the only way a machine-level test can
+    /// see it.** The machine holds a `Box<dyn ExecutionEngine>` and has no idea a JIT
+    /// is behind it, so without this the count would be unreachable from a test that
+    /// only has a machine — and "the JIT ran everything" and "the JIT ran nothing and
+    /// the interpreter did all the work" are the same architectural state.
+    fn native_instruction_count(&self) -> Option<u64> {
+        Some(self.executed_instructions)
+    }
+
     fn discard_private_state(&mut self) {
         self.blocks.clear();
+        self.yield_boundary = None;
         self.executed_blocks = 0;
         self.executed_instructions = 0;
     }

@@ -367,7 +367,11 @@ fn user_stack_is_not_executable_in_either_mode() {
             )
             .unwrap(),
         );
-        let error = engine.step(&mut cpu, &mut bus).unwrap_err();
+        let error = engine
+            .step(&mut cpu, &mut bus)
+            .unwrap_err()
+            .into_guest()
+            .expect("the reference interpreter never declines");
         assert!(matches!(
             error.cause,
             CpuFaultCause::Fetch(lazalith_memory::MemoryFault {

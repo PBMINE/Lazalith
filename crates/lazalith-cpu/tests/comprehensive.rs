@@ -36,7 +36,9 @@ fn unchanged(
     let memory = ram.clone();
     let error = ReferenceInterpreter::new()
         .execute(cpu, &instruction(before.config(), opcode, operands), ram)
-        .unwrap_err();
+        .unwrap_err()
+        .into_guest()
+        .expect("the reference interpreter never declines");
     assert_eq!(error.pc, before.pc());
     assert_eq!(error.opcode, Some(opcode.as_u8()));
     assert_eq!(cpu.architectural(), &before);
@@ -349,7 +351,14 @@ fn every_branch_condition_exhausts_all_flag_patterns() {
                     );
                     let target = 0x108i128 + i128::from(displacement) * 4;
                     if taken && target > i128::from(config.word_width().mask()) {
-                        assert!(matches!(result.unwrap_err().cause, Cause::Outcome(_)));
+                        assert!(matches!(
+                            result
+                                .unwrap_err()
+                                .into_guest()
+                                .expect("the reference interpreter never declines")
+                                .cause,
+                            Cause::Outcome(_)
+                        ));
                         assert_eq!(machine.architectural().pc().as_u64(), 0x100);
                     } else {
                         assert_outcome!(result, OutcomeApplication::Continue);
@@ -561,6 +570,8 @@ fn calls_returns_and_jumps_obey_stack_and_subsequent_fetch_policy() {
                 ReferenceInterpreter::new()
                     .step(&mut machine, &mut ram)
                     .unwrap_err()
+                    .into_guest()
+                    .expect("the reference interpreter never declines")
                     .cause,
                 Cause::Width(_)
             ));
@@ -723,6 +734,8 @@ fn privilege_halt_and_all_control_selectors_are_explicit() {
             ReferenceInterpreter::new()
                 .step_bytes(&mut machine, &[], &mut ram)
                 .unwrap_err()
+                .into_guest()
+                .expect("the reference interpreter never declines")
                 .cause,
             Cause::Halted
         ));
@@ -730,6 +743,8 @@ fn privilege_halt_and_all_control_selectors_are_explicit() {
             ReferenceInterpreter::new()
                 .step(&mut machine, &mut ram)
                 .unwrap_err()
+                .into_guest()
+                .expect("the reference interpreter never declines")
                 .cause,
             Cause::Halted
         ));
@@ -753,7 +768,9 @@ fn decode_mode_fetch_errors_retain_context_and_typed_sources() {
             let before = machine.architectural().clone();
             let error = ReferenceInterpreter::new()
                 .step_bytes(&mut machine, &bytes, &mut ram)
-                .unwrap_err();
+                .unwrap_err()
+                .into_guest()
+                .expect("the reference interpreter never declines");
             assert!(matches!(error.cause, Cause::Decode(_)));
             assert_eq!(error.opcode, bytes.first().copied());
             assert_eq!(error.pc.as_u64(), 0);
@@ -774,7 +791,9 @@ fn decode_mode_fetch_errors_retain_context_and_typed_sources() {
             let memory = ram.clone();
             let error = ReferenceInterpreter::new()
                 .step(&mut machine, &mut ram)
-                .unwrap_err();
+                .unwrap_err()
+                .into_guest()
+                .expect("the reference interpreter never declines");
             assert!(matches!(error.cause, Cause::Fetch(_)));
             assert_eq!(error.opcode, None);
             assert!(error.source().unwrap().source().is_some());
@@ -804,6 +823,8 @@ fn decode_mode_fetch_errors_retain_context_and_typed_sources() {
         ReferenceInterpreter::new()
             .execute(&mut machine, &wide, &mut ram)
             .unwrap_err()
+            .into_guest()
+            .expect("the reference interpreter never declines")
             .cause,
         Cause::Instruction(_)
     ));
@@ -815,6 +836,8 @@ fn decode_mode_fetch_errors_retain_context_and_typed_sources() {
                 &mut ram
             )
             .unwrap_err()
+            .into_guest()
+            .expect("the reference interpreter never declines")
             .cause,
         Cause::Decode(_)
     ));

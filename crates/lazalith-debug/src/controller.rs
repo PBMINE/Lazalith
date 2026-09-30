@@ -905,7 +905,98 @@ impl<D: Device> DebugController<D> {
     }
 
     /// One step of the machine, with the scheduler's validation in front of it.
+    /// Which execution engine this controller's machine is running.
+    ///
+    /// **A shared read, like [`Self::machine`] and for the same reason**: a frontend asks
+    /// which engine it is watching so it can label the session, and it gets a name rather
+    /// than the engine.
+    pub fn execution_engine(&self) -> lazalith_cpu::EngineKind {
+        self.machine.execution_engine()
+    }
+
+    /// Chooses which execution engine this controller's machine runs.
+    ///
+    /// # Why a debugger gets to choose
+    ///
+    /// **Because "is this bug in my program or in the compiler?" is the first question
+    /// anyone asks about a JIT, and the only way to answer it is to run the same program
+    /// both ways.** Setting the engine to `Optimized` or `Jit` and watching the same fault
+    /// appear or vanish is a debugging technique that needs no access to the machine
+    /// internals — just this.
+    ///
+    /// The engine change is a machine operation with all of the machine's guarantees: the
+    /// architectural state is untouched, the outgoing engine's private state is dropped,
+    /// and a switch is refused in the states where it would be a reset in disguise. The
+    /// controller adds nothing to it, which is the point — this is a convenience for the
+    /// person at the keyboard, not a second implementation of switching.
+    pub fn set_execution_engine(
+        &mut self,
+        kind: lazalith_cpu::EngineKind,
+    ) -> Result<(), DebugError> {
+        self.machine
+            .switch_execution_engine(kind)
+            .map_err(DebugError::from)
+    }
+
+    /// How many instructions this machine has retired as host-native code.
+    ///
+    /// **The number that tells a JIT user whether anything is actually being compiled.**
+    /// A JIT installed on a program it declines entirely reports zero here while reporting
+    /// perfectly ordinary-looking steps, and a frontend showing "JIT" with no indication
+    /// that nothing ran natively is actively misleading.
+    pub fn native_instructions(&self) -> u64 {
+        self.machine.native_instructions()
+    }
+
+    /// How many times an engine declined and this machine ran the instruction elsewhere.
+    ///
+    /// **Non-zero means the guest is being executed by a mixture of engines**, which is
+    /// normal and is not a fault — but it is the explanation for a step that seemed to
+    /// take no time, and a frontend debugging performance should be able to show it.
+    pub fn engine_handoffs(&self) -> u64 {
+        self.machine.engine_handoffs()
+    }
+
+    /// Tells the machine where this session's breakpoints are.
+    ///
+    /// **Every live session's breakpoints, not just the stepping one**, because the machine
+    /// runs one guest and every session's breakpoints are addresses that guest may reach.
+    /// An empty set clears the machine's boundary, so a controller that has just had its
+    /// last breakpoint removed does not leave a stale one behind — which would keep
+    /// truncating blocks for the rest of the session's life with nothing to stop at.
+    fn sync_yield_points(&mut self, process: ProcessId) {
+        let points: Vec<u64> = self
+            .sessions
+            .iter()
+            .flat_map(|session| session.breakpoints().to_vec())
+            .collect();
+        // A suspended breakpoint is one the user asked this run to ignore, so it must not
+        // bound anything: including it would make the JIT stop at an address the debugger
+        // is not going to report, which is worse than not stopping there at all.
+        let points = if self.suspended_breakpoints {
+            Vec::new()
+        } else {
+            points
+        };
+        let _ = process;
+        self.machine.set_yield_points(points);
+    }
+
     fn step_once(&mut self, process: ProcessId) -> Result<RegisterSnapshot, DebugError> {
+        // **The debugger's breakpoints, pushed down to the machine before every step.**
+        //
+        // A single-instruction engine needs nothing: it cannot run past a breakpoint
+        // because it only ever runs one instruction. A JIT that retires a *block* would
+        // step straight over one, and the program would keep running while the user is
+        // looking at a stop the guest never took — every register correct, the debugger
+        // lying. The machine turns this set into the "stop before this address" boundary
+        // its engine has to honour, which is the only way an engine that can retire
+        // several instructions at once is still debuggable.
+        //
+        // It is pushed here rather than in `set_breakpoint` because the boundary depends
+        // on the current program counter and has to stay correct as the program moves; and
+        // it is pushed for `step` as well as `run` so single-stepping is exact too.
+        self.sync_yield_points(process);
         match self.kernel.step(&mut self.machine) {
             Ok(step) => {
                 if let Some(outcome) = step.outcome {

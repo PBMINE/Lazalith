@@ -11,7 +11,7 @@ mod outcome;
 mod processor;
 mod trap;
 
-pub use engine::{EngineError, EngineKind, ExecutionEngine};
+pub use engine::{EngineDecline, EngineError, EngineFault, EngineKind, ExecutionEngine};
 pub use fast::FastInterpreter;
 pub use fault::{CpuFault, CpuFaultCause, FaultOrigin};
 pub use interpreter::ReferenceInterpreter;

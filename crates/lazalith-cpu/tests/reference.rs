@@ -48,6 +48,8 @@ fn tiny_fetched_call_sequence_runs_both_modes() {
             ReferenceInterpreter::new()
                 .step(&mut cpu, &mut ram)
                 .unwrap_err()
+                .into_guest()
+                .expect("the reference interpreter never declines")
                 .cause,
             Cause::Halted
         ));
@@ -124,7 +126,9 @@ fn faults_do_not_publish_candidate_or_memory_effects() {
             let memory = ram.clone();
             let error = ReferenceInterpreter::new()
                 .execute(&mut cpu, &instruction(config, opcode, &operands), &mut ram)
-                .unwrap_err();
+                .unwrap_err()
+                .into_guest()
+                .expect("the reference interpreter never declines");
             assert_eq!(error.pc.as_u64(), 0);
             assert_eq!(error.opcode, Some(opcode.as_u8()));
             assert_eq!(cpu.architectural(), &before);
@@ -146,6 +150,8 @@ fn faults_do_not_publish_candidate_or_memory_effects() {
                     &mut ram
                 )
                 .unwrap_err()
+                .into_guest()
+                .expect("the reference interpreter never declines")
                 .cause,
             Cause::Memory {
                 source: MemoryError::Transaction,
@@ -187,6 +193,8 @@ fn next_pc_is_checked_before_reads_and_stack_operations() {
                 ReferenceInterpreter::new()
                     .execute(&mut cpu, &instruction(config, opcode, &operands), &mut ram)
                     .unwrap_err()
+                    .into_guest()
+                    .expect("the reference interpreter never declines")
                     .cause,
                 Cause::NextPc(_)
             ));
@@ -239,7 +247,9 @@ fn traps_are_events_and_controller_instructions_are_not_emulated() {
                         &instruction(config, opcode, &operands),
                         &mut Ram::default(),
                     )
-                    .unwrap_err();
+                    .unwrap_err()
+                    .into_guest()
+                    .expect("the reference interpreter never declines");
                 if status == 32 {
                     assert!(matches!(error.cause, Cause::PrivilegeViolation));
                 } else {
@@ -258,6 +268,8 @@ fn traps_are_events_and_controller_instructions_are_not_emulated() {
                             &mut Ram::default()
                         )
                         .unwrap_err()
+                        .into_guest()
+                        .expect("the reference interpreter never declines")
                         .cause,
                     Cause::PrivilegeViolation
                 ));

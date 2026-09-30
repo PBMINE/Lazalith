@@ -47,9 +47,9 @@
 //! about whether an access faulted disagree about the program's behaviour.
 
 use lazalith_cpu::{
-    ArchitecturalState, CpuFault, CpuFaultCause, CpuMemory, DataAccess, DataAccessKind, EngineKind,
-    ExecutionEngine, OutcomeApplication, Privilege, Processor, ReferenceInterpreter, StepResult,
-    TrapCause,
+    ArchitecturalState, CpuFaultCause, CpuMemory, DataAccess, DataAccessKind, EngineFault,
+    EngineKind, ExecutionEngine, OutcomeApplication, Privilege, Processor, ReferenceInterpreter,
+    StepResult, TrapCause,
 };
 use lazalith_devices::{ConsoleDevice, DeviceId, DeviceManager};
 use lazalith_isa::{DataSize, Instruction, Opcode, Operand, encode};
@@ -489,7 +489,7 @@ fn program_bytes(program: &Program) -> Vec<u8> {
 
 fn observe_bare(
     cpu: &Processor,
-    outcome: &Result<StepResult, CpuFault<MemoryFault>>,
+    outcome: &Result<StepResult, EngineFault<MemoryFault>>,
     cycles: u64,
 ) -> Observation {
     let state = cpu.architectural();
@@ -509,7 +509,19 @@ fn observe_bare(
             };
             (false, true, Some(String::from(cause)), *resume_pc)
         }
-        Err(fault) => (false, true, Some(cause_name(&fault.cause)), state.pc()),
+        // A bare interpreter cannot decline, so a decline here would mean a third-party
+        // engine in the harness is not the reference. It is reported as such rather
+        // than folded into the fault arm, because "the engine refused" and "the guest
+        // faulted" are different results and this file compares them.
+        Err(fault) => match fault.guest() {
+            Some(guest) => (false, true, Some(cause_name(&guest.cause)), state.pc()),
+            None => (
+                false,
+                true,
+                Some("<engine declined>".to_string()),
+                state.pc(),
+            ),
+        },
     };
     Observation {
         registers: (0..RegisterIndex::COUNT)

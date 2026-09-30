@@ -485,7 +485,7 @@ fn the_emitted_bytes_are_the_ones_written_down() {
     let translate = |bytes: &[u8]| {
         let processor = cpu();
         let mut memory = Memory::of(bytes);
-        lazalith_jit::translation_of(&processor, &mut memory)
+        lazalith_jit::translation_of(&processor, &mut memory, None)
             .expect("translates")
             .code
             .bytes()
@@ -581,7 +581,7 @@ fn only_the_last_flag_setting_instruction_spills() {
     let bytes = arithmetic();
     let processor = cpu();
     let mut memory = Memory::of(&bytes);
-    let block = lazalith_jit::translation_of(&processor, &mut memory).expect("translates");
+    let block = lazalith_jit::translation_of(&processor, &mut memory, None).expect("translates");
 
     // `MOV [RDX + disp32], reg` with `RDX` in the r/m field: REX 0x4C, opcode 0x89, and
     // a ModRM whose low three bits are RDX (2). Counting exactly these says how many
@@ -625,7 +625,7 @@ fn only_the_last_flag_setting_instruction_spills() {
     // A block with no arithmetic at all sets no flags.
     let plain = emit(Opcode::Mov, &[r(0), r(1)]);
     let mut memory = Memory::of(&plain);
-    let block = lazalith_jit::translation_of(&processor, &mut memory).expect("translates");
+    let block = lazalith_jit::translation_of(&processor, &mut memory, None).expect("translates");
     assert_eq!(
         block.flags, None,
         "LI and MOV do not touch the status register, so a block of them has no flags"

@@ -98,7 +98,9 @@ fn console_full_fault_preserves_cpu_ram_and_prior_output() {
         let before = cpu.architectural().clone();
         let error = lazalith_cpu::ReferenceInterpreter::new()
             .step(&mut cpu, &mut bus)
-            .unwrap_err();
+            .unwrap_err()
+            .into_guest()
+            .expect("the reference interpreter never declines");
         assert!(matches!(
             error.cause,
             lazalith_cpu::CpuFaultCause::Memory {

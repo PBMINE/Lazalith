@@ -44,7 +44,7 @@
 //! memory exactly as the previous engine left them, which is what B23 tests.
 
 use crate::{
-    CpuFault, CpuFaultCause, CpuMemory, EngineKind, ExecutionEngine, ExecutionState,
+    CpuFault, CpuFaultCause, CpuMemory, EngineFault, EngineKind, ExecutionEngine, ExecutionState,
     FetchedInstruction, OutcomeApplication, Processor, ReferenceInterpreter, StepResult,
     validate_pc,
 };
@@ -111,6 +111,27 @@ impl<M: CpuMemory> ExecutionEngine<M> for FastInterpreter {
         &mut self,
         processor: &mut Processor,
         memory: &mut M,
+    ) -> Result<StepResult, EngineFault<M::Error>> {
+        self.step_guest(processor, memory)
+            .map_err(EngineFault::Guest)
+    }
+
+    fn execute(
+        &mut self,
+        processor: &mut Processor,
+        instruction: &Instruction,
+        memory: &mut M,
+    ) -> Result<StepResult, EngineFault<M::Error>> {
+        self.execute_guest(processor, instruction, memory)
+            .map_err(EngineFault::Guest)
+    }
+}
+
+impl FastInterpreter {
+    fn step_guest<M: CpuMemory>(
+        &mut self,
+        processor: &mut Processor,
+        memory: &mut M,
     ) -> Result<StepResult, CpuFault<M::Error>> {
         let config = processor.config();
         let pc = processor.architectural().pc();
@@ -162,7 +183,7 @@ impl<M: CpuMemory> ExecutionEngine<M> for FastInterpreter {
         Ok(StepResult::new(application, instruction.opcode().cycles()))
     }
 
-    fn execute(
+    fn execute_guest<M: CpuMemory>(
         &mut self,
         processor: &mut Processor,
         instruction: &Instruction,

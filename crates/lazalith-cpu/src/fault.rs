@@ -92,23 +92,7 @@ pub enum CpuFaultCause<E> {
     Outcome(OutcomeError),
     DataAccess(DataAccessError),
     Fetch(E),
-    Memory {
-        access: DataAccess,
-        source: E,
-    },
-    /// This execution engine declined to run the instruction.
-    ///
-    /// **Not a guest error, and that is why it is a variant here rather than a
-    /// `Result::Err` outside the fault type.** Every other cause is something the guest
-    /// did — a bad address, a bad operand, a privilege violation. A JIT declining an
-    /// instruction is something *the engine* did, and the machine's correct response is
-    /// to run it through a different engine rather than to trap the guest.
-    ///
-    /// B22 added it when the JIT arrived, and the distinction is load-bearing: a
-    /// machine that treated a decline as a guest fault would trap a program for using an
-    /// instruction the JIT happens not to handle, which is the JIT's limitation and not
-    /// the program's.
-    JitDeclined,
+    Memory { access: DataAccess, source: E },
 }
 
 impl<E: Error + 'static> fmt::Display for CpuFault<E> {
@@ -148,9 +132,6 @@ impl<E: Error + 'static> fmt::Display for CpuFaultCause<E> {
             Self::DataAccess(source) => source.fmt(f),
             Self::Fetch(source) => write!(f, "instruction fetch: {source}"),
             Self::Memory { access, source } => write!(f, "{access:?}: {source}"),
-            Self::JitDeclined => {
-                f.write_str("this execution engine declined to run the instruction")
-            }
         }
     }
 }
@@ -184,6 +165,14 @@ impl<E: Error + 'static> Error for CpuFaultCause<E> {
 /// wrong sends someone to look in the wrong place: a guest fault is a bug in the
 /// program they are debugging, and an emulator bug is a bug in *this* crate with
 /// nothing to do with their program.
+///
+/// **An engine's inability to run something is neither, and that is the point.** B22
+/// had to file "the JIT does not handle this instruction" as `Guest`, which is a lie
+/// in both directions: it is not the guest's mistake, and classifying it as `Guest`
+/// meant a caller asking "did my program do something wrong?" was told yes. B23 gave
+/// it its own type — [`EngineDecline`](crate::EngineDecline) — so it no longer has to
+/// be misfiled as one of these two. A decline is a statement about this build's
+/// coverage, and a build that says so is more useful than one that blames the guest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FaultOrigin {
     /// The guest program did something the machine had to refuse.
@@ -235,12 +224,6 @@ impl<E> CpuFaultCause<E> {
             | Self::Outcome(_)
             | Self::TrapEntry(_)
             | Self::TerminalTrap => FaultOrigin::Emulator,
-            // A decline is the engine's limitation, not the guest's mistake and not an
-            // emulator bug: nothing invariant was violated. It is `Guest` because the
-            // machine's answer to it is to run the instruction elsewhere, and calling it
-            // an emulator cause would make `Emulator` mean "this build is wrong" for a
-            // JIT that simply does not handle an instruction yet.
-            Self::JitDeclined => FaultOrigin::Guest,
         }
     }
 

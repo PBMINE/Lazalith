@@ -13,10 +13,10 @@ pub use profile::{
 use alloc::{boxed::Box, collections::TryReserveError, vec::Vec};
 use core::{error::Error, fmt};
 use lazalith_cpu::{
-    ArchitecturalState, ControlStateError, CpuFault, CpuFaultCause, DataAccessError, EngineError,
-    EngineKind, ExecutionContextId, ExecutionEngine, FaultOrigin, OutcomeApplication,
-    OutcomeErrorKind, Processor, ReferenceInterpreter, SyscallCompletion, TrapAttempt, TrapCause,
-    TrapController, TrapRequest,
+    ArchitecturalState, ControlStateError, CpuFault, CpuFaultCause, DataAccessError, EngineDecline,
+    EngineError, EngineFault, EngineKind, ExecutionContextId, ExecutionEngine, FaultOrigin,
+    OutcomeApplication, OutcomeErrorKind, Processor, ReferenceInterpreter, StepResult,
+    SyscallCompletion, TrapAttempt, TrapCause, TrapController, TrapRequest,
 };
 use lazalith_devices::{Device, DeviceId, DeviceManager};
 use lazalith_diagnostics::bug::{EmulatorBug, Subsystem};
@@ -40,6 +40,42 @@ pub enum MachineState {
     Faulted,
 }
 
+/// Why a step retired no instruction.
+///
+/// **Separate from [`MachineError`] because one of these is a normal outcome.** A trap is
+/// an ordinary event a guest can be written to handle; an engine handoff is an internal
+/// detail that must never be visible. Both are "this step did not retire", but only one
+/// of them is something the caller asked for.
+#[derive(Debug)]
+enum StepStop {
+    /// A trap was entered, and this is it.
+    Trapped(TrapEvent),
+    /// No engine on this machine can execute the instruction at the program counter.
+    ///
+    /// **A machine fact, and never a guest fault.** The interpreter declines nothing, so
+    /// reaching this means the guest is standing at an address the machine cannot
+    /// execute at all — which is a defect in this build's coverage or a misconfigured
+    /// yield boundary, and blaming the guest for it with a trap would be exactly the
+    /// mistake B23 removed.
+    NoEngine(EngineDecline),
+    /// The machine itself refused: trap entry failed, the clock rejected an advance, or
+    /// an engine's report was inconsistent.
+    ///
+    /// **The one case that can leave the machine `Faulted`,** because `enter_trap` sets
+    /// that when it cannot enter a trap. That is unchanged from B6 and is correct: a
+    /// machine that cannot enter a trap the guest caused has genuinely lost the ability
+    /// to continue, and §11's handoff rules do not apply because there is no guest state
+    /// left to hand over.
+    Failed(MachineError),
+}
+
+impl From<MachineError> for StepStop {
+    fn from(error: MachineError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// A trap that ended a step, or the reason no engine could run it.
 fn is_executable_state(state: MachineState) -> bool {
     matches!(
         state,
@@ -126,6 +162,23 @@ pub enum MachineError {
     /// or a switch at a moment when changing engines is not a thing a machine may
     /// do. See [`LazalithMachine::switch_execution_engine`].
     Engine(EngineError),
+    /// No engine on this machine can execute the instruction at the program counter.
+    ///
+    /// **Not a guest fault and not a trap, and that is the point.** The active engine
+    /// declined, the Reference Interpreter was handed the instruction, and it declined
+    /// too — which cannot happen for a well-formed guest and means this build cannot
+    /// execute this address at all.
+    ///
+    /// It is an error rather than a fault because a fault would put the guest in a trap
+    /// frame, and a trap is a thing the guest observes: its program counter moves, its
+    /// privilege changes, and a handler it wrote runs. Making a machine's own coverage
+    /// gap look like a guest error is the exact conflation B23 exists to remove, so this
+    /// is reported to the caller — a debugger, a manager, a test — and never entered into
+    /// the guest's control flow.
+    NoExecutionEngine {
+        /// What no engine on this machine could do.
+        decline: EngineDecline,
+    },
     Decode(DecodeError),
     InvalidSyscallReturn,
     InvalidUserContext {
@@ -173,6 +226,9 @@ impl fmt::Display for MachineError {
             Self::Memory(source) => write!(f, "memory rejected the operation: {source}"),
             Self::Cpu(source) => write!(f, "CPU rejected the operation: {source}"),
             Self::Engine(source) => write!(f, "execution engine: {source}"),
+            Self::NoExecutionEngine { decline } => {
+                write!(f, "no engine on this machine can execute here: {decline}")
+            }
             Self::InstructionCountOverflow => f.write_str("executed instruction count overflowed"),
             Self::InitialClock { devices, requested } => write!(
                 f,
@@ -194,6 +250,9 @@ impl Error for MachineError {
             Self::Memory(source) => Some(source),
             Self::AddressSpaceSwap(source) => Some(source),
             Self::Cpu(source) => Some(source),
+            // A decline is not a wrapped error — it is this build's coverage, and there
+            // is nothing underneath it to point at.
+            Self::NoExecutionEngine { .. } => None,
             Self::Engine(source) => Some(source),
             Self::Decode(source) => Some(source),
             Self::InvalidTransition { .. }
@@ -234,6 +293,51 @@ pub struct LazalithMachine<D: Device> {
     /// switch through [`ExecutionEngine::discard_private_state`], and a guest must
     /// not be able to tell that it was dropped.
     engine: Box<dyn ExecutionEngine<Bus<D>>>,
+    /// The engine a decline is handed to.
+    ///
+    /// **A second engine *value*, never a second architectural state.** It borrows the
+    /// same `processor` for the length of one step, exactly as `engine` does, so running
+    /// an instruction here instead of there has nothing to reconcile — which is the whole
+    /// reason a JIT → interpreter handoff can be precise without a sync point. It is
+    /// always a [`ReferenceInterpreter`]: the semantic authority, and the one engine that
+    /// never declines, so the handoff cannot fail to find a destination.
+    ///
+    /// It is held rather than constructed per decline because constructing one is a
+    /// `Box` allocation on a path taken by every instruction the JIT cannot translate,
+    /// which for a register-only JIT is most of them.
+    fallback: Box<dyn ExecutionEngine<Bus<D>>>,
+    /// Guest addresses an engine must not execute an instruction at, sorted.
+    ///
+    /// **Set from the debugger's breakpoints, and pushed into the engine before every
+    /// step.** This is the mechanism that stops a translated block running straight over
+    /// a breakpoint, and it lives on the machine rather than in the debugger because the
+    /// engine is what has to honour it and the engine cannot see the debugger.
+    ///
+    /// An engine that retires one instruction at a time has no use for it; one that
+    /// retires a block has no other way to know.
+    yield_points: Vec<InstructionAddress>,
+    /// How many times an engine declined and this machine ran the instruction elsewhere.
+    ///
+    /// **Observability, and deliberately not a [`MachineEvent`].** The guest must not be
+    /// able to tell a handoff happened, which means it must not appear in the stream of
+    /// step results the guest's own code path observes — but a debugger and a benchmark
+    /// absolutely need to count them, because "the JIT ran nothing" and "the JIT ran
+    /// everything" are both invisible without this number. B24 measures it.
+    handoffs: u64,
+    /// Native instructions retired by engines this machine has already discarded.
+    ///
+    /// **Banked at every switch**, because the outgoing engine object is dropped and its
+    /// own count goes with it. See [`LazalithMachine::native_instructions`].
+    native_total: u64,
+    /// Why the last engine handoff happened, if one has.
+    last_decline: Option<EngineDecline>,
+    /// Retired instructions still to run on the current engine before switching to the
+    /// JIT, or `None` when no automatic switch is armed.
+    ///
+    /// **A countdown rather than a hotness score, and the field is named for what it
+    /// does.** See [`LazalithMachine::use_jit_after`] for why the automatic transition
+    /// is opt-in and why this is not a real hot-code detector.
+    jit_warmup: Option<u64>,
     bus: Bus<D>,
     config: ArchitectureConfig,
     clock: VirtualClock,
@@ -301,6 +405,17 @@ impl<D: Device> LazalithMachine<D> {
         Ok(Self {
             processor,
             engine: Box::new(ReferenceInterpreter::new()),
+            // Two separate values, because they are two separate roles: `engine` is
+            // whichever the caller chose and `fallback` is the one a decline goes to.
+            // Handing a decline to the *active* engine would be a no-op, and handing it
+            // to a freshly built interpreter would allocate on every declined
+            // instruction.
+            fallback: Box::new(ReferenceInterpreter::new()),
+            yield_points: Vec::new(),
+            handoffs: 0,
+            native_total: 0,
+            last_decline: None,
+            jit_warmup: None,
             bus,
             config,
             clock,
@@ -327,6 +442,144 @@ impl<D: Device> LazalithMachine<D> {
     /// can bucket by it.
     pub fn execution_engine(&self) -> EngineKind {
         self.engine.kind()
+    }
+
+    /// Guest addresses an engine must not execute an instruction at.
+    ///
+    /// # What this is for
+    ///
+    /// **It is how a debugger's breakpoints survive an engine that retires several
+    /// instructions per step.** A JIT block can cover thirty-one instructions, and a
+    /// breakpoint at the third of them would be stepped over: the guest's arithmetic
+    /// would be entirely correct and the debugger would be reporting a stop the guest
+    /// never took. The debugger owns the breakpoints — it is the thing that knows where
+    /// the user's code is — and this is the one piece of that knowledge the machine needs,
+    /// because the engine is what has to stop.
+    ///
+    /// # Why the machine filters it
+    ///
+    /// **An address at or below the program counter is dropped, and that filtering is the
+    /// method's most important behaviour.** A caller that has already been told to stop
+    /// at an address has, by definition, already done so; re-arming it would exclude the
+    /// instruction about to run, and an engine asked to exclude the instruction it was
+    /// about to run has nothing to execute and declines — every step, forever. The
+    /// machine therefore keeps only addresses strictly ahead of the program counter, so
+    /// the set cannot be poisoned by a stale breakpoint.
+    ///
+    /// A no-op for an engine that retires one instruction at a time, and harmless.
+    pub fn set_yield_points(&mut self, points: impl IntoIterator<Item = u64>) {
+        let mut points: Vec<InstructionAddress> =
+            points.into_iter().map(InstructionAddress::new).collect();
+        points.sort_unstable();
+        points.dedup();
+        if points != self.yield_points {
+            // The engine's cache holds blocks translated under the *old* set, and a
+            // block translated with a boundary is different code from one without, so
+            // both engines are told. The interpreter ignores it; the JIT clears its
+            // cache, which is the point.
+            self.engine.set_yield_boundary(None);
+            self.yield_points = points;
+        }
+    }
+
+    /// The guest addresses an engine has been told not to execute at.
+    pub fn yield_points(&self) -> Vec<u64> {
+        self.yield_points.iter().map(|at| at.as_u64()).collect()
+    }
+
+    /// How many times an engine declined and this machine ran the instruction elsewhere.
+    ///
+    /// **A count, not an event, and the difference is the requirement.** §11 says a mode
+    /// switch must not be observable to the guest, so this cannot appear in the
+    /// [`MachineEvent`] stream the guest's own execution path sees. A debugger and a
+    /// benchmark need it anyway: without it, "the JIT ran every instruction" and "the JIT
+    /// ran none and the interpreter did all the work" are the same machine state, and
+    /// B24's performance numbers would be uninterpretable.
+    pub const fn engine_handoffs(&self) -> u64 {
+        self.handoffs
+    }
+
+    /// How many guest instructions have retired on this machine, ever.
+    ///
+    /// **The count is of *retired* instructions, and a translated block contributes all
+    /// of them.** Before B23 this was advanced by one per `step`, so a machine running a
+    /// JIT block of thirty-one instructions under-counted by thirty — and `run(limit)`,
+    /// which counts retired instructions against its limit, would have run roughly thirty
+    /// times further than asked. It is exposed because B24 measures against it and
+    /// because a debugger reporting a program counter with no idea how far the program has
+    /// got is not much of a debugger.
+    pub const fn executed_instruction_count(&self) -> u64 {
+        self.executed
+    }
+
+    /// How many guest instructions have retired as host-native code, across every engine
+    /// this machine has ever run.
+    ///
+    /// **The answer to "did the JIT actually do anything", and the only one available
+    /// through a machine.** An engine-switching differential test compares architectural
+    /// state, and a JIT that never ran a single instruction natively would match the
+    /// reference on every field of it — because the interpreter is correct and is the
+    /// oracle. This is the number that distinguishes "the JIT ran the program" from "the
+    /// JIT was installed and declined everything", and B23's handoff tests are worthless
+    /// without it.
+    ///
+    /// **Cumulative across engine switches, and the accumulation is the point.** A switch
+    /// drops the outgoing engine object, and with it that engine's own count — so a naive
+    /// implementation of this accessor reports zero the moment a JIT is switched away
+    /// from, and a test that switches `interpreter → JIT → interpreter` and then asks
+    /// how much the JIT did would be told "none" about the one segment that used it.
+    /// [`switch_execution_engine`] therefore banks the outgoing count into `native_total`
+    /// before the object goes, and a run that used a JIT at any point reports it however
+    /// many times the engine changed afterwards.
+    ///
+    /// Both engines are counted, so a decline handed to the fallback is visible as a
+    /// handoff rather than as native work.
+    pub fn native_instructions(&self) -> u64 {
+        self.native_total
+            .saturating_add(self.engine.native_instruction_count().unwrap_or(0))
+            .saturating_add(self.fallback.native_instruction_count().unwrap_or(0))
+    }
+
+    /// Why the last engine handoff happened, if one has.
+    pub const fn last_engine_decline(&self) -> Option<EngineDecline> {
+        self.last_decline
+    }
+
+    /// Switches to the JIT once this many instructions have retired on another engine.
+    ///
+    /// # What this is for
+    ///
+    /// §11 lists "interpreter execution → hot code identified → JIT compiles → JIT
+    /// continues from the same architectural state" as a required transition. This is
+    /// that transition, and it is **opt-in because the honest version of "hot code" is
+    /// not this.** A real hotness counter decides per code region which blocks are worth
+    /// compiling; this decides once, for the whole machine, after a warm-up.
+    ///
+    /// It is offered anyway, for two reasons. It proves the transition at an instruction
+    /// boundary with no restart, which is the part of §11 that can be wrong; and it gives
+    /// a caller that has *already* decided this machine should be fast a way to say so
+    /// without reaching past the machine's API to poke its engine.
+    ///
+    /// # Why it is not the default
+    ///
+    /// **Because for most guest code it would make things slower, and a default that
+    /// makes things slower is not a default.** The JIT translates straight-line register
+    /// operations; real programs are memory traffic and control flow, which it declines.
+    /// Enabling it unconditionally would pay a failed translation on every instruction
+    /// and run nothing natively. That is a measurement (B24) rather than a guess, and
+    /// the measurement is the reason this is opt-in.
+    ///
+    /// The switch happens *at* an instruction boundary, between steps, with the
+    /// architectural state untouched — the same operation as a manual
+    /// [`switch_execution_engine`](Self::switch_execution_engine), reached automatically.
+    /// A count of zero disables it again.
+    pub fn use_jit_after(&mut self, instructions: u64) -> Result<(), MachineError> {
+        self.jit_warmup = Some(instructions);
+        if instructions == 0 {
+            self.switch_execution_engine(EngineKind::Jit)
+        } else {
+            Ok(())
+        }
     }
 
     /// Changes which execution engine runs this machine, without resetting it.
@@ -393,6 +646,15 @@ impl<D: Device> LazalithMachine<D> {
                 reason: "the machine is faulted, and an engine switch is not a reset",
             }));
         }
+        // **Bank the outgoing engine's native count before dropping it.** The object goes
+        // with the assignment on the next line, and its own counter with it — so a
+        // machine that switched away from a JIT would report zero native instructions
+        // afterwards, which is the one number B23's tests and B24's measurements exist to
+        // obtain. Architectural state is untouched by any of this; the count is
+        // observability of how the work was done, and it survives the switch on purpose.
+        self.native_total = self
+            .native_total
+            .saturating_add(self.engine.native_instruction_count().unwrap_or(0));
         self.engine = engine_for::<Bus<D>>(kind);
         Ok(())
     }
@@ -850,9 +1112,19 @@ impl<D: Device> LazalithMachine<D> {
         self.bus.reset_devices(self.initial_time);
         self.processor = Processor::new(self.initial_state.clone());
         self.engine.discard_private_state();
+        // The fallback engine's private state goes too, for the same reason: a reset that
+        // left one engine's cache and dropped the other's would be a reset that depended
+        // on which engine had been active.
+        self.fallback.discard_private_state();
         self.clock = VirtualClock::at(self.initial_time);
         self.interrupts.reset();
         self.last_trap_fault = None;
+        // Handoff and decline counters are *observability of this run*, not machine state,
+        // so a reset clears them. Keeping them would make a benchmark's second run
+        // report the first run's handoffs, which is worse than starting from zero.
+        self.handoffs = 0;
+        self.last_decline = None;
+        self.native_total = 0;
         self.state = MachineState::Reset;
     }
 
@@ -1005,19 +1277,91 @@ impl<D: Device> LazalithMachine<D> {
         self.step_inner()
     }
 
-    fn step_inner(&mut self) -> Result<MachineEvent, MachineError> {
-        self.ensure_executable(MachineOperation::Step)?;
-        if let Some(event) = self.try_external_interrupt()? {
-            return Ok(MachineEvent::Trapped { event });
-        }
-        let executed = self
-            .executed
-            .checked_add(1)
-            .ok_or(MachineError::InstructionCountOverflow)?;
-        let had_frame = self.processor.traps().has_active_frame();
-        let result = match self.engine.step(&mut self.processor, &mut self.bus) {
-            Ok(result) => result,
-            Err(fault) => {
+    /// Runs the active engine, handing a decline to the fallback.
+    ///
+    /// **This is B23's handoff, and the `match` on [`EngineFault`] is the whole
+    /// design.** There are two arms because there are exactly two things that can go
+    /// wrong, and they want opposite responses:
+    ///
+    /// - a **guest fault** is the guest's problem and becomes a trap, exactly as it did
+    ///   before any JIT existed;
+    /// - a **decline** is this engine's problem and is answered by running the
+    ///   instruction on another engine, so the guest sees an ordinary retired
+    ///   instruction and cannot tell.
+    ///
+    /// Before B23 the two were the same type — a `CpuFault` with a `JitDeclined` variant
+    /// — and the `Err` arm trapped. That trapped programs for using instructions the JIT
+    /// had not learned, and if the trap could not be entered the machine went terminally
+    /// `Faulted`. **The types are what make that unrepeatable**: a decline cannot reach
+    /// `enter_trap` without an arm here that says so.
+    ///
+    /// # Why the handoff is precise
+    ///
+    /// **Because a decline must have changed nothing, the interpreter runs exactly the
+    /// instruction the JIT declined.** [`ExecutionEngine`] requires it, and the JIT's own
+    /// `step` asserts it, but the guarantee is what makes this correct rather than
+    /// merely plausible:
+    ///
+    /// - the program counter still names the instruction that was declined, so the
+    ///   interpreter executes *that* instruction — not a re-execution of one the JIT
+    ///   already retired, and not a skip past one it could not;
+    /// - no register, no flag, no clock tick and no memory byte was written, so the
+    ///   interpreter starts from the state the guest left and produces the result the
+    ///   interpreter alone would have;
+    /// - the machine's own `executed` count and `last_cycles` are advanced by the
+    ///   interpreter's answer, not by the JIT's attempt, so a run that spends most of
+    ///   its time declining costs what the guest did and not what the engine tried.
+    ///
+    /// # Why there is a second engine object
+    ///
+    /// **Two engines, one architectural state.** `fallback` is a second
+    /// [`ExecutionEngine`] *value*, not a second copy of the guest — it borrows the same
+    /// `&mut self.processor` for the length of one step, which is the arrangement B3
+    /// built and the reason the invariant holds. Running it for one instruction instead
+    /// of installing it permanently is cheaper than any reconciliation, because there is
+    /// nothing to reconcile.
+    fn run_engine(&mut self) -> Result<StepResult, StepStop> {
+        match self.engine.step(&mut self.processor, &mut self.bus) {
+            Ok(result) => Ok(result),
+            Err(EngineFault::Declined(decline)) => {
+                self.handoffs += 1;
+                self.last_decline = Some(decline);
+                // **The fallback is the Reference Interpreter, always.** It is the
+                // semantic authority and it declines nothing, so this arm cannot loop.
+                match self.fallback.step(&mut self.processor, &mut self.bus) {
+                    Ok(result) => Ok(result),
+                    Err(EngineFault::Guest(fault)) => {
+                        // The declined instruction turned out to fault when it was
+                        // executed properly, which is a perfectly ordinary guest fault and
+                        // is reported as one. This is the case a JIT must get right: a
+                        // null dereference the JIT cannot even translate still has to
+                        // trap identically to the interpreter's.
+                        let cause = trap_cause(&fault);
+                        let resume_pc = fault.pc;
+                        let event = self.enter_trap(PendingTrap::Fault {
+                            cause,
+                            resume_pc,
+                            original: fault,
+                        })?;
+                        Err(StepStop::Trapped(event))
+                    }
+                    Err(EngineFault::Declined(second)) => {
+                        // Two engines in a row declining the same instruction means the
+                        // machine cannot execute it at all. That is a fact about this
+                        // build, not a guest fault and not an engine switch, and there is
+                        // no third place to send it — so it is surfaced as an error
+                        // rather than turned into a trap, which would blame the guest for
+                        // this machine's coverage.
+                        Err(StepStop::NoEngine(EngineDecline::UnsupportedInstruction {
+                            reason: match second {
+                                EngineDecline::UnsupportedInstruction { reason } => reason,
+                                _ => "the reference interpreter declined, which is a bug",
+                            },
+                        }))
+                    }
+                }
+            }
+            Err(EngineFault::Guest(fault)) => {
                 let cause = trap_cause(&fault);
                 let resume_pc = fault.pc;
                 let event = self.enter_trap(PendingTrap::Fault {
@@ -1025,8 +1369,48 @@ impl<D: Device> LazalithMachine<D> {
                     resume_pc,
                     original: fault,
                 })?;
-                return Ok(MachineEvent::Trapped { event });
+                Err(StepStop::Trapped(event))
             }
+        }
+    }
+
+    /// The guest address the engine must not execute an instruction at, or `None`.
+    ///
+    /// **Strictly after the current program counter, which is what makes the JIT's
+    /// boundary well-formed.** The set is kept sorted so this is the first address at or
+    /// after here. Addresses at or before here are excluded on purpose: the caller has
+    /// already been told to stop there — a debugger checks a breakpoint *before*
+    /// stepping — and re-arming one behind the program counter would exclude the very
+    /// instruction about to run, leaving the JIT with nothing to translate and the
+    /// machine declining every step forever.
+    fn yield_boundary(&self) -> Option<InstructionAddress> {
+        let here = self.architectural_state().pc();
+        self.yield_points.iter().copied().find(|at| *at > here)
+    }
+
+    fn step_inner(&mut self) -> Result<MachineEvent, MachineError> {
+        self.ensure_executable(MachineOperation::Step)?;
+        if let Some(event) = self.try_external_interrupt()? {
+            return Ok(MachineEvent::Trapped { event });
+        }
+        // The boundary a block must not run past, recomputed each step because it is a
+        // function of the current program counter: the nearest address at or after here
+        // that a caller has asked not to execute.
+        let boundary = self.yield_boundary();
+        self.engine.set_yield_boundary(boundary);
+        self.fallback.set_yield_boundary(boundary);
+        let had_frame = self.processor.traps().has_active_frame();
+        let result = match self.run_engine() {
+            Ok(result) => result,
+            // A trap was entered, so this step retired nothing: no clock, no count, no
+            // outcome to apply. The event is the step's result and it already carries the
+            // resume address, so returning here is what keeps the trap from being
+            // applied twice.
+            Err(StepStop::Trapped(event)) => return Ok(MachineEvent::Trapped { event }),
+            Err(StepStop::NoEngine(decline)) => {
+                return Err(MachineError::NoExecutionEngine { decline });
+            }
+            Err(StepStop::Failed(error)) => return Err(error),
         };
         // **Time is charged here: after the instruction retired, before the outcome is
         // applied.** Three things make this the only place that works.
@@ -1045,9 +1429,28 @@ impl<D: Device> LazalithMachine<D> {
         //   why a timer works without the step loop knowing that timers exist.
         self.last_cycles = result.cycles;
         self.advance_clock(CycleCount::new(u64::from(result.cycles)))?;
-        self.executed = executed;
+        self.executed = self
+            .executed
+            .checked_add(u64::from(result.instructions))
+            .ok_or(MachineError::InstructionCountOverflow)?;
         if had_frame && !self.processor.traps().has_active_frame() {
             self.last_trap_fault = None;
+        }
+        // The automatic interpreter → JIT transition, taken at this instruction boundary.
+        //
+        // **Here, after the instruction retired and the clock was charged**, because that
+        // is the only point at which the architectural state is complete and consistent.
+        // A switch anywhere earlier would be a switch in the middle of a step, which is
+        // the thing §11 says must not happen — and switching is free here precisely
+        // because the state is whole.
+        if let Some(remaining) = self.jit_warmup {
+            let remaining = remaining.saturating_sub(u64::from(result.instructions));
+            if remaining == 0 {
+                self.jit_warmup = None;
+                self.switch_execution_engine(EngineKind::Jit)?;
+            } else {
+                self.jit_warmup = Some(remaining);
+            }
         }
         match result.application {
             OutcomeApplication::Halted => {
@@ -1187,6 +1590,18 @@ impl<D: Device> LazalithMachine<D> {
     }
 }
 
+/// Classifies a guest fault into the trap the guest will see.
+///
+/// **Every arm of this function is a fault the guest caused**, and that is now enforced by
+/// the type rather than by care: an engine decline is an [`EngineDecline`] and arrives as
+/// [`EngineFault::Declined`], which [`LazalithMachine::run_engine`] answers with a handoff
+/// and never passes here.
+///
+/// In B22 this function had an arm for a `CpuFaultCause::JitDeclined`, with a comment
+/// explaining that reaching it would be a bug — and the machine reached it, on every
+/// instruction the JIT could not translate, trapping programs for a compiler limitation
+/// and going terminally `Faulted` when the trap could not be entered. **A comment saying
+/// "this is unreachable" is a wish; a type that cannot carry the value is a fact.**
 fn trap_cause(fault: &CpuFault<MemoryFault>) -> TrapCause {
     match &fault.cause {
         CpuFaultCause::Halted | CpuFaultCause::OperandLayout => TrapCause::IllegalInstruction,
@@ -1204,18 +1619,7 @@ fn trap_cause(fault: &CpuFault<MemoryFault>) -> TrapCause {
         CpuFaultCause::DoubleTrap
         | CpuFaultCause::DeferredInterrupt
         | CpuFaultCause::TerminalTrap
-        | CpuFaultCause::TrapEntry(_)
-        // **A decline is not a guest fault, and mapping it to one would be a bug.**
-        // `trap_cause` is only reached for faults the *guest* caused, and a JIT saying
-        // "I will not run this" is the engine's limitation. The machine must not enter a
-        // trap for it, because a trap is a thing the guest observes — it changes the
-        // program counter, the trap frame and the privilege — and a program would be
-        // trapped for using an instruction the JIT has not taught itself yet.
-        //
-        // The mapping below is unreachable in the right design and is here so that a
-        // decline which *did* reach the trap path is reported as an invalid control
-        // state — an emulator bug, visibly — rather than as a plausible guest fault.
-        | CpuFaultCause::JitDeclined => TrapCause::InvalidControlState,
+        | CpuFaultCause::TrapEntry(_) => TrapCause::InvalidControlState,
     }
 }
 

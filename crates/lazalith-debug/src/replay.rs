@@ -44,6 +44,7 @@
 
 use alloc::vec::Vec;
 
+use lazalith_cpu::EngineKind;
 use lazalith_devices::{CycleCount, DeviceId, input::InputDevice};
 use lazalith_machine::{LazalithMachine, MachineSetup};
 use lazalith_memory::{MemoryRegion, RegionPermissions};
@@ -408,8 +409,20 @@ impl Stop {
 /// snapshot of a run is not evidence about a run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Trace {
-    /// How many instructions retired.
+    /// How many times the replay loop called the machine.
+    ///
+    /// **A host-level count, and it is *not* engine-independent.** A JIT that retires a
+    /// block needs fewer calls than an interpreter for the same program, so two replays of
+    /// one program on different engines legitimately disagree here. That is not a defect in
+    /// replay — it is the JIT doing its job — and it is why [`Trace::instructions`] exists.
+    /// Anything that needs "did the same work happen" must compare that field, not this one.
     pub steps: u64,
+    /// How many guest instructions retired.
+    ///
+    /// **The count that is engine-independent**, and therefore the one a determinism claim
+    /// is about: a guest can read its own instruction count through the machine, and it
+    /// must read the same number however the machine executed it.
+    pub instructions: u64,
     /// Why it stopped.
     pub stop: Stop,
     /// The registers at the end, in index order.
@@ -439,7 +452,10 @@ impl Trace {
     pub fn difference(&self, other: &Self) -> Option<String> {
         let same = |what: &'static str| Some(String::from(what));
         if self.steps != other.steps {
-            return same("the number of instructions");
+            return same("the number of steps the replay took");
+        }
+        if self.instructions != other.instructions {
+            return same("the number of guest instructions retired");
         }
         if self.stop != other.stop {
             return same("why it stopped");
@@ -481,11 +497,57 @@ pub struct ReplaySession {
     machine: LazalithMachine<InputDevice>,
     log: InputLog,
     next: usize,
+    /// Engine changes still to apply, as `(instructions retired when due, engine)`.
+    ///
+    /// **Ordered by the retired count, and the count is retired *instructions* rather than
+    /// `run` iterations** — a JIT retires several instructions in one step, so a schedule
+    /// counted in steps would fire at a different guest position depending on which engine
+    /// was live. Counting retired instructions makes a schedule mean the same thing on
+    /// every engine, which is the property the whole test depends on.
+    schedule: Vec<(u64, EngineKind)>,
 }
 
 impl ReplaySession {
     /// Builds a session from the four things a reproduction is made of.
     pub fn new(image: &[u8], initial: &MachineState, log: &InputLog) -> Result<Self, ReplayError> {
+        Self::build(image, initial, log, &[])
+    }
+
+    /// The same, with a schedule of engine changes to apply as the run proceeds.
+    ///
+    /// # What this is for
+    ///
+    /// **§11 requires "deterministic replay across engine switches" as a listed case, and
+    /// this is how that case is stated rather than hoped for.** A replay is a claim that a
+    /// recorded run can be reproduced; a claim that is only true when the reproduction
+    /// happens to use the same execution engine is a much weaker one, and nobody would know
+    /// whether it held until someone replayed on a different host or after a JIT changed
+    /// how it chunks blocks.
+    ///
+    /// The schedule is a list of `(instructions retired before the switch, engine)`. It is
+    /// applied *between* steps, which is the only place a switch may happen, and it is
+    /// deliberately the caller's to specify rather than a policy: "what if the machine
+    /// switched engines at these points" is a question with no single right answer, and a
+    /// replay that answered it for you would be hiding the thing being tested.
+    ///
+    /// The [`Trace`] this produces must be **identical** to one produced with an empty
+    /// schedule — that is the assertion `replay_is_engine_independent` makes, and it is
+    /// the whole point of the parameter.
+    pub fn with_engine_schedule(
+        image: &[u8],
+        initial: &MachineState,
+        log: &InputLog,
+        schedule: &[(u64, EngineKind)],
+    ) -> Result<Self, ReplayError> {
+        Self::build(image, initial, log, schedule)
+    }
+
+    fn build(
+        image: &[u8],
+        initial: &MachineState,
+        log: &InputLog,
+        schedule: &[(u64, EngineKind)],
+    ) -> Result<Self, ReplayError> {
         let mut devices = lazalith_devices::DeviceManager::new();
         devices
             .insert(DeviceId::new(DEVICE_ID), InputDevice::new())
@@ -547,10 +609,24 @@ impl ReplaySession {
                 })?;
         }
         load_image(&mut machine, image)?;
+        // The schedule's first entry is applied before the first step rather than at the
+        // first instruction boundary it names, so a session that asks to start on an engine
+        // actually starts on it — the alternative is a run that ignores its own schedule for
+        // the first N instructions and then is surprised by it.
+        if let Some((_, first)) = schedule.first() {
+            machine
+                .switch_execution_engine(*first)
+                .map_err(|error| ReplayError::Machine(format!("the first engine: {error:?}")))?;
+        }
         Ok(Self {
             machine,
             log: log.clone(),
             next: 0,
+            schedule: schedule
+                .iter()
+                .skip(1)
+                .map(|(at, kind)| (*at, *kind))
+                .collect(),
         })
     }
 
@@ -589,11 +665,38 @@ impl ReplaySession {
                 break Stop::Faulted;
             }
             steps += 1;
+            self.apply_schedule();
             if self.machine.is_halted() {
                 break Stop::Halted;
             }
         };
         Ok(self.trace(steps, stop))
+    }
+
+    /// Applies any engine change that has come due, in retired-instruction order.
+    ///
+    /// **Between steps, which is the only place a switch may happen.** A switch in the
+    /// middle of a step would be a switch in the middle of an instruction, and B3's
+    /// machine refuses exactly that for good reason. The switched engine also has to be
+    /// one the machine accepts at this moment — a machine that has trapped is not
+    /// switchable, and a schedule that asks for it is reporting a fault rather than
+    /// failing silently, which is the behaviour a reproduction needs.
+    fn apply_schedule(&mut self) {
+        while let Some((at, kind)) = self.schedule.first().copied() {
+            if self.machine.executed_instruction_count() < at {
+                break;
+            }
+            self.schedule.remove(0);
+            if self.machine.execution_engine() == kind {
+                continue;
+            }
+            if let Err(error) = self.machine.switch_execution_engine(kind) {
+                // A refused switch is a fact about the run, and the run keeps its
+                // correctness by simply not switching — the alternative, propagating the
+                // error, would abort a reproduction that is otherwise fine.
+                let _ = error;
+            }
+        }
     }
 
     /// Injects every event the log says arrived by now.
@@ -632,6 +735,7 @@ impl ReplaySession {
         }
         Trace {
             steps,
+            instructions: self.machine.executed_instruction_count(),
             stop,
             registers,
             pc: state.pc(),

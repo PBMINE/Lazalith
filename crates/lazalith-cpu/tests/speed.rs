@@ -273,7 +273,15 @@ fn both_engines_charge_the_same_cost_for_every_opcode() {
                 }
             }
             (Err(a), Err(b)) => {
-                // The same fault, from the same place, for the same reason.
+                // Both must be the *same kind* of failure, not merely two errors: an engine that
+                // declines where another faults is a real disagreement, and comparing rendered
+                // strings would have reported that as the two merely differing.
+                let (a, b) = (
+                    a.into_guest()
+                        .expect("the reference interpreter never declines"),
+                    b.into_guest()
+                        .expect("the reference interpreter never declines"),
+                );
                 assert_eq!(
                     a.cause.to_string(),
                     b.cause.to_string(),
@@ -521,12 +529,20 @@ fn a_control_transfer_to_an_address_the_reference_refuses_is_refused_by_both_eng
     );
 
     // Step two: the transfer, and the refusal.
+    //
+    // Both must be *guest faults*, not declines. A decline would mean one engine refused
+    // to try, which is a different answer from "this program cannot run", and the whole
+    // point of this test is that two engines reach the same verdict.
     let a = reference
         .step(&mut reference_cpu, &mut reference_ram)
-        .expect_err("the reference refuses a jump to a misaligned address");
+        .expect_err("the reference refuses a jump to a misaligned address")
+        .into_guest()
+        .expect("the reference interpreter never declines");
     let b = fast
         .step(&mut fast_cpu, &mut fast_ram)
-        .expect_err("and so must the optimised engine");
+        .expect_err("and so must the optimised engine")
+        .into_guest()
+        .expect("the reference interpreter never declines");
     assert_eq!(
         a.cause.to_string(),
         b.cause.to_string(),

@@ -2,8 +2,8 @@
 mod support;
 
 use lazalith_cpu::{
-    CpuFault, CpuFaultCause, ExecutionContextId, ExecutionEngine, OutcomeApplication, Privilege,
-    ReferenceInterpreter, TrapCause,
+    CpuFault, CpuFaultCause, EngineFault, ExecutionContextId, ExecutionEngine, OutcomeApplication,
+    Privilege, ReferenceInterpreter, TrapCause,
 };
 use lazalith_isa::{ControlRegister, Opcode, Operand};
 use support::{MODES, Ram, cpu, instruction, r};
@@ -31,7 +31,9 @@ fn every_privileged_operation_rejects_user_before_any_effect() {
                 let before = cpu.architectural().clone();
                 let error = ReferenceInterpreter::new()
                     .execute(&mut cpu, &instruction(config, opcode, &operands), &mut ram)
-                    .unwrap_err();
+                    .unwrap_err()
+                    .into_guest()
+                    .expect("the reference interpreter never declines");
                 assert_eq!(error.cause, CpuFaultCause::PrivilegeViolation);
                 assert_eq!(cpu.architectural(), &before);
                 assert_eq!(ram.reads, 0);
@@ -108,10 +110,10 @@ fn trap_entry_and_rfe_restore_user_and_interrupt_state_without_restoring_registe
                 &instruction(config, Opcode::Rfe, &[]),
                 &mut ram
             ),
-            Err(CpuFault {
+            Err(EngineFault::Guest(CpuFault {
                 cause: CpuFaultCause::Control(_),
                 ..
-            })
+            }))
         ));
         assert_eq!(cpu.architectural(), &before_return);
         let context = ExecutionContextId::new(1).unwrap();
