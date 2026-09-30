@@ -167,10 +167,40 @@ pub fn lex(source: SourceId, sources: &SourceManager) -> Lexed {
         sources,
         text,
         at: 0,
+        end: text.len() as u32,
         tokens: Vec::new(),
         diagnostics: Vec::new(),
     }
     .run()
+}
+
+/// Lexes a string that is not a file.
+///
+/// **A synthetic one-file source map, for lexing text the compiler made up** — a macro
+/// body, or the tokens of a `#define` line. Those bytes belong to no file, and there are
+/// two honest ways to deal with that: refuse to lex them, or give them a map of their own
+/// and be clear that a span into it points at a fragment rather than at a program.
+///
+/// The second is what this does, because the alternative is a preprocessor that cannot
+/// read a macro body at all. The spans it produces are real spans *into a real (if
+/// one-line) file*; they simply do not name a file anybody opened. A caller that cares
+/// where a token came from re-spans it — which is exactly what macro expansion does,
+/// because the useful place to point at for an expanded token is the place it was used.
+pub fn lex_str(name: &str, text: &str) -> Lexed {
+    let mut sources = SourceManager::default();
+    let source = match sources.add_file(name, text) {
+        Ok(source) => source,
+        // The map is empty and the text is a fragment, so the only way `add_file` can
+        // fail is a length this compiler could not have been built to accept. An empty
+        // token list is the honest result: there is nothing to lex.
+        Err(_) => {
+            return Lexed {
+                tokens: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+        }
+    };
+    lex(source, &sources)
 }
 
 struct Lexer<'a> {
@@ -178,6 +208,7 @@ struct Lexer<'a> {
     sources: &'a SourceManager,
     text: &'a str,
     at: u32,
+    end: u32,
     tokens: Vec<Token>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -238,8 +269,15 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// The end of the text this lexer is reading.
+    ///
+    /// **A bound, not the file's length, so a lexer can be pointed at a fragment.** The
+    /// preprocessor lexes a macro body and a directive argument, and both are text inside
+    /// no file; reading to the end of the fragment rather than to the end of whatever
+    /// buffer happens to hold it is what keeps one fragment's tokens from running into
+    /// the next one's.
     fn len(&self) -> u32 {
-        self.text.len() as u32
+        self.end
     }
 
     fn byte(&self, at: u32) -> u8 {

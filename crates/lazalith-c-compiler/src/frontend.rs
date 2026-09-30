@@ -4,12 +4,19 @@
 //! program never reaches a later stage built on an earlier stage's mistake:
 //!
 //! ```text
-//! source -> lexer -> parser -> resolver -> type checker -> CheckedCProgram
+//! source -> preprocessor -> lexer -> parser -> resolver -> type checker -> CheckedCProgram
 //! ```
 //!
+//! The preprocessor is a stage of its own rather than a step inside the lexer, because
+//! it is the one stage that can *fail* for a reason that is not about the program's
+//! grammar: a missing header is not a syntax error, and reporting it as one would send
+//! someone looking in the wrong file for a mistake that is not there.
+//!
 //! Every stage reports through `lazalith_diagnostics`, and every stage keeps the
-//! `SourceManager` it was given, so a caller can render any failure with the
-//! shared renderer.
+//! `SourceManager` it was given, so a caller can render any failure with the shared
+//! renderer. That matters more than usual here: a header is added to the *same* source
+//! map as the program, so a diagnostic from inside one renders against the header's own
+//! text rather than against the program that included it.
 //!
 //! # Two entry points, on purpose
 //!
@@ -29,20 +36,42 @@ use crate::ast::TranslationUnit;
 use crate::diagnostic::StageError;
 use crate::lexer::{self, Token};
 use crate::parser;
+use crate::preprocess::{self, Includes};
 use crate::resolve::{self, Resolved};
 use crate::types::{self, CheckedCProgram};
 
 /// Runs the whole frontend on one file, stopping at the first failure.
 ///
-/// The caller owns the source map and the file's name. On success the caller
-/// owns the checked program, whose every node still points into that map.
+/// The caller owns the source map and the file's name. On success the caller owns the
+/// checked program, whose every node still points into that map.
+///
+/// **No headers, and no architecture.** This is the entry point for a program that has
+/// neither, and it is not a limitation but a description: a program that includes a header
+/// needs someone to say where headers are, and [`compile_for`] is where that is said.
 pub fn compile(
     sources: &mut SourceManager,
     name: &str,
     text: &str,
 ) -> Result<(SourceId, CheckedCProgram), StageError> {
+    let mut resolver = preprocess::NoIncludes;
+    let mut includes = Includes::none(&mut resolver);
+    compile_for(sources, name, text, &mut includes)
+}
+
+/// Runs the whole frontend on one file, with headers and a target.
+///
+/// **This is the entry point a real build uses,** and the difference from [`compile`] is
+/// exactly the difference between a program and a translation unit: a translation unit can
+/// include a header, and which one it means depends on a target and an include path that
+/// only the caller knows.
+pub fn compile_for(
+    sources: &mut SourceManager,
+    name: &str,
+    text: &str,
+    includes: &mut Includes<'_>,
+) -> Result<(SourceId, CheckedCProgram), StageError> {
     let source = add_file(sources, name, text)?;
-    let tokens = lex_file(source, sources)?;
+    let tokens = preprocess_file(source, name, sources, includes)?;
     let unit = parse_tokens(source, sources, tokens)?;
     let resolved = resolve::resolve(source, sources, unit);
     let mut checked = types::check(source, sources, &resolved);
@@ -55,11 +84,25 @@ pub fn compile(
 
 /// Runs the whole frontend and reports every failure it finds.
 ///
-/// Returns the resolved tree even when there were failures, because a caller
-/// that wants to highlight every problem needs the tree the problems are in. It
-/// is only absent when the file could not be read at all, which is the one
-/// failure that leaves nothing to point at.
+/// Returns the resolved tree even when there were failures, because a caller that wants to
+/// highlight every problem needs the tree the problems are in. It is only absent when the
+/// file could not be read at all, which is the one failure that leaves nothing to point at.
 pub fn analyse(sources: &mut SourceManager, name: &str, text: &str) -> Analysis {
+    let mut resolver = preprocess::NoIncludes;
+    let mut includes = Includes::none(&mut resolver);
+    analyse_for(sources, name, text, &mut includes)
+}
+
+/// [`analyse`], with headers and a target.
+///
+/// **The same reason [`compile_for`] exists, and the same asymmetry:** a build script wants
+/// the first diagnostic and an editor wants all of them, and both want the same headers.
+pub fn analyse_for(
+    sources: &mut SourceManager,
+    name: &str,
+    text: &str,
+    includes: &mut Includes<'_>,
+) -> Analysis {
     let source = match add_file(sources, name, text) {
         Ok(source) => source,
         Err(error) => {
@@ -71,20 +114,20 @@ pub fn analyse(sources: &mut SourceManager, name: &str, text: &str) -> Analysis 
             };
         }
     };
-    let lexed = lexer::lex(source, sources);
-    if !lexed.diagnostics.is_empty() {
+    let preprocessed = preprocess::preprocess(sources, source, name, includes);
+    if !preprocessed.diagnostics.is_empty() {
         return Analysis {
             source: Some(source),
             resolved: empty_resolved(),
             checked: None,
-            diagnostics: lexed
+            diagnostics: preprocessed
                 .diagnostics
                 .into_iter()
                 .map(|diagnostic| StageError::from_parts(diagnostic, sources.clone()))
                 .collect(),
         };
     }
-    let parsed = parser::parse(source, sources, lexed.tokens);
+    let parsed = parser::parse(source, sources, preprocessed.tokens);
     if !parsed.diagnostics.is_empty() {
         return Analysis {
             source: Some(source),
@@ -142,6 +185,25 @@ pub fn parse_file(
     let source = add_file(sources, name, text)?;
     let tokens = lex_file(source, sources)?;
     parse_tokens(source, sources, tokens).map(|unit| (source, unit))
+}
+
+/// Preprocesses one file into tokens.
+///
+/// `name` is the file's name as written, and it is passed on to the preprocessor because
+/// the include-cycle check compares *names*: every read of a header adds a new file to the
+/// map, so an id-based check could never see a cycle.
+pub fn preprocess_file(
+    source: SourceId,
+    name: &str,
+    sources: &mut SourceManager,
+    includes: &mut Includes<'_>,
+) -> Result<Vec<Token>, StageError> {
+    let preprocessed = preprocess::preprocess(sources, source, name, includes);
+    let tokens = preprocessed.tokens;
+    match preprocessed.diagnostics.into_iter().next() {
+        None => Ok(tokens),
+        Some(error) => Err(StageError::from_parts(error, sources.clone())),
+    }
 }
 
 /// Lexes one file into tokens.

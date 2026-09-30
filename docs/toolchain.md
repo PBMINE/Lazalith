@@ -198,10 +198,14 @@ a C program, links it and executes the image. The byte-for-byte test could not h
 found defect 2 — every image the bug produced was internally consistent — which is
 why a stage that produces executable artifacts is checked by executing them.
 
-**Not implemented:** a C *preprocessor*. There is no `#include`, no `#define`, no
-macro expansion. Anything C-shaped that needs one today is a limitation and is
-recorded in `docs/c-compiler.md`; the Linux 0.01 port (§21, §48) will need this
-before it can build `kernel/sched.c`, which uses macros heavily.
+**A preprocessor**, as its own stage rather than as a step inside the lexer — see
+`lazalith_c_compiler::preprocess`. It does `#include`, object-like and function-like
+`#define`, `#undef`, `#ifdef`, `#ifndef`, `#else`, `#endif` and `#error`, and it works
+on tokens rather than on text, so a diagnostic inside a header points into the header.
+
+It does **not** do `#if` or `#elif`, and it refuses them rather than skipping them: an
+ignored `#if` makes `#if 0` and `#if 1` the same program. Every include guard and every
+feature switch is a definedness test, so `#ifdef` covers what a kernel header needs.
 
 
 ---
@@ -292,10 +296,10 @@ sysroot with `lib/libc.c` in it is hosted; one without is freestanding.
 
 ### What is still missing
 
-- **No preprocessor**, so `#include "lazos/syscall.h"` does not yet work. The header
-  is on disk and is the right bytes; nothing includes it yet. That is the next
-  piece of B15's follow-on work and the blocker for a kernel that includes its own
-  headers.
+- **The C front end has a preprocessor but the driver does not feed it a sysroot
+  include path yet.** `#include "lazos/syscall.h"` resolves against a `MapIncludes`, and
+  the resolver the driver builds is where the sysroot.s headers have to be wired in. The
+  header is on disk and is the right bytes.
 - **The C library is stored as source, not prebuilt.** Deliberate: an object would be
   a build artefact of one compiler version. A `lazpkg`-installed `.lzo` library is
   the later form.
@@ -328,14 +332,13 @@ and that a corrupted byte never panics or over-reads.
 
 ## 7. What is not here
 
-- **A sysroot exists, but nothing includes from it yet.** `lazen sysroot` writes
-  `include/lazos/*.h` and `lazcc --sysroot` reads the libraries and runtime, but the
-  C front end has no preprocessor, so `#include "lazos/syscall.h"` does not work yet.
-  The header is on disk and is the right bytes; what is missing is the `#include`.
+- **A sysroot exists, and the preprocessor can include from one.** `lazen sysroot` writes
+  `include/lazos/*.h` and `lazcc --sysroot` reads the libraries and runtime. The header
+  is on disk, the `#include` works, and what is still missing is a resolver that points at
+  the sysroot.s `include` directory from a driver run.
 - **No `lazpkg` installed libraries.** The C library is stored as source; a `.lzo`
   archive a package manager installs is the later form.
 - **No 32-bit sysroot**, and `lazen sysroot --target` says so rather than writing one.
-- **No C preprocessor.**
 - **No `lazdbg`.** The debug *API* is complete; no program drives it. `lazpkg` and
   `lazimg` likewise stay as `lazen` subcommands — §18 asks to move toward distinct
   tools, and the split was drawn at the two file formats rather than at

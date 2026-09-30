@@ -80,7 +80,7 @@ refusal that only says "unsupported" tells the reader nothing they can act on.
 | `goto` | the IR's blocks are built in the order a body is walked, and a backwards jump needs a second pass | a loop |
 | a call through a function pointer | `CALL` takes a displacement and `CALLR` takes one register; neither reaches a function whose address is only known at run time | a call by name, or a `switch` |
 | a call needing more than six argument words | four arguments are in registers and two on the stack, and a wider type uses more than one word | fewer or narrower arguments |
-| `#define` and macro expansion | not implemented; a directive is stepped over and a `#define`d name fails as undeclared | write the name out |
+| `#if` and `#elif` | a constant-expression evaluator is a real piece of work, and an ignored `#if` is worse than a refused one: it makes `#if 0` and `#if 1` the same program | `#ifdef` for a definedness test, which is what an include guard or a feature switch is |
 | a floating *literal*, even where the type would be an integer | a floating constant is a lexical fact, and refusing it in the lexer is where the message can say the machine has no floating point | an integer literal |
 
 A `struct` is still fully usable *except* by value: it can be declared, sized
@@ -111,6 +111,7 @@ refused:
 | `C03xx` | name resolution |
 | `C04xx` | types and semantics |
 | `C05xx` | lowering to IR |
+| `C06xx` | preprocessor |
 | `C9xxx` | the per-stage fallback for a malformed code |
 
 This is the same scheme the Lazen front end uses (`L` lexer, `P` parser, `N`

@@ -8,11 +8,13 @@ pub mod frontend;
 pub mod ir;
 pub mod lexer;
 pub mod parser;
+pub mod preprocess;
 pub mod resolve;
 pub mod types;
 
 pub use ctypes::{CType, EnumType, Enumerator, Field, FunctionType, RecordType};
 pub use diagnostic::{CompileError, StageError, render};
-pub use frontend::{analyse, compile};
+pub use frontend::{analyse, analyse_for, compile, compile_for};
 pub use ir::lower;
+pub use preprocess::{IncludeResolver, Includes, MapIncludes, NoIncludes};
 pub use types::CheckedCProgram;
